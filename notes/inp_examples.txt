@@ -1,0 +1,24 @@
+* start of file, i think inp format usees "*" to declare comments. 
+.Units mm
+
+* w = conductor width, h = conductor height
+.Default sigma=58000.0 w=0.52 h=0.035 nhinc=1 nwinc=7
+
+*then follow the points:
+N0 x=5.38491 y=-25.334 z=0
+N1 x=5.77449 y=-25.2481 z=0
+N2 x=6.16271 y=-25.1561 z=0
+...
+
+
+E0 N0 N1
+E1 N1 N2
+E2 N2 N3
+...
+
+*end of file will look like this: 
+.external N0 N4485
+
+.freq fmin=130000.0 fmax=140000.0 ndec=1
+
+.end
