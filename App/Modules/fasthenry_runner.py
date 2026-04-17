@@ -114,24 +114,25 @@ class FastHenryRunner:
 
     def _start(self):
         w32c = _ensure_win32()
-        # Dispatch creates the FastHenry2 COM server. Console stays hidden.
+        import pythoncom
+        try:
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
         self._obj = w32c.Dispatch("FastHenry2.Document")
 
     def _stop(self):
         if self._obj is None:
             return
         try:
-            # If a simulation is still running when we tear down, stop it.
-            if self._obj.IsRunning():
-                self._obj.Stop()
-                # Give it a moment to settle before quitting.
+            if self._obj.IsRunning:
+                self._obj.Stop
                 for _ in range(10):
-                    if not self._obj.IsRunning():
+                    if not self._obj.IsRunning:
                         break
                     time.sleep(0.2)
-            self._obj.Quit()
+            self._obj.Quit
         except Exception:
-            # Best-effort teardown; a failed Quit isn't worth crashing for.
             pass
         self._obj = None
 
@@ -168,7 +169,7 @@ class FastHenryRunner:
             )
 
         t0 = time.time()
-        while self._obj.IsRunning():
+        while self._obj.IsRunning:
             elapsed = time.time() - t0
             if elapsed > timeout_sec:
                 self._obj.Stop()
@@ -189,19 +190,20 @@ class FastHenryRunner:
         """Return the sweep frequency list as a tuple of floats."""
         if self._obj is None:
             raise RuntimeError("FastHenry object not initialized")
-        return tuple(self._obj.GetFrequencies())
+        raw = self._obj.GetFrequencies
+        return tuple(raw) if isinstance(raw, (tuple, list)) else (raw,)
 
     def inductance(self):
         """Return 3D nested list [freq_idx][row][col] of L in henries."""
         if self._obj is None:
             raise RuntimeError("FastHenry object not initialized")
-        return _safearray_to_nested_list(self._obj.GetInductance())
+        return _safearray_to_nested_list(self._obj.GetInductance)
 
     def resistance(self):
         """Return 3D nested list [freq_idx][row][col] of R in ohms."""
         if self._obj is None:
             raise RuntimeError("FastHenry object not initialized")
-        return _safearray_to_nested_list(self._obj.GetResistance())
+        return _safearray_to_nested_list(self._obj.GetResistance)
 
     def single_port_result(self, target_freq_hz):
         """
@@ -231,15 +233,13 @@ class FastHenryRunner:
     # ----- Zc.mat export helper -----
 
     def export_zc_mat(self, dest_path):
-        """
-        FastHenry writes Zc.mat to the working directory of the .inp
-        during Run(). Copy it to wherever the user wants. Safe to call
-        after run() completes.
-        """
         import shutil
         if self._work_dir is None:
             raise RuntimeError("No simulation has been run yet")
         src = os.path.join(self._work_dir, "Zc.mat")
         if not os.path.exists(src):
             raise FileNotFoundError(f"Zc.mat not found in {self._work_dir}")
+        # If dest is already the source, nothing to do.
+        if os.path.abspath(src) == os.path.abspath(dest_path):
+            return
         shutil.copyfile(src, dest_path)

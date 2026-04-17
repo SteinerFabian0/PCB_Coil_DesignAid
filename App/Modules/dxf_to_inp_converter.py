@@ -30,11 +30,11 @@ DEFAULT_W_MM = 0.52
 DEFAULT_H_MM = 0.035            # 1 oz copper = 35 um
 DEFAULT_SIGMA_PER_MM = 5.8e4    # copper conductivity in 1/(mm*Ohm) for .Units mm
 DEFAULT_NHINC = 1
-DEFAULT_NWINC = 7
+DEFAULT_NWINC = 3
 DEFAULT_FMIN_HZ = 1.35e5
 DEFAULT_FMAX_HZ = 1.50e5
 DEFAULT_FREQ_NDEC = 1
-DEFAULT_ARC_SEG_LEN_MM = 0.4    # max chord length when tessellating an arc
+DEFAULT_ARC_SEG_LEN_MM = 0.6   # max chord length when tessellating an arc
 
 
 # -------------------------------------------------------------------------
@@ -241,6 +241,7 @@ def _write_inp(points, out_path,
 def convert_dxf_to_inp(dxf_path, out_path,
                        w=DEFAULT_W_MM, h=DEFAULT_H_MM,
                        sigma=DEFAULT_SIGMA_PER_MM,
+                       nhinc=DEFAULT_NHINC, nwinc=DEFAULT_NWINC,
                        fmin=DEFAULT_FMIN_HZ, fmax=DEFAULT_FMAX_HZ,
                        z_offset=0.0,
                        header_comment="PCB Coil - generated from DXF",
@@ -269,6 +270,7 @@ def convert_dxf_to_inp(dxf_path, out_path,
 
     _write_inp(path, out_path,
                w=w, h=h, sigma=sigma,
+               nhinc=nhinc, nwinc=nwinc,
                fmin=fmin, fmax=fmax,
                header_comment=header_comment)
 

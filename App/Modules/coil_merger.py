@@ -96,7 +96,7 @@ def write_combined_inp(nodes_layer1, nodes_layer2, out_path,
                        layer_spacing_mm,
                        w=0.52, h=0.035, sigma=5.8e4,
                        w2=None, h2=None,
-                       nhinc=1, nwinc=7,
+                       nhinc=1, nwinc=3,
                        fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
                        via_w=None, via_h=None,
                        header_comment="Combined 2-layer coil"):
