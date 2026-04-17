@@ -70,22 +70,6 @@ def find_via_match(nodes_a, nodes_b, tol=DEFAULT_VIA_MATCH_TOL_MM):
 # Reorientation
 # -------------------------------------------------------------------------
 
-def _orient_for_merge(nodes, via_at):
-    """
-    Return the node list reversed if necessary so that `via_at` ("start"
-    or "end") ends up at the requested position for merging.
-
-    Caller specifies whether this layer's via must end up at "end" (for
-    layer 1) or "start" (for layer 2).
-    """
-    # No-op shortcut: already correct.
-    if via_at == "end":
-        # Via should be the last node; nothing to flip if it already is.
-        return list(nodes)
-    if via_at == "start":
-        return list(nodes)
-    raise ValueError(f"via_at must be 'start' or 'end', got {via_at!r}")
-
 
 def orient_layers(nodes_a, nodes_b, match):
     """
@@ -111,6 +95,7 @@ def orient_layers(nodes_a, nodes_b, match):
 def write_combined_inp(nodes_layer1, nodes_layer2, out_path,
                        layer_spacing_mm,
                        w=0.52, h=0.035, sigma=5.8e4,
+                       w2=None, h2=None,
                        nhinc=1, nwinc=7,
                        fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
                        via_w=None, via_h=None,
@@ -183,21 +168,26 @@ def write_combined_inp(nodes_layer1, nodes_layer2, out_path,
             f.write(f"N{n1 + j} x={x:.6g} y={y:.6g} z={z:.6g}\n")
         f.write("\n")
 
-        # Edges within layer 1.
+# Edges within layer 1 (use layer-1 defaults).
         for i in range(n1 - 1):
             f.write(f"E{i} N{i} N{i + 1}\n")
 
-        # Via edge: connects last node of layer 1 to first node of layer 2.
-        # Override w,h explicitly because a via typically has different
-        # dimensions than the trace. Even if via_w == w and via_h == h it's
-        # harmless to restate.
+        # If layer 2 has different trace dimensions, drop a second
+        # .Default so subsequent E-lines pick up the new w/h.
+        _w2 = w if w2 is None else w2
+        _h2 = h if h2 is None else h2
+        if _w2 != w or _h2 != h:
+            f.write(f".Default sigma={sigma} w={_w2} h={_h2}"
+                    f" nhinc={nhinc} nwinc={nwinc}\n")
+
+        # Via edge: explicit w,h override regardless (via geometry differs).
         via_edge_idx = n1 - 1
         f.write(f"E{via_edge_idx} N{n1 - 1} N{n1}"
                 f" w={via_w} h={via_h}\n")
 
-        # Edges within layer 2.
+        # Edges within layer 2 (use layer-2 defaults if we emitted them).
         for j in range(n2 - 1):
-            edge_idx = n1 + j     # continues numbering past the via edge
+            edge_idx = n1 + j
             f.write(f"E{edge_idx} N{n1 + j} N{n1 + j + 1}\n")
         f.write("\n")
 

@@ -17,7 +17,7 @@ the general NxN case because it's not harder.
 """
 
 import re
-import cmath
+import math
 
 
 _FREQ_HEADER_RE = re.compile(
@@ -115,7 +115,7 @@ def inductance_from_z(z_complex, frequency_hz):
     L = imag(Z) / (2 * pi * f). Assumes series L-R model, which is what
     FastHenry outputs for a single-port extraction.
     """
-    return z_complex.imag / (2.0 * cmath.pi.real * frequency_hz)
+    return z_complex.imag / (2.0 * math.pi * frequency_hz)
 
 
 def resistance_from_z(z_complex):
