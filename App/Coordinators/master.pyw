@@ -50,7 +50,7 @@ class CoilApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Coil2Inductor")
-        self.geometry("1500x950")
+        self.geometry("1200x850")
 
         # Load savestate once, keep in memory; writes go through helpers.
         self._state = savestate.load(PROJECT_ROOT)

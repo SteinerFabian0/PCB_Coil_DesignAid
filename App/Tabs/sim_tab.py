@@ -128,7 +128,7 @@ class SimTab(ttk.Frame):
 
         self.geom_frame = ttk.LabelFrame(row1, text="2-port geometry")
         gf = ttk.Frame(self.geom_frame); gf.pack(fill="x", padx=6, pady=6)
-        ttk.Label(gf, text="PCB gap TX-top→RX-bottom (mm):").pack(side="left")
+        ttk.Label(gf, text="PCB spacing (mm):").pack(side="left")
         self.pcb_gap_var = tk.StringVar(value="2.5")
         ttk.Entry(gf, textvariable=self.pcb_gap_var, width=8).pack(
             side="left", padx=4)
@@ -145,7 +145,7 @@ class SimTab(ttk.Frame):
         self.freq_var = tk.StringVar(value=self.DEFAULT_FREQ)
         ttk.Entry(sr, textvariable=self.freq_var, width=10).pack(
             side="left", padx=4)
-        ttk.Label(sr, text="Max iter:").pack(side="left", padx=(12, 0))
+        ttk.Label(sr, text="Max iterarions:").pack(side="left", padx=(12, 0))
         self.maxiter_var = tk.StringVar(value="")
         ttk.Entry(sr, textvariable=self.maxiter_var, width=6).pack(
             side="left", padx=4)
@@ -169,26 +169,42 @@ class SimTab(ttk.Frame):
         ttk.Label(rf, textvariable=self.sim_status,
                   foreground="gray").pack(side="right", padx=8)
 
+        coup = ttk.LabelFrame(body, text="Coupling (2-port only)")
+        coup.pack(fill="x", padx=8, pady=4)
+        cg = ttk.Frame(coup); cg.pack(fill="x", padx=6, pady=6)
+        self.res_M = tk.StringVar(value="—")
+        self.res_k = tk.StringVar(value="—")
+        self.res_Zmat = tk.StringVar(value="—")
+        self._put(cg, 0, 0, "Mutual inductance:", self.res_M)
+        self._put(cg, 0, 2, "Coupling coeff.:",          self.res_k)
+        self._put(cg, 1, 0, "Z-matrix (Ω):",        self.res_Zmat)
+
+        # Pre-initialize insight variables so they can be assigned flexibly
+        self.ins_vars = {k: tk.StringVar(value="—") for k in (
+            "f0_tx", "f0_rx", "df_tx", "df_rx",
+            "z_tx_drive", "p_on", "p_avg", "q_tx_rx", "k",
+            "p_rect_on", "v_rect_peak", "goal_status")}
+
         # -------------- Two-column TX / RX split ----------------------
         split = ttk.Frame(body); split.pack(fill="x", padx=8, pady=4)
-        tx_col = ttk.Frame(split); tx_col.pack(side="left", fill="both",
-                                                expand=True)
+        split.columnconfigure(0, weight=1, uniform="col")
+        split.columnconfigure(1, weight=0)
+        split.columnconfigure(2, weight=1, uniform="col")
+
         # Subtle vertical separator.
         sep = tk.Frame(split, bg="#b0b0b0", width=2)
-        sep.pack(side="left", fill="y", padx=4)
-        rx_col = ttk.Frame(split); rx_col.pack(side="left", fill="both",
-                                                expand=True)
+        sep.grid(row=0, column=1, rowspan=2, sticky="ns", padx=4)
 
-        # TX column: inputs, then results.
-        tx_in = ttk.LabelFrame(tx_col, text="TX inputs")
-        tx_in.pack(fill="x", pady=(0, 4))
+        # TX inputs
+        tx_in = ttk.LabelFrame(split, text="TX inputs")
+        tx_in.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
         self.cap_tx = CapField(tx_in, "C_TX (nF):",
                                on_value_change=self._update_insights)
         self.cap_tx.pack(fill="x", padx=4, pady=2)
         r = ttk.Frame(tx_in); r.pack(fill="x", padx=4, pady=2)
         ttk.Label(r, text="V_supply min (V):",
                   width=18, anchor="w").pack(side="left")
-        self.v_min_var = tk.StringVar(value="3.3")
+        self.v_min_var = tk.StringVar(value="3.2")
         ttk.Entry(r, textvariable=self.v_min_var, width=8).pack(
             side="left", padx=2)
         r = ttk.Frame(tx_in); r.pack(fill="x", padx=4, pady=2)
@@ -200,7 +216,7 @@ class SimTab(ttk.Frame):
         r = ttk.Frame(tx_in); r.pack(fill="x", padx=4, pady=2)
         ttk.Label(r, text="Envelope duty %:",
                   width=18, anchor="w").pack(side="left")
-        self.duty_var = tk.StringVar(value="50")
+        self.duty_var = tk.StringVar(value="60")
         ttk.Entry(r, textvariable=self.duty_var, width=8).pack(
             side="left", padx=2)
         r = ttk.Frame(tx_in); r.pack(fill="x", padx=4, pady=2)
@@ -210,28 +226,24 @@ class SimTab(ttk.Frame):
         ttk.Entry(r, textvariable=self.fc_var, width=10).pack(
             side="left", padx=2)
 
-        self.tx_frame, self.res_tx = self._make_coil_result_frame(tx_col, "TX")
-
-        # RX column: inputs, then results.
-        rx_in = ttk.LabelFrame(rx_col, text="RX inputs")
-        rx_in.pack(fill="x", pady=(0, 4))
+        # RX inputs
+        rx_in = ttk.LabelFrame(split, text="RX inputs")
+        rx_in.grid(row=0, column=2, sticky="nsew", pady=(0, 4))
         self.cap_rx = CapField(rx_in, "C_RX (nF):",
                                on_value_change=self._update_insights)
         self.cap_rx.pack(fill="x", padx=4, pady=2)
         r = ttk.Frame(rx_in); r.pack(fill="x", padx=4, pady=2)
         ttk.Label(r, text="Avg P consumption (W):",
                   width=22, anchor="w").pack(side="left")
-        self.p_avg_var = tk.StringVar(value="0.1")
+        self.p_avg_var = tk.StringVar(value="0.05")
         ttk.Entry(r, textvariable=self.p_avg_var, width=8).pack(
             side="left", padx=2)
         r = ttk.Frame(rx_in); r.pack(fill="x", padx=4, pady=2)
         ttk.Label(r, text="Min V_rectified (V):",
                   width=22, anchor="w").pack(side="left")
-        self.v_rect_min_var = tk.StringVar(value="3.4")
+        self.v_rect_min_var = tk.StringVar(value="3.3")
         ttk.Entry(r, textvariable=self.v_rect_min_var, width=8).pack(
             side="left", padx=2)
-
-        self.rx_frame, self.res_rx = self._make_coil_result_frame(rx_col, "RX")
 
         # Trace all the user-fillable insight inputs.
         for v in (self.v_min_var, self.v_max_var, self.duty_var,
@@ -240,36 +252,51 @@ class SimTab(ttk.Frame):
                         lambda *_a: (self._update_insights(),
                                      self._save_state()))
 
-        # ---- Shared block: coupling + derived ----------------------------
-        coup = ttk.LabelFrame(body, text="Coupling (2-port only)")
-        coup.pack(fill="x", padx=8, pady=4)
-        cg = ttk.Frame(coup); cg.pack(fill="x", padx=6, pady=6)
-        self.res_M = tk.StringVar(value="—")
-        self.res_k = tk.StringVar(value="—")
-        self.res_Zmat = tk.StringVar(value="—")
-        self._put(cg, 0, 0, "Mutual inductance M:", self.res_M)
-        self._put(cg, 0, 2, "Coupling k:",          self.res_k)
-        self._put(cg, 1, 0, "Z-matrix (Ω):",        self.res_Zmat)
+        # TX results and appended insights (forced inside the bounding box)
+        tx_res_container = ttk.Frame(split)
+        tx_res_container.grid(row=1, column=0, sticky="nsew")
+        self.tx_frame, self.res_tx = self._make_coil_result_frame(tx_res_container, "TX")
+        
+        tx_extra = ttk.Frame(self.tx_frame)
+        try:
+            tx_extra.pack(fill="x", pady=(4, 6), padx=6)
+        except tk.TclError:
+            # Fallback if _make_coil_result_frame uses .grid() internally
+            tx_extra.grid(row=99, column=0, columnspan=4, sticky="ew", pady=(4, 6), padx=6)
+            
+        ttk.Label(tx_extra, text=" f0 TX:", font=("", 9, "bold"), width=16).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(tx_extra, textvariable=self.ins_vars["f0_tx"]).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        ttk.Label(tx_extra, text=" Δf TX (fc-f0):", font=("", 9, "bold"), width=16).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(tx_extra, textvariable=self.ins_vars["df_tx"]).grid(row=1, column=1, sticky="w", padx=4, pady=2)
 
+        # RX results and appended insights (forced inside the bounding box)
+        rx_res_container = ttk.Frame(split)
+        rx_res_container.grid(row=1, column=2, sticky="nsew")
+        self.rx_frame, self.res_rx = self._make_coil_result_frame(rx_res_container, "RX")
+
+        rx_extra = ttk.Frame(self.rx_frame)
+        try:
+            rx_extra.pack(fill="x", pady=(4, 6), padx=6)
+        except tk.TclError:
+            # Fallback if _make_coil_result_frame uses .grid() internally
+            rx_extra.grid(row=99, column=0, columnspan=4, sticky="ew", pady=(4, 6), padx=6)
+
+        ttk.Label(rx_extra, text=" f0 RX:", font=("", 9, "bold"), width=16).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(rx_extra, textvariable=self.ins_vars["f0_rx"]).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        ttk.Label(rx_extra, text=" Δf RX (target-f0):", font=("", 9, "bold"), width=16).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(rx_extra, textvariable=self.ins_vars["df_rx"]).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+        # ---------------- Moved Derived Insights ----------------------
         ins = ttk.LabelFrame(body, text="Derived system insights")
         ins.pack(fill="x", padx=8, pady=4)
-        self.ins_vars = {k: tk.StringVar(value="—") for k in (
-            "f0_tx", "f0_rx", "df_tx", "df_rx",
-            "z_tx_drive", "p_on", "p_avg", "q_tx_rx", "k",
-            "p_rect_on", "v_rect_peak", "goal_status")}
         og = ttk.Frame(ins); og.pack(fill="x", padx=6, pady=4)
         items = [
-            ("f₀ TX:",               "f0_tx"),
-            ("Δf TX (fc-f0):",       "df_tx"),
-            ("f₀ RX:",               "f0_rx"),
-            ("Δf RX (target-f0):",   "df_rx"),
-            ("|Z_TX| at drive:",     "z_tx_drive"),
-            ("Coupling k:",          "k"),
             ("Q_TX / Q_RX:",         "q_tx_rx"),
-            ("P_in ON  (Vmin→max):", "p_on"),
-            ("P_in avg (Vmin→max):", "p_avg"),
-            ("P_rect ON (Vmin→max):","p_rect_on"),
-            ("V_rect pk (Vmin→max):","v_rect_peak"),
+            ("|Z_TX| at drive:",     "z_tx_drive"),
+            ("TX-Power draw (on) (Vmin→max):", "p_on"),
+            ("RX-Power rectified (on) (Vmin→max):","p_rect_on"),
+            ("TX-Power draw (avg) (Vmin→max):", "p_avg"),
+            ("RX-Voltage rect. (peak) (Vmin→max):","v_rect_peak"),
         ]
         for i, (lbl, key) in enumerate(items):
             r, c = divmod(i, 2)
@@ -280,7 +307,7 @@ class SimTab(ttk.Frame):
         ttk.Label(ins, textvariable=self.ins_vars["goal_status"],
                   foreground="#206020",
                   font=("", 9, "bold")).pack(anchor="w", padx=6, pady=(0, 4))
-
+        
     def _make_coil_result_frame(self, parent, role):
         frame = ttk.LabelFrame(parent, text=f"{role} coil results")
         frame.pack(fill="x", pady=(0, 4))
@@ -342,7 +369,7 @@ class SimTab(ttk.Frame):
                   ).pack(anchor="w", padx=8, pady=(8, 2))
 
         ctrl = ttk.Frame(parent); ctrl.pack(fill="x", padx=8, pady=(0, 4))
-        self._stackup_true_scale = tk.BooleanVar(value=True)   # ON default
+        self._stackup_true_scale = tk.BooleanVar(value=False)   # OFF default
         ttk.Checkbutton(ctrl, text="True Scale",
                         variable=self._stackup_true_scale,
                         command=self._redraw_stackup
@@ -478,7 +505,7 @@ class SimTab(ttk.Frame):
         try: run_inp = self._prepare_run_inp()
         except Exception as e:
             messagebox.showerror("Simulation", f"Prepare failed: {e}"); return
-        max_iter = self._parse_opt_int(self.maxiter_var.get(), "Max iter")
+        max_iter = self._parse_opt_int(self.maxiter_var.get(), "Max iterations:")
         if max_iter is False: return
         tol = self._parse_opt_float(self.tol_var.get(), "Tol")
         if tol is False: return
