@@ -395,6 +395,13 @@ class SimTab(ttk.Frame):
                     self._sim_queue.put(("error", "Zc.mat empty.")); return
                 f_used, Zmat = zc_parser.matrix_at(blocks, target_f)
                 n_ports = zc_parser.port_count(blocks)
+                if len(Zmat) < n_ports or any(len(r) < n_ports for r in Zmat):
+                    self._sim_queue.put((
+                        "error",
+                        f"Zc.mat matrix is {len(Zmat)}×{len(Zmat[0]) if Zmat else 0} "
+                        f"but header says {n_ports}×{n_ports}. "
+                        "FastHenry may not have converged (NaN in output)."
+                    )); return
                 self._sim_queue.put(("done", {"frequency": f_used,
                                                "Zmat": Zmat,
                                                "n_ports": n_ports}))

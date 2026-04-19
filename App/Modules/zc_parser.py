@@ -26,12 +26,24 @@ _FREQ_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A matrix entry looks like: "  1.70447      +4.37211j"
-# Real and imaginary are whitespace-separated; j marks imaginary.
+# A matrix entry: "  1.70447      +4.37211j"  or  "  -nan(ind)     -nan(ind)j"
+# The NaN/Inf variants appear when FastHenry doesn't converge.
+_SCALAR_PAT = r"[-+]?(?:nan(?:\([^)]*\))?|inf|\d+\.?\d*(?:[eE][-+]?\d+)?)"
+_SIGNED_PAT = r"[-+](?:nan(?:\([^)]*\))?|inf|\d+\.?\d*(?:[eE][-+]?\d+)?)"
 _COMPLEX_RE = re.compile(
-    r"([-+]?\d+\.?\d*(?:[eE][-+]?\d+)?)\s*"       # real
-    r"([-+]\d+\.?\d*(?:[eE][-+]?\d+)?)j",         # imag + 'j'
+    rf"({_SCALAR_PAT})\s*({_SIGNED_PAT})j",
+    re.IGNORECASE,
 )
+
+
+def _parse_scalar(s):
+    """Parse a float string that may contain 'nan(ind)' or 'inf'."""
+    sl = s.lower()
+    if "nan" in sl:
+        return float("nan")
+    if "inf" in sl:
+        return float("-inf") if sl.lstrip().startswith("-") else float("inf")
+    return float(s)
 
 
 def parse_zc_mat(filepath):
@@ -76,9 +88,9 @@ def parse_zc_mat(filepath):
                 # Header line ("Row 1: n0 to n4485") or similar - skip.
                 continue
 
-            # Parse a row of complex numbers.
+            # Parse a row of complex numbers (NaN/Inf included).
             row = [
-                complex(float(re_), float(im))
+                complex(_parse_scalar(re_), _parse_scalar(im))
                 for re_, im in _COMPLEX_RE.findall(line)
             ]
             if row:

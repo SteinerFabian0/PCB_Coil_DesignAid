@@ -22,9 +22,11 @@ import parametric_coil as pc
 
 try:
     import fasthenry_runner as runner
+    import zc_parser
     _RUNNER_OK = True
 except Exception:
     runner = None
+    zc_parser = None
     _RUNNER_OK = False
 
 # --- Visual constants -----------------------------------------------------
@@ -59,14 +61,14 @@ class ParametricCoilTab(ttk.Frame):
     DEFAULT_OD_MM         = 52.0
     DEFAULT_TRACE_W_MM    = 0.4
     DEFAULT_SPACING_MM    = 0.16
-    DEFAULT_TURNS         = 10
+    DEFAULT_TURNS         = 11
     DEFAULT_RESOLUTION_MM = 0.6
     DEFAULT_OUTER_GAP     = 0.2
     DEFAULT_INNER_GAP     = 1.3
     DEFAULT_COPPER_OZ     = [1.0, 0.5, 0.5, 1.0]
 
-    QUICKSIM_RESOLUTION_MM = 1.0
-    QUICKSIM_MAX_ITER      = 80
+    QUICKSIM_RESOLUTION_MM = 1.2
+    QUICKSIM_TIMEOUT_SEC   = 120   # wall-clock limit for quickSim
 
     def __init__(self, parent, app, role, coil_index, temp_dir,
                  on_next_tab=None, **kw):
@@ -693,8 +695,11 @@ class ParametricCoilTab(ttk.Frame):
                                  "Set target frequency in Simulation tab.")
             return
         fmax = fmin + 15000.0
-        dest = os.path.join(self.temp_dir,
-                            f"quicksim_{self.role.lower()}.inp")
+        # Use a dedicated sub-directory so quickSim's Zc.mat never collides
+        # with the sim-tab's Zc.mat (both would otherwise land in temp/).
+        qs_dir = os.path.join(self.temp_dir, f"qs_{self.role.lower()}")
+        os.makedirs(qs_dir, exist_ok=True)
+        dest = os.path.join(qs_dir, f"quicksim_{self.role.lower()}.inp")
         try:
             self._compose_inp(dest, fmin, fmax,
                               resolution_override=self.QUICKSIM_RESOLUTION_MM,
@@ -714,13 +719,18 @@ class ParametricCoilTab(ttk.Frame):
         try:
             with runner.FastHenryRunner() as fh:
                 ok = fh.run(inp_path,
-                            max_iter=self.QUICKSIM_MAX_ITER,
+                            timeout_sec=self.QUICKSIM_TIMEOUT_SEC,
                             progress_cb=None)
                 if not ok:
                     self._quicksim_queue.put(("error", "Timed out")); return
-                res = fh.single_port_result(target_f)
-                L_uh = res["L_henry"] * 1e6
-                self._quicksim_queue.put(("done", L_uh))
+                zc_path = os.path.join(os.path.dirname(inp_path), "Zc.mat")
+                fh.export_zc_mat(zc_path)
+                blocks = zc_parser.parse_zc_mat(zc_path)
+                if not blocks:
+                    self._quicksim_queue.put(("error", "Zc.mat empty")); return
+                f_used, Zmat = zc_parser.matrix_at(blocks, target_f)
+                L_h = Zmat[0][0].imag / (2.0 * math.pi * f_used)
+                self._quicksim_queue.put(("done", L_h * 1e6))
         except Exception as e:
             self._quicksim_queue.put(("error",
                                       f"{type(e).__name__}: {e}"))
