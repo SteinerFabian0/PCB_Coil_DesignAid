@@ -38,17 +38,17 @@ def build_command_line(inp_path, max_iter=180, tol=None, extra_args=None):
     """
     Build the string passed to FastHenry2.Run().
 
-    The Run() method takes "a FastHenry2 command line, as would be given
-    from a shell console" (per the docs you shared), so the first token
-    is the .inp file and the rest are the usual FastHenry flags.
-
-    Quoting: paths with spaces must be quoted. We always quote.
+    FastHenry's option parser reads values concatenated to the same argv
+    token (C-style: atoi(&argv[i][2])). So it's "-i180", NOT "-i 180" —
+    with the space, the value parses as empty and "180" becomes a stray
+    positional argument, which is the bug that's been causing the max-iter
+    field to silently misbehave.
     """
     parts = [f'"{inp_path}"']
     if max_iter is not None:
-        parts.append(f"-i {int(max_iter)}")
+        parts.append(f"-i{int(max_iter)}")
     if tol is not None:
-        parts.append(f"-t {tol:g}")
+        parts.append(f"-t{tol:g}")
     if extra_args:
         parts.append(extra_args)
     return " ".join(parts)

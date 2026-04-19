@@ -103,39 +103,42 @@ def _bump_name(name, offset):
 
 
 def combine_two_port(inp1_path, inp2_path, out_path,
+                     z_offset_coil2=0.0,
                      header="Two-port coupled coil simulation"):
     """
-    Merge two single-port .inp files. Returns summary dict with port indices.
+    Merge two single-port .inp files into a two-port .inp.
+
+    z_offset_coil2 is added to every coil-2 node's z coordinate before
+    writing. The caller is responsible for computing this (typically so
+    that coil 2's bottom sits `gap` mm above coil 1's top).
+
+    Returns summary dict with port indices.
     """
     p1 = parse_inp(inp1_path)
     p2 = parse_inp(inp2_path)
 
-    # Shift coil 2's node indices past coil 1's highest.
     max_n1 = max(int(n[0][1:]) for n in p1["nodes"])
     offset = max_n1 + 1
-
-    # Edge index counter resets to zero and spans both coils, avoiding E# collisions.
     e_counter = 0
 
     with open(out_path, "w", newline="\n") as f:
         f.write(f"* {header}\n")
         f.write(f"* Coil 1 source: {inp1_path}\n")
         f.write(f"* Coil 2 source: {inp2_path}\n")
+        if z_offset_coil2 != 0.0:
+            f.write(f"* Coil 2 z-shifted by {z_offset_coil2:+.4f} mm\n")
         if p1["freq"] != p2["freq"]:
             f.write(f"* NOTE: coil 2 had freq '{p2['freq']}', "
                     f"using coil 1's for the combined sweep.\n")
         f.write(".Units mm\n\n")
 
-        # Nodes, coil 1 then coil 2 with offset.
         for name, x, y, z in p1["nodes"]:
             f.write(f"{name} x={x:.6g} y={y:.6g} z={z:.6g}\n")
         for name, x, y, z in p2["nodes"]:
             f.write(f"{_bump_name(name, offset)} "
-                    f"x={x:.6g} y={y:.6g} z={z:.6g}\n")
+                    f"x={x:.6g} y={y:.6g} z={z + z_offset_coil2:.6g}\n")
         f.write("\n")
 
-        # All edges written with fully explicit params (no .Default inheritance
-        # across the coil boundary).
         for e in p1["edges"]:
             kv = " ".join(f"{k}={v:g}" for k, v in e["params"].items())
             f.write(f"E{e_counter} {e['from']} {e['to']} {kv}\n")
@@ -159,4 +162,5 @@ def combine_two_port(inp1_path, inp2_path, out_path,
         "external_coil1": ext1,
         "external_coil2": ext2,
         "offset": offset,
+        "z_offset_coil2": z_offset_coil2,
     }
