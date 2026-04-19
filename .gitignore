@@ -6,3 +6,4 @@ temp/Zc.mat
 *.mat
 /App/Tabs/__pycache__
 /savestate
+/App/Savestate/__pycache__

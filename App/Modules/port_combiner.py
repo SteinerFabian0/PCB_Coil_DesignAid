@@ -102,65 +102,77 @@ def _bump_name(name, offset):
     return f"N{int(name[1:]) + offset}"
 
 
-def combine_two_port(inp1_path, inp2_path, out_path,
-                     z_offset_coil2=0.0,
+def combine_two_port(inp_tx_path, inp_rx_path, out_path,
+                     pcb_gap_mm=0.0,
                      header="Two-port coupled coil simulation"):
     """
-    Merge two single-port .inp files into a two-port .inp.
+    Merge two single-port .inp files (TX + RX) into a two-port .inp.
 
-    z_offset_coil2 is added to every coil-2 node's z coordinate before
-    writing. The caller is responsible for computing this (typically so
-    that coil 2's bottom sits `gap` mm above coil 1's top).
+    Stacking convention:
+      - RX nodes are written at their original z coordinates.
+      - TX nodes are shifted UP in code-z so that TX's lowest z lands at
+        (RX's max z + pcb_gap_mm). I.e. the PCB gap separates TX's bottom
+        and RX's top. Port 0 = TX (first .external), port 1 = RX.
 
-    Returns summary dict with port indices.
+    In the user's mental model (where each coil's slot 1 is "topmost"),
+    this places RX physically above TX with `pcb_gap_mm` separation.
     """
-    p1 = parse_inp(inp1_path)
-    p2 = parse_inp(inp2_path)
+    p_tx = parse_inp(inp_tx_path)
+    p_rx = parse_inp(inp_rx_path)
 
-    max_n1 = max(int(n[0][1:]) for n in p1["nodes"])
-    offset = max_n1 + 1
+    # Z-shift computation.
+    z_tx_min = min(n[3] for n in p_tx["nodes"])
+    z_rx_max = max(n[3] for n in p_rx["nodes"])
+    z_shift_tx = z_rx_max + pcb_gap_mm - z_tx_min
+
+    # Renumber RX past TX's highest index; keeps port 0 = TX.
+    max_n_tx = max(int(n[0][1:]) for n in p_tx["nodes"])
+    offset = max_n_tx + 1
+
     e_counter = 0
-
     with open(out_path, "w", newline="\n") as f:
         f.write(f"* {header}\n")
-        f.write(f"* Coil 1 source: {inp1_path}\n")
-        f.write(f"* Coil 2 source: {inp2_path}\n")
-        if z_offset_coil2 != 0.0:
-            f.write(f"* Coil 2 z-shifted by {z_offset_coil2:+.4f} mm\n")
-        if p1["freq"] != p2["freq"]:
-            f.write(f"* NOTE: coil 2 had freq '{p2['freq']}', "
-                    f"using coil 1's for the combined sweep.\n")
+        f.write(f"* TX source: {inp_tx_path}\n")
+        f.write(f"* RX source: {inp_rx_path}\n")
+        f.write(f"* PCB gap (TX-top to RX-bottom, code-z): {pcb_gap_mm} mm\n")
+        f.write(f"* TX z-shift applied: {z_shift_tx:.4f} mm\n")
+        if p_tx["freq"] != p_rx["freq"]:
+            f.write(f"* NOTE: RX .freq '{p_rx['freq']}' ignored; "
+                    f"using TX's '{p_tx['freq']}'.\n")
         f.write(".Units mm\n\n")
 
-        for name, x, y, z in p1["nodes"]:
-            f.write(f"{name} x={x:.6g} y={y:.6g} z={z:.6g}\n")
-        for name, x, y, z in p2["nodes"]:
+        # TX nodes first (original N-indices), z-shifted.
+        for name, x, y, z in p_tx["nodes"]:
+            f.write(f"{name} x={x:.6g} y={y:.6g} z={z + z_shift_tx:.6g}\n")
+        # RX nodes with renumbered indices, original z.
+        for name, x, y, z in p_rx["nodes"]:
             f.write(f"{_bump_name(name, offset)} "
-                    f"x={x:.6g} y={y:.6g} z={z + z_offset_coil2:.6g}\n")
+                    f"x={x:.6g} y={y:.6g} z={z:.6g}\n")
         f.write("\n")
 
-        for e in p1["edges"]:
+        # Edges with all per-edge params explicit (no .Default inheritance).
+        for e in p_tx["edges"]:
             kv = " ".join(f"{k}={v:g}" for k, v in e["params"].items())
             f.write(f"E{e_counter} {e['from']} {e['to']} {kv}\n")
             e_counter += 1
-        for e in p2["edges"]:
+        for e in p_rx["edges"]:
             kv = " ".join(f"{k}={v:g}" for k, v in e["params"].items())
             f.write(f"E{e_counter} {_bump_name(e['from'], offset)} "
                     f"{_bump_name(e['to'], offset)} {kv}\n")
             e_counter += 1
         f.write("\n")
 
-        ext1 = p1["external"]
-        ext2 = (_bump_name(p2["external"][0], offset),
-                _bump_name(p2["external"][1], offset))
-        f.write(f".external {ext1[0]} {ext1[1]}\n")
-        f.write(f".external {ext2[0]} {ext2[1]}\n\n")
-
-        f.write(f".freq {p1['freq']}\n\n.end\n")
+        # TX external first → port 0 = TX.
+        ext_tx = p_tx["external"]
+        ext_rx = (_bump_name(p_rx["external"][0], offset),
+                  _bump_name(p_rx["external"][1], offset))
+        f.write(f".external {ext_tx[0]} {ext_tx[1]}\n")
+        f.write(f".external {ext_rx[0]} {ext_rx[1]}\n\n")
+        f.write(f".freq {p_tx['freq']}\n\n.end\n")
 
     return {
-        "external_coil1": ext1,
-        "external_coil2": ext2,
+        "external_tx": ext_tx,
+        "external_rx": ext_rx,
         "offset": offset,
-        "z_offset_coil2": z_offset_coil2,
+        "z_shift_tx": z_shift_tx,
     }

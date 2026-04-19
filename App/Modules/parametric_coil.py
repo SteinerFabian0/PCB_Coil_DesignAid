@@ -342,3 +342,308 @@ def write_parallel_multilayer_inp(layer_data, out_path,
         "external_end":   end_idx,
         "slot_offsets":   offsets,
     }
+
+    # ---------------------------------------------------------------------------
+# Series-connection emitter (all slots in one chain)
+# ---------------------------------------------------------------------------
+
+def write_series_inp(layer_data, out_path, w_mm,
+                     sigma=COPPER_SIGMA_PER_MM,
+                     nhinc=1, nwinc=3,
+                     via_w_mm=None, via_h_mm=None,
+                     fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
+                     header="Parametric all-series multilayer coil"):
+    """
+    All active slots in one series chain, with alternating layers'
+    node ordering reversed so B-fields add. After reversal, each
+    slot's "exit" node is always offsets[k] + len(nodes) - 1 and
+    its "entry" is offsets[k] — so vias are exit-to-entry links.
+    """
+    if not layer_data:
+        raise ValueError("layer_data is empty")
+
+    flags = series_reverse_flags_for_topology("series", len(layer_data))
+    layer_data = reverse_nodes_for_series_flow(layer_data, flags)
+
+    if via_w_mm is None: via_w_mm = w_mm
+    if via_h_mm is None: via_h_mm = layer_data[0]["h_mm"]
+
+    offsets, cum = [], 0
+    for ld in layer_data:
+        offsets.append(cum); cum += len(ld["nodes"])
+
+    def first_of(k): return offsets[k]
+    def last_of(k):  return offsets[k] + len(layer_data[k]["nodes"]) - 1
+
+    with open(out_path, "w", newline="\n") as f:
+        f.write(f"* {header}\n")
+        for ld in layer_data:
+            f.write(f"* slot {ld['slot']}: z={ld['z']:.3f} mm, "
+                    f"h={ld['h_mm']:.4f} mm\n")
+        f.write(".Units mm\n\n")
+        f.write(f".Default sigma={sigma} w={w_mm} h={layer_data[0]['h_mm']}"
+                f" nhinc={nhinc} nwinc={nwinc}\n\n")
+
+        for k, ld in enumerate(layer_data):
+            for i, (x, y, z) in enumerate(ld["nodes"]):
+                f.write(f"N{offsets[k] + i} x={x:.6g} y={y:.6g} z={z:.6g}\n")
+        f.write("\n")
+
+        edge_counter = 0
+        current_h = layer_data[0]["h_mm"]
+        for k, ld in enumerate(layer_data):
+            if ld["h_mm"] != current_h:
+                current_h = ld["h_mm"]
+                f.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+                        f" nhinc={nhinc} nwinc={nwinc}\n")
+            base = offsets[k]
+            for i in range(len(ld["nodes"]) - 1):
+                f.write(f"E{edge_counter} N{base + i} N{base + i + 1}\n")
+                edge_counter += 1
+        f.write("\n")
+
+        # Series chain: exit of slot k → entry of slot k+1.
+        for k in range(len(layer_data) - 1):
+            f.write(f"E{edge_counter} N{last_of(k)} N{first_of(k + 1)}"
+                    f" w={via_w_mm} h={via_h_mm}\n")
+            edge_counter += 1
+        f.write("\n")
+
+        start_idx = first_of(0)
+        end_idx   = last_of(len(layer_data) - 1)
+        f.write(f".external N{start_idx} N{end_idx}\n\n")
+        f.write(f".freq fmin={fmin} fmax={fmax} ndec={freq_ndec}\n\n.end\n")
+
+    return {"total_nodes": cum, "external_start": start_idx,
+            "external_end": end_idx, "slot_offsets": offsets,
+            "reverse_flags": flags}
+
+
+def write_series_pairs_parallel_inp(layer_data, out_path, w_mm,
+                                    sigma=COPPER_SIGMA_PER_MM,
+                                    nhinc=1, nwinc=3,
+                                    via_w_mm=None, via_h_mm=None,
+                                    fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
+                                    header="Two series pairs in parallel"):
+    """(slot0→slot1) series  ||  (slot2→slot3) series.
+    Slot 1 and slot 3 reversed so each pair's B-field adds."""
+    if len(layer_data) != 4:
+        raise ValueError("series_pairs_par requires exactly 4 slots")
+
+    flags = series_reverse_flags_for_topology("series_pairs_par", 4)
+    layer_data = reverse_nodes_for_series_flow(layer_data, flags)
+
+    if via_w_mm is None: via_w_mm = w_mm
+    if via_h_mm is None: via_h_mm = layer_data[0]["h_mm"]
+
+    offsets, cum = [], 0
+    for ld in layer_data:
+        offsets.append(cum); cum += len(ld["nodes"])
+    def first_of(k): return offsets[k]
+    def last_of(k):  return offsets[k] + len(layer_data[k]["nodes"]) - 1
+
+    with open(out_path, "w", newline="\n") as f:
+        f.write(f"* {header}\n.Units mm\n\n")
+        f.write(f".Default sigma={sigma} w={w_mm} h={layer_data[0]['h_mm']}"
+                f" nhinc={nhinc} nwinc={nwinc}\n\n")
+        for k, ld in enumerate(layer_data):
+            for i, (x, y, z) in enumerate(ld["nodes"]):
+                f.write(f"N{offsets[k] + i} x={x:.6g} y={y:.6g} z={z:.6g}\n")
+        f.write("\n")
+
+        edge_counter = 0
+        current_h = layer_data[0]["h_mm"]
+        for k, ld in enumerate(layer_data):
+            if ld["h_mm"] != current_h:
+                current_h = ld["h_mm"]
+                f.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+                        f" nhinc={nhinc} nwinc={nwinc}\n")
+            base = offsets[k]
+            for i in range(len(ld["nodes"]) - 1):
+                f.write(f"E{edge_counter} N{base + i} N{base + i + 1}\n")
+                edge_counter += 1
+        f.write("\n")
+
+        # Series vias inside each pair: exit→entry of next slot.
+        f.write(f"E{edge_counter} N{last_of(0)} N{first_of(1)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        f.write(f"E{edge_counter} N{last_of(2)} N{first_of(3)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        # Parallel ladder: pair A entry↔pair B entry, pair A exit↔pair B exit.
+        # Pair A entry = first_of(0); pair A exit = last_of(1).
+        # Pair B entry = first_of(2); pair B exit = last_of(3).
+        f.write(f"E{edge_counter} N{first_of(0)} N{first_of(2)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        f.write(f"E{edge_counter} N{last_of(1)} N{last_of(3)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        f.write("\n")
+
+        start_idx = first_of(0); end_idx = last_of(1)
+        f.write(f".external N{start_idx} N{end_idx}\n\n")
+        f.write(f".freq fmin={fmin} fmax={fmax} ndec={freq_ndec}\n\n.end\n")
+
+    return {"total_nodes": cum, "external_start": start_idx,
+            "external_end": end_idx, "slot_offsets": offsets,
+            "reverse_flags": flags}
+
+
+def write_parallel_pairs_series_inp(layer_data, out_path, w_mm,
+                                    sigma=COPPER_SIGMA_PER_MM,
+                                    nhinc=1, nwinc=3,
+                                    via_w_mm=None, via_h_mm=None,
+                                    fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
+                                    header="Two parallel pairs in series"):
+    """(slot0 || slot1) series (slot2 || slot3).
+    Both slots in pair B reversed so the whole structure's B adds."""
+    if len(layer_data) != 4:
+        raise ValueError("parallel_pairs_ser requires exactly 4 slots")
+
+    flags = series_reverse_flags_for_topology("parallel_pairs_ser", 4)
+    layer_data = reverse_nodes_for_series_flow(layer_data, flags)
+
+    if via_w_mm is None: via_w_mm = w_mm
+    if via_h_mm is None: via_h_mm = layer_data[0]["h_mm"]
+
+    offsets, cum = [], 0
+    for ld in layer_data:
+        offsets.append(cum); cum += len(ld["nodes"])
+    def first_of(k): return offsets[k]
+    def last_of(k):  return offsets[k] + len(layer_data[k]["nodes"]) - 1
+
+    with open(out_path, "w", newline="\n") as f:
+        f.write(f"* {header}\n.Units mm\n\n")
+        f.write(f".Default sigma={sigma} w={w_mm} h={layer_data[0]['h_mm']}"
+                f" nhinc={nhinc} nwinc={nwinc}\n\n")
+        for k, ld in enumerate(layer_data):
+            for i, (x, y, z) in enumerate(ld["nodes"]):
+                f.write(f"N{offsets[k] + i} x={x:.6g} y={y:.6g} z={z:.6g}\n")
+        f.write("\n")
+
+        edge_counter = 0
+        current_h = layer_data[0]["h_mm"]
+        for k, ld in enumerate(layer_data):
+            if ld["h_mm"] != current_h:
+                current_h = ld["h_mm"]
+                f.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+                        f" nhinc={nhinc} nwinc={nwinc}\n")
+            base = offsets[k]
+            for i in range(len(ld["nodes"]) - 1):
+                f.write(f"E{edge_counter} N{base + i} N{base + i + 1}\n")
+                edge_counter += 1
+        f.write("\n")
+
+        # Pair A parallel ladder (slots 0,1): entries together, exits together.
+        f.write(f"E{edge_counter} N{first_of(0)} N{first_of(1)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        f.write(f"E{edge_counter} N{last_of(0)} N{last_of(1)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        # Pair B parallel ladder (slots 2,3).
+        f.write(f"E{edge_counter} N{first_of(2)} N{first_of(3)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        f.write(f"E{edge_counter} N{last_of(2)} N{last_of(3)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        # Series bridge: pair A exit net → pair B entry net.
+        f.write(f"E{edge_counter} N{last_of(0)} N{first_of(2)}"
+                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
+        f.write("\n")
+
+        # External: pair A entry ↔ pair B exit.
+        start_idx = first_of(0); end_idx = last_of(2)
+        f.write(f".external N{start_idx} N{end_idx}\n\n")
+        f.write(f".freq fmin={fmin} fmax={fmax} ndec={freq_ndec}\n\n.end\n")
+
+    return {"total_nodes": cum, "external_start": start_idx,
+            "external_end": end_idx, "slot_offsets": offsets,
+            "reverse_flags": flags}
+
+
+def write_topology_inp(topology, layer_data, out_path, w_mm, **kwargs):
+    if topology == "parallel":
+        return write_parallel_multilayer_inp(layer_data, out_path,
+                                             w_mm=w_mm, **kwargs)
+    if topology == "series":
+        return write_series_inp(layer_data, out_path, w_mm=w_mm, **kwargs)
+    if topology == "series_pairs_par":
+        return write_series_pairs_parallel_inp(layer_data, out_path,
+                                               w_mm=w_mm, **kwargs)
+    if topology == "parallel_pairs_ser":
+        return write_parallel_pairs_series_inp(layer_data, out_path,
+                                               w_mm=w_mm, **kwargs)
+    raise ValueError(f"Unknown topology: {topology}")
+
+# ---------------------------------------------------------------------------
+# Dispatch helper — picks the right emitter for a topology name.
+# ---------------------------------------------------------------------------
+
+def write_topology_inp(topology, layer_data, out_path, w_mm, **kwargs):
+    """
+    Dispatch writer: topology ∈ {"parallel","series","series_pairs_par",
+    "parallel_pairs_ser"}.
+    """
+    if topology == "parallel":
+        return write_parallel_multilayer_inp(layer_data, out_path,
+                                             w_mm=w_mm, **kwargs)
+    if topology == "series":
+        return write_series_inp(layer_data, out_path, w_mm=w_mm, **kwargs)
+    if topology == "series_pairs_par":
+        return write_series_pairs_parallel_inp(layer_data, out_path,
+                                               w_mm=w_mm, **kwargs)
+    if topology == "parallel_pairs_ser":
+        return write_parallel_pairs_series_inp(layer_data, out_path,
+                                               w_mm=w_mm, **kwargs)
+    raise ValueError(f"Unknown topology: {topology}")
+
+# ---------------------------------------------------------------------------
+# Series B-field direction fix
+# ---------------------------------------------------------------------------
+
+def reverse_nodes_for_series_flow(layer_data, reverse_flags):
+    """
+    Return a *new* list of layer dicts where each entry whose flag is True
+    has its `nodes` list reversed. Required for series-connected layers
+    where the spiral on alternate layers must wind in the opposite node
+    ordering for the magnetic fields to add rather than cancel.
+
+    The spiral xy geometry stays identical — only the traversal direction
+    (and therefore the implied current direction) changes.
+
+    `reverse_flags` length must equal len(layer_data).
+    """
+    if len(reverse_flags) != len(layer_data):
+        raise ValueError("reverse_flags length mismatch")
+    out = []
+    for ld, rev in zip(layer_data, reverse_flags):
+        if rev:
+            out.append({**ld, "nodes": list(reversed(ld["nodes"]))})
+        else:
+            out.append({**ld, "nodes": list(ld["nodes"])})
+    return out
+
+
+def series_reverse_flags_for_topology(topology, n_layers):
+    """
+    For a given topology, which layers need their node order flipped so
+    the B-field adds? Convention: first layer of each series chain stays
+    native; subsequent series-chained layers alternate.
+
+    Returns list[bool] of length n_layers.
+    """
+    flags = [False] * n_layers
+    if topology == "series":
+        # Single chain over all active layers — alternate every layer.
+        for k in range(n_layers):
+            flags[k] = (k % 2 == 1)
+    elif topology == "series_pairs_par":
+        # Two independent chains: (0,1) and (2,3). Second of each pair reversed.
+        if n_layers >= 2: flags[1] = True
+        if n_layers >= 4: flags[3] = True
+    elif topology == "parallel_pairs_ser":
+        # Chain between pair A (slots 0,1) and pair B (slots 2,3). Slots
+        # inside a parallel pair wind the SAME way (both contribute current
+        # in the same direction through the tank). The two pairs are in
+        # series, so pair B must be reversed relative to pair A. Reverse
+        # BOTH slot 2 and slot 3.
+        if n_layers >= 3: flags[2] = True
+        if n_layers >= 4: flags[3] = True
+    # "parallel" → no reversal; all layers in parallel, same direction.
+    return flags
