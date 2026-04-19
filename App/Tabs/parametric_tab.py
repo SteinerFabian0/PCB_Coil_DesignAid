@@ -52,7 +52,7 @@ _STATUS_COLORS = {
 
 # For the default (non-true-scale) 3D view, exaggerate z gaps so thin
 # PCB stacks are visible alongside coil ODs of tens of mm.
-Z_EXAGGERATION = 10.0
+Z_EXAGGERATION = 12.0
 
 
 class ParametricCoilTab(ttk.Frame):

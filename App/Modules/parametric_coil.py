@@ -599,13 +599,28 @@ def write_topology_inp(topology, layer_data, out_path, w_mm, **kwargs):
 
 def reverse_nodes_for_series_flow(layer_data, reverse_flags):
     """
-    Return a *new* list of layer dicts where each entry whose flag is True
-    has its `nodes` list reversed. Required for series-connected layers
-    where the spiral on alternate layers must wind in the opposite node
-    ordering for the magnetic fields to add rather than cancel.
+    Return a *new* list of layer dicts. For each entry whose flag is
+    True, the layer's spiral is GEOMETRICALLY mirrored (y → -y) AND its
+    node list is reversed.
 
-    The spiral xy geometry stays identical — only the traversal direction
-    (and therefore the implied current direction) changes.
+    Why both operations are needed for series-connected layers:
+      * Reversing node order alone just walks the SAME physical spiral
+        backwards. The current's direction around the z-axis is
+        unchanged, so adjacent series layers carry CCW and CW currents
+        respectively — their B-fields cancel instead of adding.
+      * Mirroring y flips the spiral's angular winding sense (CCW
+        outside-to-inside becomes CW outside-to-inside). Combined with
+        the reversed traversal (now inside-to-outside), the current on
+        flipped layers rotates CCW around +z again, matching the non-
+        flipped layers so B-fields add.
+
+    Both spiral endpoints sit on the x-axis (y = 0), so y-mirroring
+    leaves them unchanged. Via stitching is therefore unaffected: the
+    first/last xy of each layer still matches its neighbour's.
+
+    Applying this function twice is an identity (y→-y twice is +y,
+    reverse twice is original), which callers rely on to round-trip
+    between visualizer-native and writer-native layer data.
 
     `reverse_flags` length must equal len(layer_data).
     """
@@ -614,11 +629,11 @@ def reverse_nodes_for_series_flow(layer_data, reverse_flags):
     out = []
     for ld, rev in zip(layer_data, reverse_flags):
         if rev:
-            out.append({**ld, "nodes": list(reversed(ld["nodes"]))})
+            mirrored = [(x, -y, z) for (x, y, z) in ld["nodes"]]
+            out.append({**ld, "nodes": list(reversed(mirrored))})
         else:
             out.append({**ld, "nodes": list(ld["nodes"])})
     return out
-
 
 def series_reverse_flags_for_topology(topology, n_layers):
     """

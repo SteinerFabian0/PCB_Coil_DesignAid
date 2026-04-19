@@ -34,23 +34,33 @@ def _ensure_win32():
 # Command-line option assembly
 # -------------------------------------------------------------------------
 
-def build_command_line(inp_path, max_iter=180, tol=None, extra_args=None):
+def build_command_line(inp_path, max_iter=None, tol=None, extra_args=None):
     """
     Build the string passed to FastHenry2.Run().
 
-    FastHenry's option parser reads values concatenated to the same argv
-    token (C-style: atoi(&argv[i][2])). So it's "-i180", NOT "-i 180" —
-    with the space, the value parses as empty and "180" becomes a stray
-    positional argument, which is the bug that's been causing the max-iter
-    field to silently misbehave.
+    Two subtle requirements here — getting either wrong silently yields
+    NaN results from the solver:
+
+      * Each option and its value must live in a SINGLE argv token
+        (C-style parse: atoi(&argv[i][2])). So "-i180", not "-i 180".
+
+      * The input filename must come AFTER all flags. FastHenry's argv
+        walker treats the first non-"-" token as the input file and
+        stops consuming flags. If the file is first, every flag that
+        follows it is dropped — including -i and -t. The solver then
+        runs with a default/zero iteration cap and the GMRES output
+        comes back NaN. This is why typing ANY value into the max-iter
+        field used to turn the sim result into NaN, and why QuickSim
+        (which picks up the default max_iter) always returned NaN.
     """
-    parts = [f'"{inp_path}"']
+    parts = []
     if max_iter is not None:
         parts.append(f"-i{int(max_iter)}")
     if tol is not None:
         parts.append(f"-t{tol:g}")
     if extra_args:
         parts.append(extra_args)
+    parts.append(f'"{inp_path}"')
     return " ".join(parts)
 
 
@@ -136,7 +146,7 @@ class FastHenryRunner:
             pass
         self._obj = None
 
-    def run(self, inp_path, max_iter=180, tol=None, extra_args=None,
+    def run(self, inp_path, max_iter=None, tol=None, extra_args=None,
             timeout_sec=DEFAULT_TIMEOUT_SEC, progress_cb=None):
         """
         Kick off a simulation and block until it finishes or times out.

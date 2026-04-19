@@ -8,6 +8,10 @@ import os, sys, math, queue, shutil, threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
+
 _here = os.path.dirname(os.path.abspath(__file__))
 _modules = os.path.join(os.path.dirname(_here), "Modules")
 if _modules not in sys.path:
@@ -26,6 +30,11 @@ except Exception:
     _RUNNER_OK = False
 
 ROLE_TO_IDX = {"TX": 0, "RX": 1}
+
+# Stack-up viewer constants (mirrors parametric_tab's conventions so the
+# sim-tab preview matches the coil tab visually).
+_STK_LAYER_COLORS   = ["#e63434", "#18d935", "#ce6c33", "#2080d0"]
+_STK_Z_EXAGGERATION = 8
 
 
 class CapField(ttk.Frame):
@@ -87,7 +96,15 @@ class SimTab(ttk.Frame):
 
     # ---- layout ---------------------------------------------------------
     def _build(self):
-        outer = ttk.Frame(self); outer.pack(fill="both", expand=True)
+        # Right-hand stack-up viewer — packed FIRST so it claims a fixed
+        # column and the settings scroll-area flexes to fill the rest.
+        viewer_pane = ttk.Frame(self, width=440)
+        viewer_pane.pack(side="right", fill="y")
+        viewer_pane.pack_propagate(False)   # honour the fixed width
+        self._build_stackup_viewer(viewer_pane)
+
+        outer = ttk.Frame(self); outer.pack(side="left", fill="both",
+                                             expand=True)
         canvas = tk.Canvas(outer, highlightthickness=0)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
@@ -115,7 +132,9 @@ class SimTab(ttk.Frame):
         self.pcb_gap_var = tk.StringVar(value="2.5")
         ttk.Entry(gf, textvariable=self.pcb_gap_var, width=8).pack(
             side="left", padx=4)
-        self.pcb_gap_var.trace_add("write", lambda *_a: self._save_state())
+        self.pcb_gap_var.trace_add(
+            "write",
+            lambda *_a: (self._save_state(), self._redraw_stackup()))
         self._update_gap_visibility()
 
         # Row 2: solver settings.
@@ -291,6 +310,7 @@ class SimTab(ttk.Frame):
         self._metadata[idx]  = metadata
         self._update_source_labels()
         self._update_gap_visibility()
+        self._redraw_stackup()
 
     def unregister_coil(self, role, source_name):
         idx = ROLE_TO_IDX[role]
@@ -300,6 +320,7 @@ class SimTab(ttk.Frame):
             self._metadata[idx]  = None
             self._update_source_labels()
             self._update_gap_visibility()
+            self._redraw_stackup()
             self.app.on_sim_slot_cleared(role, source_name)
 
     def _update_source_labels(self):
@@ -312,6 +333,128 @@ class SimTab(ttk.Frame):
                                  padx=(8, 0))
         else:
             self.geom_frame.pack_forget()
+
+    # ---- stack-up viewer ------------------------------------------------
+    def _build_stackup_viewer(self, parent):
+        """Right-side 3D viewer of whatever's registered in TX/RX slots."""
+        ttk.Label(parent, text="Stack-up preview",
+                  font=("", 10, "bold")
+                  ).pack(anchor="w", padx=8, pady=(8, 2))
+
+        ctrl = ttk.Frame(parent); ctrl.pack(fill="x", padx=8, pady=(0, 4))
+        self._stackup_true_scale = tk.BooleanVar(value=True)   # ON default
+        ttk.Checkbutton(ctrl, text="True Scale",
+                        variable=self._stackup_true_scale,
+                        command=self._redraw_stackup
+                        ).pack(side="left")
+
+        self._stackup_fig = Figure(figsize=(4.2, 5.2), dpi=90)
+        self._stackup_canvas = FigureCanvasTkAgg(self._stackup_fig,
+                                                  master=parent)
+        self._stackup_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                                   padx=6, pady=(0, 4))
+        self._stackup_hint = ttk.Label(parent, text="", foreground="gray")
+        self._stackup_hint.pack(anchor="w", padx=8, pady=(0, 6))
+        # Initial empty-state render.
+        self._redraw_stackup()
+
+    @staticmethod
+    def _meta_nodes_by_layer(meta):
+        """Extract per-layer node lists regardless of whether the meta
+        comes from the parametric tab (nodes_by_layer) or the DXF tab
+        (flat nodes + layer_params counts)."""
+        if not meta:
+            return []
+        nbl = meta.get("nodes_by_layer")
+        if nbl:
+            return [list(g) for g in nbl if g]
+        nodes = meta.get("nodes") or []
+        layer_params = meta.get("layer_params") or []
+        if not nodes:
+            return []
+        if not layer_params:
+            return [list(nodes)]
+        out, off = [], 0
+        for _w, _h, n in layer_params:
+            out.append(list(nodes[off:off + n]))
+            off += n
+        return [g for g in out if g]
+
+    def _redraw_stackup(self):
+        fig = self._stackup_fig
+        fig.clf()
+
+        tx_layers = self._meta_nodes_by_layer(self._metadata[0])
+        rx_layers = self._meta_nodes_by_layer(self._metadata[1])
+
+        if not tx_layers and not rx_layers:
+            self._stackup_hint.configure(
+                text="Send a coil to Sim to preview its stack-up.")
+            self._stackup_canvas.draw_idle()
+            return
+        self._stackup_hint.configure(text="")
+
+        # PCB gap — only used when BOTH coils are registered. Mirrors
+        # port_combiner.combine_two_port's shift convention so the
+        # preview matches what actually goes into FastHenry.
+        try: pcb_gap = float(self.pcb_gap_var.get())
+        except ValueError: pcb_gap = 0.0
+        if pcb_gap < 0: pcb_gap = 0.0
+
+        tx_shift = 0.0
+        if tx_layers and rx_layers:
+            z_rx_max = max(p[2] for g in rx_layers for p in g)
+            z_tx_min = min(p[2] for g in tx_layers for p in g)
+            tx_shift = z_rx_max + pcb_gap - z_tx_min
+
+        true_scale = self._stackup_true_scale.get()
+        z_scale = 1.0 if true_scale else _STK_Z_EXAGGERATION
+
+        ax = fig.add_subplot(111, projection="3d")
+
+        def _plot(layers, z_shift, role, linestyle):
+            for slot_idx, group in enumerate(layers):
+                if not group: continue
+                xs = [p[0] for p in group]
+                ys = [p[1] for p in group]
+                # Flip z for display so slot 1 sits at the top (same
+                # mental model as the parametric tab).
+                zs = [-(p[2] + z_shift) * z_scale for p in group]
+                color = _STK_LAYER_COLORS[slot_idx % len(_STK_LAYER_COLORS)]
+                ax.plot(xs, ys, zs, color=color, linewidth=1.0,
+                        linestyle=linestyle,
+                        label=f"{role} L{slot_idx + 1}")
+
+        # RX drawn solid, TX dashed — lets you tell the coils apart when
+        # both are on screen without needing eight distinct colors.
+        _plot(rx_layers, 0.0,     "RX", "-")
+        _plot(tx_layers, tx_shift, "TX", "--")
+
+        ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
+        ax.set_zlabel("-Z (mm)"
+                      + ("" if true_scale
+                         else f"  [×{_STK_Z_EXAGGERATION:g}]"))
+        present = [r for r, g in (("TX", tx_layers), ("RX", rx_layers)) if g]
+        title = " + ".join(present)
+        if tx_layers and rx_layers:
+            title += f"   (PCB gap {pcb_gap:g} mm)"
+        if not true_scale:
+            title += "   (z exaggerated)"
+        ax.set_title(title, fontsize=9)
+        if ax.has_data():
+            ax.legend(loc="upper right", fontsize=7)
+            self._equalize_stackup_axes(ax)
+        fig.tight_layout()
+        self._stackup_canvas.draw_idle()
+
+    @staticmethod
+    def _equalize_stackup_axes(ax):
+        xl = ax.get_xlim3d(); yl = ax.get_ylim3d(); zl = ax.get_zlim3d()
+        span = max(xl[1]-xl[0], yl[1]-yl[0], zl[1]-zl[0])
+        cx = 0.5*(xl[0]+xl[1]); cy = 0.5*(yl[0]+yl[1]); cz = 0.5*(zl[0]+zl[1])
+        ax.set_xlim3d(cx - span/2, cx + span/2)
+        ax.set_ylim3d(cy - span/2, cy + span/2)
+        ax.set_zlim3d(cz - span/2, cz + span/2)
 
     def get_target_freq(self):
         try:
@@ -607,6 +750,7 @@ class SimTab(ttk.Frame):
         self._sources = [None, None]; self._inp_paths = [None, None]
         self._metadata = [None, None]
         self._update_source_labels(); self._update_gap_visibility()
+        self._redraw_stackup()
         self.last_result = None
         self.elapsed_var.set("Elapsed: —")
         self.sim_status.set("Not started")
