@@ -1,0 +1,7 @@
+{
+    "python.analysis.extraPaths": [
+        "../../stubs/esp32",
+        "../stubs/esp32",
+        "./App/Modules"
+    ]
+}

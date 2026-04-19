@@ -140,6 +140,26 @@ def main():
         L_uH = inductance_from_z(z, f) * 1e6
         print(f"f = {f:.0f} Hz:  Z = {z.real:.4f} + {z.imag:.4f}j Ohm"
               f"   L = {L_uH:.4f} uH")
+        
+def port_count(blocks):
+    """Number of ports inferred from the first block's matrix size."""
+    if not blocks:
+        return 0
+    rows, cols = blocks[0]["size"]
+    if rows != cols:
+        return 0
+    return rows
+
+
+def matrix_at(blocks, target_freq_hz):
+    """
+    Full NxN complex impedance matrix at the frequency closest to target.
+    Returns (actual_freq_hz, list-of-rows-of-complex).
+    """
+    if not blocks:
+        raise ValueError("Empty Zc.mat data")
+    closest = min(blocks, key=lambda b: abs(b["frequency"] - target_freq_hz))
+    return closest["frequency"], closest["matrix"]
 
 
 if __name__ == "__main__":
