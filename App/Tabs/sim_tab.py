@@ -21,6 +21,7 @@ import zc_parser
 import port_combiner
 import coil_analysis as analysis
 import cap_combinator
+import parametric_coil as pc
 
 try:
     import fasthenry_runner as runner
@@ -457,6 +458,22 @@ class SimTab(ttk.Frame):
         _plot(rx_layers, 0.0,     "RX", "-")
         _plot(tx_layers, tx_shift, "TX", "--")
 
+        def _plot_vias(layers, z_shift, meta):
+            if not layers or not meta:
+                return
+            topology = meta.get("topology", "single")
+            via_conns = pc.via_connections_for_topology(topology, len(layers))
+            for ki, ei, kj, ej in via_conns:
+                pa = layers[ki][ei]
+                pb = layers[kj][ej]
+                ax.plot([pa[0], pb[0]], [pa[1], pb[1]],
+                        [-(pa[2] + z_shift) * z_scale,
+                         -(pb[2] + z_shift) * z_scale],
+                        color="#9020c0", linewidth=1.8, zorder=5)
+
+        _plot_vias(rx_layers, 0.0,      self._metadata[1])
+        _plot_vias(tx_layers, tx_shift, self._metadata[0])
+
         ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
         ax.set_zlabel("-Z (mm)"
                       + ("" if true_scale
@@ -655,7 +672,7 @@ class SimTab(ttk.Frame):
                     analysis.path_length_mm(lnodes), w, h, 30.0)
                 if r > 0: rs.append(r)
             return 1.0/sum(1.0/r for r in rs) if rs else 0.0
-        if topology in ("series_pairs_par", "parallel_pairs_ser"):
+        if topology == "parallel_pairs_ser":
             nbl = meta.get("nodes_by_layer", [])
             if len(layer_params) != 4 or len(nbl) != 4: return 0.0
             def rl(i):
@@ -663,9 +680,6 @@ class SimTab(ttk.Frame):
                 return analysis.dc_resistance_ohm(
                     analysis.path_length_mm(nbl[i]), w, h, 30.0)
             R = [rl(i) for i in range(4)]
-            if topology == "series_pairs_par":
-                ra = R[0]+R[1]; rb = R[2]+R[3]
-                return 1.0/(1.0/ra + 1.0/rb) if ra>0 and rb>0 else 0.0
             ra = 1.0/(1.0/R[0] + 1.0/R[1]) if R[0]>0 and R[1]>0 else 0.0
             rb = 1.0/(1.0/R[2] + 1.0/R[3]) if R[2]>0 and R[3]>0 else 0.0
             return ra + rb
@@ -682,7 +696,7 @@ class SimTab(ttk.Frame):
     @staticmethod
     def _compute_coil_length(meta):
         topology = meta.get("topology", "single")
-        if topology in ("parallel", "series_pairs_par", "parallel_pairs_ser"):
+        if topology in ("parallel", "parallel_pairs_ser"):
             nbl = meta.get("nodes_by_layer", [])
             return analysis.path_length_mm(nbl[0]) if nbl else 0.0
         return analysis.path_length_mm(meta.get("nodes", []))

@@ -352,17 +352,23 @@ def write_series_inp(layer_data, out_path, w_mm,
                      nhinc=1, nwinc=3,
                      via_w_mm=None, via_h_mm=None,
                      fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
+                     port_inside=False,
                      header="Parametric all-series multilayer coil"):
     """
     All active slots in one series chain, with alternating layers'
     node ordering reversed so B-fields add. After reversal, each
     slot's "exit" node is always offsets[k] + len(nodes) - 1 and
     its "entry" is offsets[k] — so vias are exit-to-entry links.
+
+    port_inside=True flips all reversal flags so the port terminals
+    land on the inner spiral endpoints instead of the outer ones.
     """
     if not layer_data:
         raise ValueError("layer_data is empty")
 
     flags = series_reverse_flags_for_topology("series", len(layer_data))
+    if port_inside:
+        flags = [not f for f in flags]
     layer_data = reverse_nodes_for_series_flow(layer_data, flags)
 
     if via_w_mm is None: via_w_mm = w_mm
@@ -419,86 +425,26 @@ def write_series_inp(layer_data, out_path, w_mm,
             "reverse_flags": flags}
 
 
-def write_series_pairs_parallel_inp(layer_data, out_path, w_mm,
-                                    sigma=COPPER_SIGMA_PER_MM,
-                                    nhinc=1, nwinc=3,
-                                    via_w_mm=None, via_h_mm=None,
-                                    fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
-                                    header="Two series pairs in parallel"):
-    """(slot0→slot1) series  ||  (slot2→slot3) series.
-    Slot 1 and slot 3 reversed so each pair's B-field adds."""
-    if len(layer_data) != 4:
-        raise ValueError("series_pairs_par requires exactly 4 slots")
-
-    flags = series_reverse_flags_for_topology("series_pairs_par", 4)
-    layer_data = reverse_nodes_for_series_flow(layer_data, flags)
-
-    if via_w_mm is None: via_w_mm = w_mm
-    if via_h_mm is None: via_h_mm = layer_data[0]["h_mm"]
-
-    offsets, cum = [], 0
-    for ld in layer_data:
-        offsets.append(cum); cum += len(ld["nodes"])
-    def first_of(k): return offsets[k]
-    def last_of(k):  return offsets[k] + len(layer_data[k]["nodes"]) - 1
-
-    with open(out_path, "w", newline="\n") as f:
-        f.write(f"* {header}\n.Units mm\n\n")
-        f.write(f".Default sigma={sigma} w={w_mm} h={layer_data[0]['h_mm']}"
-                f" nhinc={nhinc} nwinc={nwinc}\n\n")
-        for k, ld in enumerate(layer_data):
-            for i, (x, y, z) in enumerate(ld["nodes"]):
-                f.write(f"N{offsets[k] + i} x={x:.6g} y={y:.6g} z={z:.6g}\n")
-        f.write("\n")
-
-        edge_counter = 0
-        current_h = layer_data[0]["h_mm"]
-        for k, ld in enumerate(layer_data):
-            if ld["h_mm"] != current_h:
-                current_h = ld["h_mm"]
-                f.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
-                        f" nhinc={nhinc} nwinc={nwinc}\n")
-            base = offsets[k]
-            for i in range(len(ld["nodes"]) - 1):
-                f.write(f"E{edge_counter} N{base + i} N{base + i + 1}\n")
-                edge_counter += 1
-        f.write("\n")
-
-        # Series vias inside each pair: exit→entry of next slot.
-        f.write(f"E{edge_counter} N{last_of(0)} N{first_of(1)}"
-                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
-        f.write(f"E{edge_counter} N{last_of(2)} N{first_of(3)}"
-                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
-        # Parallel ladder: pair A entry↔pair B entry, pair A exit↔pair B exit.
-        # Pair A entry = first_of(0); pair A exit = last_of(1).
-        # Pair B entry = first_of(2); pair B exit = last_of(3).
-        f.write(f"E{edge_counter} N{first_of(0)} N{first_of(2)}"
-                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
-        f.write(f"E{edge_counter} N{last_of(1)} N{last_of(3)}"
-                f" w={via_w_mm} h={via_h_mm}\n"); edge_counter += 1
-        f.write("\n")
-
-        start_idx = first_of(0); end_idx = last_of(1)
-        f.write(f".external N{start_idx} N{end_idx}\n\n")
-        f.write(f".freq fmin={fmin} fmax={fmax} ndec={freq_ndec}\n\n.end\n")
-
-    return {"total_nodes": cum, "external_start": start_idx,
-            "external_end": end_idx, "slot_offsets": offsets,
-            "reverse_flags": flags}
-
 
 def write_parallel_pairs_series_inp(layer_data, out_path, w_mm,
                                     sigma=COPPER_SIGMA_PER_MM,
                                     nhinc=1, nwinc=3,
                                     via_w_mm=None, via_h_mm=None,
                                     fmin=1.35e5, fmax=1.50e5, freq_ndec=1,
+                                    port_inside=False,
                                     header="Two parallel pairs in series"):
     """(slot0 || slot1) series (slot2 || slot3).
-    Both slots in pair B reversed so the whole structure's B adds."""
+    Both slots in pair B reversed so the whole structure's B adds.
+
+    port_inside=True flips all reversal flags so the port terminals
+    land on the inner spiral endpoints instead of the outer ones.
+    """
     if len(layer_data) != 4:
         raise ValueError("parallel_pairs_ser requires exactly 4 slots")
 
     flags = series_reverse_flags_for_topology("parallel_pairs_ser", 4)
+    if port_inside:
+        flags = [not f for f in flags]
     layer_data = reverse_nodes_for_series_flow(layer_data, flags)
 
     if via_w_mm is None: via_w_mm = w_mm
@@ -557,40 +503,27 @@ def write_parallel_pairs_series_inp(layer_data, out_path, w_mm,
             "reverse_flags": flags}
 
 
-def write_topology_inp(topology, layer_data, out_path, w_mm, **kwargs):
-    if topology == "parallel":
-        return write_parallel_multilayer_inp(layer_data, out_path,
-                                             w_mm=w_mm, **kwargs)
-    if topology == "series":
-        return write_series_inp(layer_data, out_path, w_mm=w_mm, **kwargs)
-    if topology == "series_pairs_par":
-        return write_series_pairs_parallel_inp(layer_data, out_path,
-                                               w_mm=w_mm, **kwargs)
-    if topology == "parallel_pairs_ser":
-        return write_parallel_pairs_series_inp(layer_data, out_path,
-                                               w_mm=w_mm, **kwargs)
-    raise ValueError(f"Unknown topology: {topology}")
-
 # ---------------------------------------------------------------------------
 # Dispatch helper — picks the right emitter for a topology name.
 # ---------------------------------------------------------------------------
 
-def write_topology_inp(topology, layer_data, out_path, w_mm, **kwargs):
+def write_topology_inp(topology, layer_data, out_path, w_mm,
+                       port_inside=False, **kwargs):
     """
-    Dispatch writer: topology ∈ {"parallel","series","series_pairs_par",
-    "parallel_pairs_ser"}.
+    Dispatch writer: topology ∈ {"parallel", "series", "parallel_pairs_ser"}.
+    port_inside moves both port terminals to the inner spiral endpoints.
     """
     if topology == "parallel":
         return write_parallel_multilayer_inp(layer_data, out_path,
                                              w_mm=w_mm, **kwargs)
     if topology == "series":
-        return write_series_inp(layer_data, out_path, w_mm=w_mm, **kwargs)
-    if topology == "series_pairs_par":
-        return write_series_pairs_parallel_inp(layer_data, out_path,
-                                               w_mm=w_mm, **kwargs)
+        return write_series_inp(layer_data, out_path, w_mm=w_mm,
+                                port_inside=port_inside, **kwargs)
     if topology == "parallel_pairs_ser":
         return write_parallel_pairs_series_inp(layer_data, out_path,
-                                               w_mm=w_mm, **kwargs)
+                                               w_mm=w_mm,
+                                               port_inside=port_inside,
+                                               **kwargs)
     raise ValueError(f"Unknown topology: {topology}")
 
 # ---------------------------------------------------------------------------
@@ -648,10 +581,6 @@ def series_reverse_flags_for_topology(topology, n_layers):
         # Single chain over all active layers — alternate every layer.
         for k in range(n_layers):
             flags[k] = (k % 2 == 1)
-    elif topology == "series_pairs_par":
-        # Two independent chains: (0,1) and (2,3). Second of each pair reversed.
-        if n_layers >= 2: flags[1] = True
-        if n_layers >= 4: flags[3] = True
     elif topology == "parallel_pairs_ser":
         # Chain between pair A (slots 0,1) and pair B (slots 2,3). Slots
         # inside a parallel pair wind the SAME way (both contribute current
@@ -662,3 +591,43 @@ def series_reverse_flags_for_topology(topology, n_layers):
         if n_layers >= 4: flags[3] = True
     # "parallel" → no reversal; all layers in parallel, same direction.
     return flags
+
+
+def via_connections_for_topology(topology, n_layers):
+    """
+    Return a list of (layer_a_idx, node_end_a, layer_b_idx, node_end_b) tuples
+    describing which layer endpoints are connected by vias, expressed in
+    display-native (= _layer_data) coordinates.
+
+    node_end is 0 (first node of the layer) or -1 (last node).
+
+    Works because _layer_data is already writer-native (reverse_nodes_for_series_flow
+    was applied during the refresh), so indices here match the E-elements written
+    by write_topology_inp for each topology.
+    """
+    if n_layers < 2:
+        return []
+
+    if topology == "parallel":
+        conns = []
+        for k in range(n_layers - 1):
+            conns.append((k,  0, k + 1,  0))   # start via ladder
+            conns.append((k, -1, k + 1, -1))   # end via ladder
+        return conns
+
+    if topology == "series":
+        # exit of layer k → entry of layer k+1
+        return [(k, -1, k + 1, 0) for k in range(n_layers - 1)]
+
+    if topology == "parallel_pairs_ser":
+        if n_layers != 4:
+            return []
+        return [
+            (0,  0, 1,  0),   # pair A: start bus
+            (0, -1, 1, -1),   # pair A: end bus
+            (2,  0, 3,  0),   # pair B: start bus
+            (2, -1, 3, -1),   # pair B: end bus
+            (0, -1, 2,  0),   # series bridge: pair A exit → pair B entry
+        ]
+
+    return []   # "single" or unknown

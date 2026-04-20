@@ -120,7 +120,7 @@ def _draw(ax, nodes, edges, highlight=None, title=None, view="xy"):
         if p0[2] > 0 and p1[2] > 0:
             color = "#d06020"   # orange-red for layer 2
         elif p0[2] != p1[2]:
-            color = "#2050c0"   # blue for via edges
+            color = "#9020c0"   # purple for via edges
         else:
             color = "#2080d0"   # default layer-1 blue-ish
         ax.plot([x0, x1], [y0, y1], color=color, linewidth=0.7)

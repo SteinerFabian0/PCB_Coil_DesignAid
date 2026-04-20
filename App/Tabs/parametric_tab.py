@@ -40,7 +40,6 @@ ROW_BG_SELECTED = "#ffd89a"
 TOPOLOGY_CHOICES = [
     ("All parallel",   "parallel"),
     ("All series",     "series"),
-    ("1s2  || 3s4",    "series_pairs_par"),
     ("1p2 -|- 3p4",    "parallel_pairs_ser"),
 ]
 
@@ -89,6 +88,7 @@ class ParametricCoilTab(ttk.Frame):
 
         self._link_cu = tk.BooleanVar(value=True)
         self._true_scale = tk.BooleanVar(value=False)
+        self._port_inside = tk.BooleanVar(value=False)
 
         # QuickSim state.
         self._quicksim_value = None    # float µH or None
@@ -130,6 +130,12 @@ class ParametricCoilTab(ttk.Frame):
                             value=val,
                             command=self._on_topology_change
                             ).pack(anchor="w", padx=6, pady=1)
+        self._port_inside_cb = ttk.Checkbutton(
+            tf, text="Port on Inside",
+            variable=self._port_inside,
+            command=self._on_port_inside_change,
+            state="enabled")
+        self._port_inside_cb.pack(anchor="w", padx=6, pady=(2, 2))
 
         # Spiral settings.
         sp = ttk.LabelFrame(parent, text="Spiral (applies to all active layers)")
@@ -143,8 +149,8 @@ class ParametricCoilTab(ttk.Frame):
         # Stack-up gaps.
         zf = ttk.LabelFrame(parent, text="Stack-up gaps")
         zf.pack(fill="x", pady=(0, 6))
-        self.outer_gap_var = self._entry(zf, "Outer gap (mm):", self.DEFAULT_OUTER_GAP)
-        self.inner_gap_var = self._entry(zf, "Inner gap (mm):", self.DEFAULT_INNER_GAP)
+        self.outer_gap_var = self._entry(zf, "Outer L. gap (mm):", self.DEFAULT_OUTER_GAP)
+        self.inner_gap_var = self._entry(zf, "Inner L. gap (mm):", self.DEFAULT_INNER_GAP)
 
         # Layer row table.
         lt = ttk.LabelFrame(parent, text="Layers")
@@ -270,9 +276,20 @@ class ParametricCoilTab(ttk.Frame):
     # ---- user events -----------------------------------------------------
     def _on_topology_change(self):
         topo = self.topology_var.get()
-        if topo in ("series_pairs_par", "parallel_pairs_ser"):
+        if topo == "parallel_pairs_ser":
             for av in self.slot_active_vars:
                 av.set(True)
+        if topo == "parallel":
+            self._port_inside.set(False)
+            self._port_inside_cb.configure(state="disabled")
+        else:
+            self._port_inside_cb.configure(state="normal")
+        self._mark_quicksim_stale()
+        self._mark_sim_outdated_if_loaded()
+        self._schedule_refresh()
+        self._save_state()
+
+    def _on_port_inside_change(self):
         self._mark_quicksim_stale()
         self._mark_sim_outdated_if_loaded()
         self._schedule_refresh()
@@ -365,7 +382,7 @@ class ParametricCoilTab(ttk.Frame):
             self._show_fail(msg); return
         topo = self.topology_var.get()
         n_active = sum(1 for s in stackup.slots if s.active)
-        if topo in ("series_pairs_par", "parallel_pairs_ser") and n_active != 4:
+        if topo == "parallel_pairs_ser" and n_active != 4:
             self._show_fail("This topology requires all 4 layers active.")
             return
         if n_active < 1:
@@ -378,6 +395,8 @@ class ParametricCoilTab(ttk.Frame):
         # Apply reverse flags so the *visualizer* shows true current flow
         # for series topologies (per user's preference).
         flags = pc.series_reverse_flags_for_topology(topo, len(layers))
+        if self._port_inside.get() and topo != "parallel":
+            flags = [not f for f in flags]
         layers = pc.reverse_nodes_for_series_flow(layers, flags)
 
         self._layer_data = layers
@@ -406,7 +425,6 @@ class ParametricCoilTab(ttk.Frame):
         n_act = len(self._layer_data)
         if   topo == "parallel":            eff_t, eff_m = t_per,      1
         elif topo == "series":              eff_t, eff_m = t_per*n_act, n_act
-        elif topo == "series_pairs_par":    eff_t, eff_m = t_per*2,    2
         elif topo == "parallel_pairs_ser":  eff_t, eff_m = t_per*2,    2
         else:                               eff_t, eff_m = t_per,      1
         single_len = self._single_layer_length_mm()
@@ -524,6 +542,16 @@ class ParametricCoilTab(ttk.Frame):
             ax.scatter([xs[-1]], [ys[-1]], [zs[-1]],
                        color="#c01010", s=20, edgecolors="black", linewidth=0.5)
 
+        # Draw via connections as purple lines between layer endpoints.
+        topo = self.topology_var.get()
+        via_conns = pc.via_connections_for_topology(topo, len(self._layer_data))
+        for ki, ei, kj, ej in via_conns:
+            pa = self._layer_data[ki]["nodes"][ei]
+            pb = self._layer_data[kj]["nodes"][ej]
+            ax.plot([pa[0], pb[0]], [pa[1], pb[1]],
+                    [-pa[2] * z_scale, -pb[2] * z_scale],
+                    color="#9020c0", linewidth=1.8, zorder=5)
+
         ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
         ax.set_zlabel("-Z (mm, layer 1 top)"
                       + ("" if true_scale else f"  [×{Z_EXAGGERATION:g}]"))
@@ -553,6 +581,7 @@ class ParametricCoilTab(ttk.Frame):
     def _compose_inp(self, dest_path, fmin, fmax, resolution_override=None,
                      record_emitted=True):
         topo = self.topology_var.get()
+        port_inside = self._port_inside.get()
         # Re-generate layers at possibly different resolution (for QuickSim).
         if resolution_override is not None:
             sp = pc.SpiralParams(
@@ -566,13 +595,17 @@ class ParametricCoilTab(ttk.Frame):
         else:
             layers = [dict(ld, nodes=list(ld["nodes"]))
                       for ld in self._layer_data]
-            # Undo the visualizer's reverse so writer does its own.
-            if resolution_override is None and topo != "parallel":
+            # Undo the visualizer's reverse (including any port_inside flip)
+            # so the writer can apply its own flags from scratch.
+            if topo != "parallel":
                 flags = pc.series_reverse_flags_for_topology(topo, len(layers))
+                if port_inside:
+                    flags = [not f for f in flags]
                 layers = pc.reverse_nodes_for_series_flow(layers, flags)
 
         pc.write_topology_inp(topo, layers, dest_path,
                               w_mm=self._last_params.trace_width_mm,
+                              port_inside=port_inside,
                               fmin=fmin, fmax=fmax)
         if record_emitted and resolution_override is None:
             self._layer_data_emitted = [dict(ld) for ld in layers]
@@ -637,6 +670,8 @@ class ParametricCoilTab(ttk.Frame):
             self.outer_gap_var.set(f"{self.DEFAULT_OUTER_GAP}")
             self.inner_gap_var.set(f"{self.DEFAULT_INNER_GAP}")
             self.topology_var.set("parallel")
+            self._port_inside.set(False)
+            self._port_inside_cb.configure(state="disabled")
             self._link_cu.set(True)
             self._true_scale.set(False)
             for i in range(4):
@@ -774,25 +809,33 @@ class ParametricCoilTab(ttk.Frame):
 
     def to_state(self):
         return {
-            "topology":   self.topology_var.get(),
-            "od":         self.od_var.get(),
-            "w":          self.w_var.get(),
-            "s":          self.s_var.get(),
-            "turns":      self.turns_var.get(),
-            "res":        self.res_var.get(),
-            "outer_gap":  self.outer_gap_var.get(),
-            "inner_gap":  self.inner_gap_var.get(),
-            "link_cu":    self._link_cu.get(),
-            "true_scale": self._true_scale.get(),
-            "active":     [v.get() for v in self.slot_active_vars],
-            "oz":         [v.get() for v in self.slot_oz_vars],
+            "topology":    self.topology_var.get(),
+            "port_inside": self._port_inside.get(),
+            "od":          self.od_var.get(),
+            "w":           self.w_var.get(),
+            "s":           self.s_var.get(),
+            "turns":       self.turns_var.get(),
+            "res":         self.res_var.get(),
+            "outer_gap":   self.outer_gap_var.get(),
+            "inner_gap":   self.inner_gap_var.get(),
+            "link_cu":     self._link_cu.get(),
+            "true_scale":  self._true_scale.get(),
+            "active":      [v.get() for v in self.slot_active_vars],
+            "oz":          [v.get() for v in self.slot_oz_vars],
         }
 
     def _restore_from_savestate(self):
         state = self.app.load_parametric_tab_state(self.role)
         if not state: return
         try:
-            self.topology_var.set(state.get("topology", "parallel"))
+            topo = state.get("topology", "parallel")
+            self.topology_var.set(topo)
+            port_inside = bool(state.get("port_inside", False))
+            self._port_inside.set(port_inside)
+            if topo == "parallel":
+                self._port_inside_cb.configure(state="disabled")
+            else:
+                self._port_inside_cb.configure(state="normal")
             self.od_var.set(state.get("od", f"{self.DEFAULT_OD_MM}"))
             self.w_var.set(state.get("w", f"{self.DEFAULT_TRACE_W_MM}"))
             self.s_var.set(state.get("s", f"{self.DEFAULT_SPACING_MM}"))
