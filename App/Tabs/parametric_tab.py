@@ -624,17 +624,17 @@ class ParametricCoilTab(ttk.Frame):
         dest = os.path.join(self.temp_dir,
                             f"param_{self.role.lower()}.inp")
         try:
-            topo, layers = self._compose_inp(dest, fmin, fmax)
+            topo, _ = self._compose_inp(dest, fmin, fmax)
         except Exception as e:
             messagebox.showerror("Send to Sim", f"Write failed: {e}"); return
         self._my_temp_files.add(dest)
 
         layer_params = [
             (self._last_params.trace_width_mm, ld["h_mm"], len(ld["nodes"]))
-            for ld in layers]
+            for ld in self._layer_data]
         meta = {"role": self.role, "topology": topo,
                 "layer_params": layer_params,
-                "nodes_by_layer": [list(ld["nodes"]) for ld in layers]}
+                "nodes_by_layer": [list(ld["nodes"]) for ld in self._layer_data]}
         self.app.sim_tab.register_coil(
             self.role, "Parametric Generator", dest, meta)
         self._set_sim_status("current")
