@@ -135,7 +135,7 @@ def train(model, train_loader, val_loader, device):
 
     # Reduce LR when val loss plateaus
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=40, verbose=False
+        optimizer, mode="min", factor=0.5, patience=40
     )
 
     train_losses, val_losses = [], []
