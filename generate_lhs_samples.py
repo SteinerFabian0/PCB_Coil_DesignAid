@@ -47,8 +47,8 @@ from parallel_sim import SimParams
 # Constants
 # ---------------------------------------------------------------------------
 
-N_TARGET     = 1500
-OVERSAMPLE   = 4       # generate this × N_TARGET candidates, then filter
+N_TARGET     = 1800
+OVERSAMPLE   = 32       # generate this × N_TARGET candidates, then filter
 DEFAULT_SEED = 42
 RESOLUTION_MM = 1.5    # FastHenry segment length — coarser = faster, finer = more accurate
 
@@ -57,7 +57,7 @@ FREQ_HZ      = 125_000.0
 MIN_ID_MM    = 35.0
 
 # TX fixed
-TX_OD         = 52.0
+TX_OD         = 53.0
 TX_SPACING    = 0.16
 TX_OUTER_GAP  = 0.2
 TX_INNER_GAP  = 1.3
@@ -84,7 +84,7 @@ RX_TOPOLOGIES = ["parallel", "series", "parallel_pairs_ser"]
 # Variable ranges
 TX_TURNS_RANGE = (6,   18)
 TX_WIDTH_RANGE = (0.2, 1.2)
-RX_OD_RANGE    = (48.0, 52.0)
+RX_OD_RANGE    = (48.0, 53)
 RX_TURNS_RANGE = (4,   25)
 RX_WIDTH_RANGE = (0.2, 1.2)
 
@@ -167,6 +167,10 @@ def _filter(candidates: list, n_target: int) -> tuple:
         rx_ok, rx_msg = _feasible(c["rx_od"], c["rx_width"], RX_SPACING, c["rx_turns"],
                                    RX_OUTER_GAP, RX_INNER_GAP, RX_LAYERS)
         if not rx_ok:
+            rejected += 1
+            continue
+        # For all-parallel RX, require rx_turns > tx_turns so L_rx > L_tx.
+        if c["rx_topology"] == "parallel" and c["rx_turns"] <= c["tx_turns"]:
             rejected += 1
             continue
         valid.append(c)
