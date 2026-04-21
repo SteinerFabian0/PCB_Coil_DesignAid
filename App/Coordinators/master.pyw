@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Coil2Inductor — master coordinator (slim).
-Tab order: DXF TX | DXF RX | Parametric TX | Parametric RX | Simulation | Automation.
+Tab order: DXF TX | DXF RX | Parametric TX | Parametric RX | Simulation | Automation | Automation NN.
 Opens on Parametric TX.
 """
 
@@ -24,7 +24,7 @@ from sim_tab import SimTab
 from sim_nn_tab import SimNNTab
 from dxf_coil_tab import DxfCoilTab
 from automation_tab import AutomationTab
-
+from automation_nn_tab import AutomationNNTab
 
 PROJECT_ROOT = os.path.dirname(_APP_ROOT)
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
@@ -86,7 +86,8 @@ class CoilApp(tk.Tk):
                                                temp_dir=TEMP_DIR,
                                                on_next_tab=lambda: self._advance_tab(3))
         self.auto_tab = AutomationTab(nb, app=self)
-
+        self.auto_nn_tab = AutomationNNTab(nb, app=self)
+        
         nb.add(self.dxf_tx_tab,   text="  DXF TX  ")
         nb.add(self.dxf_rx_tab,   text="  DXF RX  ")
         nb.add(self.param_tx_tab, text="  Parametric TX  ")
@@ -94,6 +95,7 @@ class CoilApp(tk.Tk):
         nb.add(self.sim_tab,      text="  Simulation  ")
         nb.add(self.sim_nn_tab,   text="  Simulation NN  ")
         nb.add(self.auto_tab,     text="  Automation  ")
+        nb.add(self.auto_nn_tab,  text="  Automation NN  ")
 
         self._ordered_tabs = [self.dxf_tx_tab, self.dxf_rx_tab,
                               self.param_tx_tab, self.param_rx_tab,

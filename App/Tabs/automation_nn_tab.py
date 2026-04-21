@@ -22,6 +22,8 @@ for _p in (_NN_DIR, _MODULES):
 
 from cap_combinator import E_VALUES_NF
 
+_SIMDATA_DIR = os.path.join(_APP_ROOT, "SimulationData")
+_SAMPLES_FILE = os.path.join(_SIMDATA_DIR, "lhs_samples.json")
 _MODEL_FILE = os.path.join(_NN_DIR, "surrogate_model.pth")
 _X_SCALER   = os.path.join(_NN_DIR, "x_scaler.pkl")
 _Y_SCALER   = os.path.join(_NN_DIR, "y_scaler.pkl")
@@ -43,7 +45,9 @@ FREQ_MIN_HZ      = 110_000.0
 FREQ_MAX_HZ      = 140_000.0
 RX_TOPOLOGIES    = ["parallel", "series", "parallel_pairs_ser"]
 
-BATCH_SIZE = 50_000
+BATCH_SIZE    = 50_000
+F0_HZ         = 125_000.0   # Frequency the NN was trained at; L/M are queried here, R_ac is then scaled
+N_DRIVE_FREQS = 7            # Drive frequencies swept uniformly across FREQ_MIN_HZ–FREQ_MAX_HZ
 
 # H-bridge fundamental voltage: V_fund = coeff * V_supply
 _HBRIDGE_COEFF = 2.0 * math.sqrt(2.0) / math.pi   # ≈ 0.9003
@@ -85,6 +89,8 @@ def _load_nn():
     import torch, joblib
     import torch.nn as nn
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     x_scaler = joblib.load(_X_SCALER)
     y_scaler = joblib.load(_Y_SCALER)
 
@@ -101,11 +107,12 @@ def _load_nn():
             return self.net(x)
 
     model = _CoilNN(x_scaler.n_features_in_)
-    model.load_state_dict(torch.load(_MODEL_FILE, map_location="cpu"))
+    model.load_state_dict(torch.load(_MODEL_FILE, map_location=device))
+    model.to(device)
     model.eval()
     feat_cols = (list(x_scaler.feature_names_in_)
                  if hasattr(x_scaler, "feature_names_in_") else None)
-    return model, x_scaler, y_scaler, feat_cols, torch
+    return model, x_scaler, y_scaler, feat_cols, torch, device
 
 
 # ---------------------------------------------------------------------------
@@ -114,10 +121,16 @@ def _load_nn():
 
 def _run_optimizer(params, progress_cb, log_cb, done_cb, cancel_flag):
     try:
-        import numpy as np
+        import numpy as np, json
 
         log_cb("Loading surrogate model…")
-        model, x_scaler, y_scaler, feat_cols, torch = _load_nn()
+        model, x_scaler, y_scaler, feat_cols, torch, device = _load_nn()
+        log_cb(f"Running on: {device}  (PyTorch {torch.__version__})")
+        if device.type == "cpu":
+            log_cb("  → No CUDA GPU detected. To enable GPU acceleration:")
+            log_cb("    pip install torch --index-url https://download.pytorch.org/whl/cu121")
+        else:
+            log_cb(f"  → GPU: {torch.cuda.get_device_name(device)}")
 
         N          = params["n_combos"]
         V_min      = params["v_min"]
@@ -130,6 +143,73 @@ def _run_optimizer(params, progress_cb, log_cb, done_cb, cancel_flag):
         P_inst_W   = P_target_W / Duty_tgt           # instantaneous power (W) when ON
         R_load_eq  = (V_rx_min ** 2) / P_inst_W      # equivalent AC load resistance (Ω)
         log_cb(f"R_load_eq = {R_load_eq:.3f} Ω  |  P_inst = {P_inst_W*1e3:.1f} mW")
+
+        # ---- Derive geometry bounds from the actual LHS samples file ----
+        try:
+            with open(_SAMPLES_FILE, "r") as _f:
+                _lhs = json.load(_f)
+            if isinstance(_lhs, dict):
+                _samples  = _lhs.get("samples", [])
+                _rng_dict = (_lhs.get("ranges") or _lhs.get("param_ranges")
+                             or _lhs.get("bounds") or {})
+            else:
+                _samples, _rng_dict = _lhs, {}
+            if _samples:
+                log_cb(f"LHS sample keys: {list(_samples[0].keys())}")
+            # Key aliases — handles naming variations across generator versions
+            _aliases = {
+                            "tx_turns":    ["tx_turns",          "TX_turns",    "n_turns_tx"],
+                            "tx_width":    ["tx_trace_width_mm",  "tx_width",    "tx_width_mm", "TX_width"],
+                            "rx_od_mm":    ["rx_od_mm",           "rx_od",       "RX_od_mm"],
+                            "rx_turns":    ["rx_turns",           "RX_turns",    "n_turns_rx"],
+                            "rx_width":    ["rx_trace_width_mm",  "rx_width",    "rx_width_mm", "RX_width"],
+                            "rx_topology": ["rx_topology",        "topology",    "rx_topo"],
+            }
+            def _resolve(canonical):
+                for a in _aliases[canonical]:
+                    if (_samples and a in _samples[0]) or a in _rng_dict:
+                        return a
+                return None
+            def _bound(canonical):
+                if _rng_dict:
+                    k = next((a for a in _aliases[canonical] if a in _rng_dict), None)
+                    if k:
+                        v = _rng_dict[k]
+                        if isinstance(v, (list, tuple)) and len(v) == 2:
+                            return float(v[0]), float(v[1])
+                k = _resolve(canonical)
+                if k is None or not _samples:
+                    raise KeyError(f"No key found for '{canonical}'")
+                vals = [s[k] for s in _samples if k in s]
+                if not vals: raise ValueError(f"Empty values for '{k}'")
+                return float(min(vals)), float(max(vals))
+            def _ibound(c):
+                lo, hi = _bound(c); return int(round(lo)), int(round(hi))
+            tx_turns_min, tx_turns_max = _ibound("tx_turns")
+            tx_width_min, tx_width_max = _bound("tx_width")
+            rx_od_min,    rx_od_max    = _bound("rx_od_mm")
+            rx_turns_min, rx_turns_max = _ibound("rx_turns")
+            rx_width_min, rx_width_max = _bound("rx_width")
+            _tk    = _resolve("rx_topology")
+            _topos = sorted({s[_tk] for s in _samples if _tk and _tk in s})
+            rx_topologies = _topos if _topos else RX_TOPOLOGIES
+            log_cb(f"Bounds from LHS: tx_turns [{tx_turns_min}–{tx_turns_max}], "
+                   f"tx_width [{tx_width_min:.2f}–{tx_width_max:.2f} mm], "
+                   f"rx_od [{rx_od_min:.1f}–{rx_od_max:.1f} mm], "
+                   f"rx_turns [{rx_turns_min}–{rx_turns_max}]")
+        except Exception as _e:
+            log_cb(f"Warning: could not read LHS bounds ({_e}), using hardcoded defaults.")
+            tx_turns_min, tx_turns_max = TX_TURNS_MIN, TX_TURNS_MAX
+            tx_width_min, tx_width_max = TX_WIDTH_MIN, TX_WIDTH_MAX
+            rx_od_min,    rx_od_max    = RX_OD_MIN,    RX_OD_MAX
+            rx_turns_min, rx_turns_max = RX_TURNS_MIN,  RX_TURNS_MAX
+            rx_width_min, rx_width_max = RX_WIDTH_MIN,  RX_WIDTH_MAX
+            rx_topologies              = RX_TOPOLOGIES
+
+        # Drive frequencies — always sweep full 110–140 kHz band regardless of training data
+        drive_freqs = np.linspace(FREQ_MIN_HZ, FREQ_MAX_HZ, N_DRIVE_FREQS)
+        log_cb(f"Drive freqs: {[f'{f/1e3:.1f}' for f in drive_freqs]} kHz "
+               f"(R_ac scaled from F0={F0_HZ/1e3:.0f} kHz via √f)")
 
         # Cap tables as numpy arrays
         tx_cap_table  = _TX_CAP_TABLE
@@ -165,18 +245,20 @@ def _run_optimizer(params, progress_cb, log_cb, done_cb, cancel_flag):
             if b % 5 == 0:
                 log_cb(f"Batch {b+1}/{n_batches}  ({len(valid_rows):,} valid so far)…")
 
-            # ---- Sample geometry ----------------------------------------
-            tx_turns_s = rng.integers(TX_TURNS_MIN, TX_TURNS_MAX + 1, size=bs).astype(np.float64)
-            tx_width_s = rng.uniform(TX_WIDTH_MIN, TX_WIDTH_MAX, size=bs)
-            rx_od_s    = rng.uniform(RX_OD_MIN, RX_OD_MAX, size=bs)
-            rx_turns_s = rng.integers(RX_TURNS_MIN, RX_TURNS_MAX + 1, size=bs).astype(np.float64)
-            rx_width_s = rng.uniform(RX_WIDTH_MIN, RX_WIDTH_MAX, size=bs)
-            freq_s     = rng.uniform(FREQ_MIN_HZ, FREQ_MAX_HZ, size=bs)
-            topo_idx_s = rng.integers(0, 3, size=bs)
+            # ---- Sample geometry (within actual training bounds) --------
+            n_topos    = len(rx_topologies)
+            tx_turns_s = rng.integers(tx_turns_min, tx_turns_max + 1, size=bs).astype(np.float64)
+            tx_width_s = rng.uniform(tx_width_min, tx_width_max, size=bs)
+            rx_od_s    = rng.uniform(rx_od_min, rx_od_max, size=bs)
+            rx_turns_s = rng.integers(rx_turns_min, rx_turns_max + 1, size=bs).astype(np.float64)
+            rx_width_s = rng.uniform(rx_width_min, rx_width_max, size=bs)
+            topo_idx_s = rng.integers(0, n_topos, size=bs)
 
             topo_oh    = np.zeros((bs, 3), dtype=np.float64)
-            for ti in range(3):
-                topo_oh[topo_idx_s == ti, ti] = 1.0
+            _topo_key  = ["topo_parallel", "topo_parallel_pairs_ser", "topo_series"]
+            for ti, tname in enumerate(rx_topologies):
+                col = _topo_key.index(f"topo_{tname}") if f"topo_{tname}" in _topo_key else ti
+                topo_oh[topo_idx_s == ti, col] = 1.0
 
             row_map = {
                 "tx_turns":              tx_turns_s,
@@ -185,144 +267,133 @@ def _run_optimizer(params, progress_cb, log_cb, done_cb, cancel_flag):
                 "rx_od_mm":              rx_od_s,
                 "rx_turns":              rx_turns_s,
                 "rx_width":              rx_width_s,
-                "freq_hz":               freq_s,
+                "freq_hz":               np.full(bs, F0_HZ),   # always query NN at training freq
                 "topo_parallel":         topo_oh[:, 0],
                 "topo_parallel_pairs_ser": topo_oh[:, 1],
                 "topo_series":           topo_oh[:, 2],
             }
             X = np.column_stack([row_map[c] for c in all_cols]).astype(np.float32)
 
-            # ---- NN inference -------------------------------------------
+            # ---- NN inference (on GPU if available) ---------------------
             X_sc = x_scaler.transform(X).astype(np.float32)
             with torch.no_grad():
-                Y_sc = model(torch.tensor(X_sc)).numpy()
-            Y = y_scaler.inverse_transform(Y_sc)   # (bs, 5)
+                X_tensor = torch.tensor(X_sc, device=device)
+                Y_sc = model(X_tensor).cpu().numpy()
+            Y = y_scaler.inverse_transform(Y_sc)
 
-            L_tx = Y[:, 0]   # µH
-            L_rx = Y[:, 1]   # µH
-            M    = Y[:, 2]   # µH
-            R_tx = Y[:, 3]   # Ω
-            R_rx = Y[:, 4]   # Ω
+            L_tx    = Y[:, 0]   # µH — geometric, essentially freq-independent in this band
+            L_rx    = Y[:, 1]   # µH
+            M       = Y[:, 2]   # µH
+            R_tx_f0 = Y[:, 3]   # Ω at F0_HZ (skin-effect dominated → scales as √f)
+            R_rx_f0 = Y[:, 4]   # Ω at F0_HZ
 
-            w = 2.0 * math.pi * freq_s   # rad/s  shape (bs,)
+            # ---- Sweep drive frequencies; scale R_ac ∝ √f --------------
+            # For each geometry sample, keep the best (drive_freq, C_tx) combo.
+            best_fitness_batch = np.full(bs, np.inf)
+            best_result_batch  = [None] * bs
 
-            # ---- RX: snap ideal C to nearest stock ----------------------
-            C_rx_ideal_nf = 1e9 / (w**2 * L_rx * 1e-6)
-            diff_rx       = np.abs(C_rx_ideal_nf[:, None] - rx_cap_nf[None, :])
-            rx_ci         = np.argmin(diff_rx, axis=1)          # (bs,)
-            C_rx          = rx_cap_nf[rx_ci]                    # (bs,)
+            for f_drive in drive_freqs:
+                w          = 2.0 * math.pi * f_drive
+                freq_scale = math.sqrt(f_drive / F0_HZ)
+                R_tx       = R_tx_f0 * freq_scale   # (bs,)
+                R_rx       = R_rx_f0 * freq_scale   # (bs,)
 
-            # ---- Z_rx (series RLC + load) --------------------------------
-            X_L_rx  = w * L_rx * 1e-6
-            X_C_rx  = 1.0 / (w * C_rx * 1e-9)
-            Zrx_re  = R_rx + R_load_eq
-            Zrx_im  = X_L_rx - X_C_rx
-            Zrx_abs2 = Zrx_re**2 + Zrx_im**2
-            Zrx_abs  = np.sqrt(Zrx_abs2)
+                # RX tank: tune cap to the actual drive frequency
+                C_rx_ideal_nf = 1e9 / (w**2 * L_rx * 1e-6)
+                diff_rx       = np.abs(C_rx_ideal_nf[:, None] - rx_cap_nf[None, :])
+                rx_ci         = np.argmin(diff_rx, axis=1)
+                C_rx          = rx_cap_nf[rx_ci]
 
-            # ---- Reflected impedance Z_ref = (wM)^2 / conj(Z_rx) -------
-            wM   = w * M * 1e-6
-            wM2  = wM**2
-            Zref_re =  wM2 * Zrx_re / Zrx_abs2
-            Zref_im = -wM2 * Zrx_im / Zrx_abs2
+                X_L_rx   = w * L_rx * 1e-6
+                X_C_rx   = 1.0 / (w * C_rx * 1e-9)
+                Zrx_re   = R_rx + R_load_eq
+                Zrx_im   = X_L_rx - X_C_rx
+                Zrx_abs2 = Zrx_re**2 + Zrx_im**2
+                Zrx_abs  = np.sqrt(Zrx_abs2)
 
-            # ---- TX: evaluate all cap options (vectorized) --------------
-            # Z_in = (R_tx + Zref_re) + j*(w*L_tx - 1/(w*C_tx) + Zref_im)
-            X_L_tx          = w * L_tx * 1e-6                        # (bs,)
-            Zin_re          = R_tx + Zref_re                          # (bs,)
-            Zin_im_no_cap   = X_L_tx + Zref_im                       # (bs,)
+                wM      = w * M * 1e-6
+                wM2     = wM**2
+                Zref_re =  wM2 * Zrx_re / Zrx_abs2
+                Zref_im = -wM2 * Zrx_im / Zrx_abs2
 
-            # X_C_tx for every stock option: shape (bs, n_tx)
-            X_C_tx_all  = 1.0 / (w[:, None] * tx_cap_nf[None, :] * 1e-9)
-            Zin_im_all  = Zin_im_no_cap[:, None] - X_C_tx_all         # (bs, n_tx)
-            Zin_abs_all = np.sqrt(Zin_re[:, None]**2 + Zin_im_all**2) # (bs, n_tx)
+                X_L_tx        = w * L_tx * 1e-6
+                Zin_re        = R_tx + Zref_re
+                Zin_im_no_cap = X_L_tx + Zref_im
+                X_C_tx_all    = 1.0 / (w * tx_cap_nf * 1e-9)              # (n_tx,)
+                Zin_im_all    = Zin_im_no_cap[:, None] - X_C_tx_all        # (bs, n_tx)
+                Zin_abs_all   = np.sqrt(Zin_re[:, None]**2 + Zin_im_all**2)
 
-            # ---- Power calc at V_min, V_mid, V_max ---------------------
-            Vf_min = _HBRIDGE_COEFF * V_min
-            Vf_max = _HBRIDGE_COEFF * V_max
-            Vf_mid = _HBRIDGE_COEFF * (V_min + V_max) * 0.5
+                Vf_min = _HBRIDGE_COEFF * V_min
+                Vf_max = _HBRIDGE_COEFF * V_max
+                Vf_mid = _HBRIDGE_COEFF * (V_min + V_max) * 0.5
 
-            # TX currents (bs, n_tx)
-            It_min = Vf_min / Zin_abs_all
-            It_max = Vf_max / Zin_abs_all
-            It_mid = Vf_mid / Zin_abs_all
+                It_min      = Vf_min / Zin_abs_all
+                It_max      = Vf_max / Zin_abs_all
+                It_mid      = Vf_mid / Zin_abs_all
+                wM_over_Zrx = wM / Zrx_abs
 
-            # RX current scale factor (bs,)
-            wM_over_Zrx = wM / Zrx_abs
+                Ir_min    = It_min * wM_over_Zrx[:, None]
+                Ir_max    = It_max * wM_over_Zrx[:, None]
+                Ir_mid    = It_mid * wM_over_Zrx[:, None]
+                V_ind_min = wM[:, None] * It_min
 
-            # RX currents (bs, n_tx)
-            Ir_min = It_min * wM_over_Zrx[:, None]
-            Ir_max = It_max * wM_over_Zrx[:, None]
-            Ir_mid = It_mid * wM_over_Zrx[:, None]
+                Pload_min = Ir_min**2 * R_load_eq
+                Pload_max = Ir_max**2 * R_load_eq
+                Pload_mid = Ir_mid**2 * R_load_eq
+                Duty_vmin = P_target_W / np.maximum(Pload_min, 1e-30)
+                Duty_vmax = P_target_W / np.maximum(Pload_max, 1e-30)
+                P_tx_mid  = It_mid**2 * Zin_re[:, None]
+                eff_mid   = np.where(P_tx_mid > 0, Pload_mid / P_tx_mid, 0.0)
 
-            # Induced RX voltage (open-circuit) at V_min (bs, n_tx)
-            V_ind_min = wM[:, None] * It_min
+                valid = (
+                    (Zin_im_all > 0.0)        &
+                    (V_ind_min  >= V_rx_min)  &
+                    (Duty_vmin  <= 1.0)       &
+                    (Duty_vmax  <= 1.0)
+                )
+                duty_err    = (np.abs(Duty_vmin - Duty_tgt) +
+                               np.abs(Duty_vmax - Duty_tgt))
+                fitness_all = np.where(valid, duty_err - eff_mid * 0.1, np.inf)
 
-            # Power to load (bs, n_tx)
-            Pload_min = Ir_min**2 * R_load_eq
-            Pload_max = Ir_max**2 * R_load_eq
-            Pload_mid = Ir_mid**2 * R_load_eq
+                best_ti      = np.argmin(fitness_all, axis=1)
+                best_fitness = fitness_all[np.arange(bs), best_ti]
 
-            # Required duty cycles
-            Duty_vmin = P_target_W / np.maximum(Pload_min, 1e-30)
-            Duty_vmax = P_target_W / np.maximum(Pload_max, 1e-30)
+                improved = np.isfinite(best_fitness) & (best_fitness < best_fitness_batch)
+                if not np.any(improved):
+                    continue
+                best_fitness_batch[improved] = best_fitness[improved]
 
-            # Efficiency at mid voltage (bs, n_tx)
-            P_tx_mid  = It_mid**2 * Zin_re[:, None]
-            eff_mid   = np.where(P_tx_mid > 0, Pload_mid / P_tx_mid, 0.0)
+                for idx in np.where(improved)[0]:
+                    ti   = int(best_ti[idx])
+                    rx_c = int(rx_ci[idx])
+                    best_result_batch[idx] = {
+                        "fitness":     float(best_fitness[idx]),
+                        "freq_hz":     f_drive,
+                        "tx_turns":    int(round(float(tx_turns_s[idx]))),
+                        "tx_width":    float(tx_width_s[idx]),
+                        "tx_od_mm":    TX_OD_MM,
+                        "rx_od_mm":    float(rx_od_s[idx]),
+                        "rx_turns":    int(round(float(rx_turns_s[idx]))),
+                        "rx_width":    float(rx_width_s[idx]),
+                        "rx_topology": rx_topologies[int(topo_idx_s[idx])],
+                        "L_tx_uH":    float(L_tx[idx]),
+                        "L_rx_uH":    float(L_rx[idx]),
+                        "M_uH":       float(M[idx]),
+                        "R_tx_ohm":   float(R_tx[idx]),
+                        "R_rx_ohm":   float(R_rx[idx]),
+                        "C_tx_nf":    float(tx_cap_nf[ti]),
+                        "C_tx_label": tx_cap_lbls[ti],
+                        "C_rx_nf":    float(rx_cap_nf[rx_c]),
+                        "C_rx_label": rx_cap_lbls[rx_c],
+                        "Duty_vmin":  float(Duty_vmin[idx, ti]),
+                        "Duty_vmax":  float(Duty_vmax[idx, ti]),
+                        "V_ind_min_V": float(V_ind_min[idx, ti]),
+                        "eff_mid":    float(eff_mid[idx, ti]),
+                        "Zin_re":     float(Zin_re[idx]),
+                        "Zin_im":     float(Zin_im_all[idx, ti]),
+                    }
 
-            # ---- Validity mask ------------------------------------------
-            valid = (
-                (Zin_im_all   > 0.0)    &   # inductive region
-                (V_ind_min    >= V_rx_min) & # minimum induced voltage
-                (Duty_vmin    <= 1.0)    &   # can reach power at V_min
-                (Duty_vmax    <= 1.0)        # can reach power at V_max
-            )   # (bs, n_tx)
-
-            # ---- Fitness: minimize duty-cycle deviation, reward efficiency
-            duty_err    = (np.abs(Duty_vmin - Duty_tgt) +
-                           np.abs(Duty_vmax - Duty_tgt))
-            fitness_all = np.where(valid, duty_err - eff_mid * 0.1, np.inf)
-
-            # Best TX cap per row
-            best_ti      = np.argmin(fitness_all, axis=1)   # (bs,)
-            best_fitness = fitness_all[np.arange(bs), best_ti]
-
-            row_valid_mask = np.isfinite(best_fitness)
-            if not np.any(row_valid_mask):
-                continue
-
-            vi  = np.where(row_valid_mask)[0]
-            bti = best_ti[vi]
-
-            for idx, ti in zip(vi, bti):
-                rx_c = rx_ci[idx]
-                valid_rows.append({
-                    "fitness":      float(best_fitness[idx]),
-                    "tx_turns":     int(round(float(tx_turns_s[idx]))),
-                    "tx_width":     float(tx_width_s[idx]),
-                    "tx_od_mm":     TX_OD_MM,
-                    "rx_od_mm":     float(rx_od_s[idx]),
-                    "rx_turns":     int(round(float(rx_turns_s[idx]))),
-                    "rx_width":     float(rx_width_s[idx]),
-                    "rx_topology":  RX_TOPOLOGIES[int(topo_idx_s[idx])],
-                    "freq_hz":      float(freq_s[idx]),
-                    "L_tx_uH":      float(L_tx[idx]),
-                    "L_rx_uH":      float(L_rx[idx]),
-                    "M_uH":         float(M[idx]),
-                    "R_tx_ohm":     float(R_tx[idx]),
-                    "R_rx_ohm":     float(R_rx[idx]),
-                    "C_tx_nf":      float(tx_cap_nf[ti]),
-                    "C_tx_label":   tx_cap_lbls[ti],
-                    "C_rx_nf":      float(rx_cap_nf[rx_c]),
-                    "C_rx_label":   rx_cap_lbls[rx_c],
-                    "Duty_vmin":    float(Duty_vmin[idx, ti]),
-                    "Duty_vmax":    float(Duty_vmax[idx, ti]),
-                    "V_ind_min_V":  float(V_ind_min[idx, ti]),
-                    "eff_mid":      float(eff_mid[idx, ti]),
-                    "Zin_re":       float(Zin_re[idx]),
-                    "Zin_im":       float(Zin_im_all[idx, ti]),
-                })
+            valid_rows.extend(r for r in best_result_batch if r is not None)
 
         log_cb(f"Sorting {len(valid_rows):,} valid configurations…")
         progress_cb(0.95)
