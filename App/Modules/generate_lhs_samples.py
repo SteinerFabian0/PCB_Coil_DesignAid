@@ -36,10 +36,10 @@ import os
 
 from scipy.stats import qmc
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_SIMDATA_DIR = os.path.join(_HERE, "App", "SimulationData")
+_HERE        = os.path.dirname(os.path.abspath(__file__))  # App/Modules
+_APP_ROOT    = os.path.dirname(_HERE)                       # App
+_SIMDATA_DIR = os.path.join(_APP_ROOT, "SimulationData")
 
-sys.path.insert(0, os.path.join(_HERE, "App", "Modules"))
 import parametric_coil as pc
 from parallel_sim import SimParams
 

@@ -22,8 +22,8 @@ _APP_ROOT    = os.path.dirname(_HERE)
 _PROJECT_ROOT = os.path.dirname(_APP_ROOT)
 _SIMDATA_DIR = os.path.join(_APP_ROOT, "SimulationData")
 _MODULES_DIR = os.path.join(_APP_ROOT, "Modules")
-_GEN_SCRIPT  = os.path.join(_PROJECT_ROOT, "generate_lhs_samples.py")
-_SWEEP_SCRIPT = os.path.join(_PROJECT_ROOT, "run_sweep.py")
+_GEN_SCRIPT  = os.path.join(_MODULES_DIR, "generate_lhs_samples.py")
+_SWEEP_SCRIPT = os.path.join(_MODULES_DIR, "run_sweep.py")
 _SAMPLES_FILE = os.path.join(_SIMDATA_DIR, "lhs_samples.json")
 _RESULTS_FILE = os.path.join(_SIMDATA_DIR, "sweep_results.json")
 _STOP_FLAG   = os.path.join(_SIMDATA_DIR, "STOP_SWEEP")
@@ -39,10 +39,13 @@ class AutomationTab(ttk.Frame):
     def __init__(self, parent, app=None, **kw):
         super().__init__(parent, **kw)
         self.app = app
-        self._log_queue  = queue.Queue()
-        self._gen_thread = None   # thread for sample generation
-        self._sweep_proc = None   # subprocess for sweep
-        self._sweep_thread = None # thread draining sweep stdout
+        self._log_queue       = queue.Queue()
+        self._gen_thread      = None   # thread for sample generation
+        self._sweep_proc      = None   # subprocess for sweep
+        self._sweep_thread    = None   # thread draining sweep stdout
+        self._covered_indices = set()
+        self._tag_to_idx      = {}
+        self._n_total_samples = 0
         self._build()
         self._refresh_status()
         self.after(POLL_MS, self._poll)
@@ -101,6 +104,17 @@ class AutomationTab(ttk.Frame):
         self._ckpt_var = tk.StringVar(value="50")
         ttk.Entry(r, textvariable=self._ckpt_var, width=6).pack(side="left", padx=4)
 
+        r = ttk.Frame(sw_frm); r.pack(fill="x", padx=8, pady=3)
+        ttk.Label(r, text="From index:", width=20, anchor="w").pack(side="left")
+        self._from_var = tk.StringVar(value="0")
+        self._from_var.trace_add("write", lambda *_: self._redraw_progress())
+        ttk.Entry(r, textvariable=self._from_var, width=7).pack(side="left", padx=4)
+        ttk.Label(r, text="To index:", width=10, anchor="w").pack(side="left")
+        self._to_var = tk.StringVar(value="")
+        self._to_var.trace_add("write", lambda *_: self._redraw_progress())
+        ttk.Entry(r, textvariable=self._to_var, width=7).pack(side="left", padx=4)
+        ttk.Label(r, text="(blank = end)", foreground="gray").pack(side="left")
+
         btn_row = ttk.Frame(sw_frm); btn_row.pack(fill="x", padx=8, pady=(3, 8))
         self._sweep_btn = ttk.Button(btn_row, text="Start Sweep",
                                      command=self._on_sweep_start)
@@ -116,12 +130,20 @@ class AutomationTab(ttk.Frame):
         prog_frm = ttk.LabelFrame(self, text="Progress")
         prog_frm.pack(fill="x", padx=10, pady=4)
 
-        self._progress = ttk.Progressbar(prog_frm, mode="determinate",
-                                          maximum=100, value=0)
-        self._progress.pack(fill="x", padx=8, pady=(6, 2))
+        # Canvas-based segmented progress bar (green = done in range, gray = rest)
+        self._prog_canvas = tk.Canvas(prog_frm, height=18, bg="#3c3c3c",
+                                      highlightthickness=1,
+                                      highlightbackground="#606060")
+        self._prog_canvas.pack(fill="x", padx=8, pady=(6, 2))
+        self._prog_canvas.bind("<Configure>", lambda e: self._redraw_progress())
+        self._prog_range_bar  = None   # green filled rect for active range
+        self._prog_done_bar   = None   # brighter green for completed portion
+        self._n_total_samples = 0      # total in samples file
+        self._run_from = 0
+        self._run_to   = 0
 
         stats_row = ttk.Frame(prog_frm)
-        stats_row.pack(fill="x", padx=8, pady=(0, 6))
+        stats_row.pack(fill="x", padx=8, pady=(0, 2))
         self._stat_done  = tk.StringVar(value="Done: —")
         self._stat_ok    = tk.StringVar(value="OK: —")
         self._stat_fail  = tk.StringVar(value="Failed: —")
@@ -129,6 +151,12 @@ class AutomationTab(ttk.Frame):
         for sv in (self._stat_total, self._stat_done,
                    self._stat_ok, self._stat_fail):
             ttk.Label(stats_row, textvariable=sv).pack(side="left", padx=12)
+
+        # Coverage text — shows which index ranges exist in the results file
+        self._coverage_var = tk.StringVar(value="Coverage: —")
+        ttk.Label(prog_frm, textvariable=self._coverage_var,
+                  foreground="#80c8ff", font=("Consolas", 8)).pack(
+                      anchor="w", padx=10, pady=(0, 2))
 
         ttk.Button(prog_frm, text="Refresh",
                    command=self._refresh_status).pack(anchor="e", padx=8, pady=(0, 4))
@@ -197,21 +225,31 @@ class AutomationTab(ttk.Frame):
     def _refresh_status(self):
         os.makedirs(_SIMDATA_DIR, exist_ok=True)
 
-        # Samples file
+        # Samples file → total sample count
+        n_total_samples = 0
         if os.path.exists(_SAMPLES_FILE):
             try:
                 with open(_SAMPLES_FILE) as f:
                     d = json.load(f)
-                n = len(d.get("samples", []))
-                self._gen_status.set(f"{n} samples on disk")
-                self._stat_total.set(f"Total: {n}")
+                samples = d.get("samples", [])
+                n_total_samples = len(samples)
+                self._gen_status.set(f"{n_total_samples} samples on disk")
+                self._stat_total.set(f"Total: {n_total_samples}")
+                # Build tag->index map for coverage calculation
+                self._tag_to_idx = {s["tag"]: i for i, s in enumerate(samples)
+                                    if "tag" in s}
             except Exception:
                 self._gen_status.set("samples file unreadable")
+                self._tag_to_idx = {}
         else:
             self._gen_status.set("no samples file")
             self._stat_total.set("Total: —")
+            self._tag_to_idx = {}
+
+        self._n_total_samples = n_total_samples
 
         # Results file
+        n_done = 0
         if os.path.exists(_RESULTS_FILE):
             try:
                 with open(_RESULTS_FILE) as f:
@@ -219,24 +257,135 @@ class AutomationTab(ttk.Frame):
                 results = d.get("results", [])
                 meta    = d.get("meta", {})
                 n_done  = len(results)
-                n_total = meta.get("total", n_done)
+                n_range = meta.get("total", n_done)   # samples in the run range
                 n_ok    = sum(1 for r in results if r.get("ok"))
                 n_fail  = n_done - n_ok
-                pct     = int(100 * n_done / n_total) if n_total else 0
-                self._progress["value"] = pct
-                self._stat_done.set(f"Done: {n_done}/{n_total}  ({pct}%)")
+                pct     = int(100 * n_done / n_range) if n_range else 0
+                self._stat_done.set(f"Done: {n_done}/{n_range}  ({pct}%)")
                 self._stat_ok.set(f"OK: {n_ok}")
                 self._stat_fail.set(f"Failed: {n_fail}")
                 if self._sweep_proc is None:
                     self._sweep_status.set(
-                        "Complete" if n_done >= n_total else f"Paused at {pct}%")
+                        "Complete" if n_done >= n_range else f"Paused at {pct}%")
+
+                # Compute which global indices are covered
+                self._update_coverage(results)
             except Exception:
                 self._sweep_status.set("results file unreadable")
+                self._coverage_var.set("Coverage: (unreadable)")
         else:
-            self._progress["value"] = 0
             self._stat_done.set("Done: —")
             self._stat_ok.set("OK: —")
             self._stat_fail.set("Failed: —")
+            self._coverage_var.set("Coverage: none")
+
+        self._redraw_progress(n_done=n_done)
+
+    def _update_coverage(self, results: list):
+        """Compute contiguous covered index ranges and update label + canvas data."""
+        tag_map = getattr(self, "_tag_to_idx", {})
+        if not tag_map or not results:
+            self._coverage_var.set("Coverage: —")
+            self._covered_indices = set()
+            self._redraw_progress()
+            return
+
+        indices = sorted(tag_map[r["tag"]] for r in results if r.get("tag") in tag_map)
+        self._covered_indices = set(indices)
+
+        if not indices:
+            self._coverage_var.set("Coverage: —")
+            return
+
+        # Merge into contiguous runs
+        runs = []
+        lo = hi = indices[0]
+        for idx in indices[1:]:
+            if idx == hi + 1:
+                hi = idx
+            else:
+                runs.append((lo, hi))
+                lo = hi = idx
+        runs.append((lo, hi))
+
+        parts = "  |  ".join(f"{lo}-{hi}" for lo, hi in runs)
+        total_covered = len(indices)
+        n_total = self._n_total_samples
+        pct = f"{100*total_covered/n_total:.1f}%" if n_total else ""
+        self._coverage_var.set(f"Coverage ({total_covered}/{n_total} {pct}):  {parts}")
+        self._redraw_progress()
+
+    def _redraw_progress(self, n_done: int = None):
+        """Draw the segmented canvas bar."""
+        c = self._prog_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 2:
+            return
+
+        n_total = self._n_total_samples
+        if n_total == 0:
+            return
+
+        # Parse current from/to from UI fields
+        try:
+            run_from = int(self._from_var.get())
+        except ValueError:
+            run_from = 0
+        try:
+            run_to = int(self._to_var.get())
+        except ValueError:
+            run_to = n_total
+
+        run_from = max(0, min(run_from, n_total))
+        run_to   = max(run_from, min(run_to, n_total))
+
+        def _x(idx):
+            return int(w * idx / n_total)
+
+        # Background (unselected region) — dark gray already from canvas bg
+        # Active range — slightly lighter trough
+        x0, x1 = _x(run_from), _x(run_to)
+        if x1 > x0:
+            c.create_rectangle(x0, 0, x1, h, fill="#555555", outline="")
+
+        # Covered indices inside the active range — bright green
+        covered = getattr(self, "_covered_indices", set())
+        # Draw covered pixels in green (batch by contiguous runs for speed)
+        if covered and n_total:
+            in_range = sorted(i for i in covered if run_from <= i < run_to)
+            if in_range:
+                lo = hi = in_range[0]
+                for idx in in_range[1:]:
+                    if idx == hi + 1:
+                        hi = idx
+                    else:
+                        c.create_rectangle(_x(lo), 1, _x(hi + 1), h - 1,
+                                           fill="#4ec94e", outline="")
+                        lo = hi = idx
+                c.create_rectangle(_x(lo), 1, _x(hi + 1), h - 1,
+                                   fill="#4ec94e", outline="")
+
+            # Covered outside range — dimmer green
+            outside = sorted(i for i in covered if not (run_from <= i < run_to))
+            if outside:
+                lo = hi = outside[0]
+                for idx in outside[1:]:
+                    if idx == hi + 1:
+                        hi = idx
+                    else:
+                        c.create_rectangle(_x(lo), 1, _x(hi + 1), h - 1,
+                                           fill="#2a6e2a", outline="")
+                        lo = hi = idx
+                c.create_rectangle(_x(lo), 1, _x(hi + 1), h - 1,
+                                   fill="#2a6e2a", outline="")
+
+        # Range boundary tick marks
+        if x0 > 0:
+            c.create_line(x0, 0, x0, h, fill="#ffcc44", width=2)
+        if x1 < w:
+            c.create_line(x1, 0, x1, h, fill="#ffcc44", width=2)
 
     # ------------------------------------------------------------------ generate
     def _on_generate(self):
@@ -264,7 +413,7 @@ class AutomationTab(ttk.Frame):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    cwd=_PROJECT_ROOT,
+                    cwd=_MODULES_DIR,
                 )
                 for line in proc.stdout:
                     self._log(line.rstrip())
@@ -293,11 +442,13 @@ class AutomationTab(ttk.Frame):
             self._log("[sweep] ERROR: No samples file found. Generate samples first.")
             return
         try:
-            workers = int(self._workers_var.get())
-            timeout = int(self._timeout_var.get())
-            ckpt    = int(self._ckpt_var.get())
+            workers  = int(self._workers_var.get())
+            timeout  = int(self._timeout_var.get())
+            ckpt     = int(self._ckpt_var.get())
+            from_idx = int(self._from_var.get()) if self._from_var.get().strip() else 0
+            to_idx   = int(self._to_var.get())   if self._to_var.get().strip()   else None
         except ValueError:
-            self._log("[sweep] ERROR: workers / timeout / checkpoint must be integers.")
+            self._log("[sweep] ERROR: workers / timeout / checkpoint / from / to must be integers.")
             return
 
         # Remove any stale stop flag.
@@ -309,10 +460,14 @@ class AutomationTab(ttk.Frame):
                "--out",              _RESULTS_FILE,
                "--workers",          str(workers),
                "--timeout",          str(timeout),
-               "--checkpoint-every", str(ckpt)]
+               "--checkpoint-every", str(ckpt),
+               "--from-idx",         str(from_idx)]
+        if to_idx is not None:
+            cmd += ["--to-idx", str(to_idx)]
 
+        range_str = f"{from_idx} -> {to_idx if to_idx is not None else 'end'}"
         self._log(f"[sweep] Starting: workers={workers}, timeout={timeout}s, "
-                  f"checkpoint_every={ckpt}")
+                  f"ckpt={ckpt}, range={range_str}")
 
         try:
             self._sweep_proc = subprocess.Popen(

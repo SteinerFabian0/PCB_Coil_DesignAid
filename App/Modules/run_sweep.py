@@ -27,10 +27,10 @@ import os
 import sys
 import time
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_SIMDATA_DIR = os.path.join(_HERE, "App", "SimulationData")
+_HERE        = os.path.dirname(os.path.abspath(__file__))  # App/Modules
+_APP_ROOT    = os.path.dirname(_HERE)                       # App
+_SIMDATA_DIR = os.path.join(_APP_ROOT, "SimulationData")
 
-sys.path.insert(0, os.path.join(_HERE, "App", "Modules"))
 from parallel_sim import SimParams, run_batch
 from generate_lhs_samples import dict_to_simparams
 
@@ -79,9 +79,24 @@ def main():
                         help="Per-sim timeout (seconds)")
     parser.add_argument("--checkpoint-every", type=int, default=50,
                         dest="ckpt_every")
+    parser.add_argument("--from-idx",         type=int, default=0,
+                        dest="from_idx",
+                        help="0-based index of first sample to process (inclusive)")
+    parser.add_argument("--to-idx",           type=int, default=None,
+                        dest="to_idx",
+                        help="0-based index of last sample to process (exclusive). "
+                             "Defaults to end of list.")
     args = parser.parse_args()
 
     params_list, meta = _load_samples(args.samples)
+
+    # Apply index range slice before anything else.
+    from_idx = max(0, args.from_idx)
+    to_idx   = args.to_idx if args.to_idx is not None else len(params_list)
+    to_idx   = min(to_idx, len(params_list))
+    params_list = params_list[from_idx:to_idx]
+    range_str = f"[{from_idx}:{to_idx}]" if (from_idx or args.to_idx) else "[all]"
+
     existing = _load_existing_results(args.out)
 
     # Patch per-sim timeout from CLI.
@@ -94,7 +109,7 @@ def main():
 
     print("=" * 65)
     print(f"FastHenry sweep  ({args.workers} workers, {args.timeout}s timeout)")
-    print(f"  Total samples : {len(params_list)}")
+    print(f"  Range         : {range_str}  ({len(params_list)} samples)")
     print(f"  Already done  : {len(done)}")
     print(f"  To simulate   : {len(todo)}")
     print(f"  Output        : {args.out}")
