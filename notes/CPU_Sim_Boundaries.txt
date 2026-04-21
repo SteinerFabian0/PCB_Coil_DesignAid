@@ -1,0 +1,32 @@
+TX:
+    Fixed parameters:
+        trace spacing = 0.16
+        mode = all parallel
+        use layers 1&2&3; NOT 4.
+        OD: 52mm
+        copper weight 1.0 everywhere
+        gap between l1 & l2 = 0.2mm
+        gap between l2 & l3 = 1.3mm
+        port on outside
+    Variable parameters (range)
+        turns per layer (6-18)
+        trace width (0.2-1.2)
+
+RX: 
+    Fixed:
+        trace spacing = 0.16
+        always use all 4 layers
+        1oz outer, 0.5oz inner layers
+        outer layer gap = 0.2mm
+        inner layer gap = 0.6mm
+        port on inside
+    variable:
+        mode (lets run 3 branches of LHS, one on each mode)
+        OD: (48-52)mm
+        turns per layer (4-25)
+        trace width (0.2-1.2)
+
+Global:
+PCB gap = 2.6mm
+target drive frequency: 110-140kHz
+

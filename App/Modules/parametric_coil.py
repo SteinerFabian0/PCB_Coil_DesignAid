@@ -631,3 +631,173 @@ def via_connections_for_topology(topology, n_layers):
         ]
 
     return []   # "single" or unknown
+
+
+# ---------------------------------------------------------------------------
+# Combined 2-port TX+RX .inp writer
+# ---------------------------------------------------------------------------
+
+def _collect_segment_text(layer_data, node_offset, edge_offset, w_mm,
+                          topology, port_inside, sigma, nhinc, nwinc):
+    """
+    Return (node_lines, edge_lines, port_start_idx, port_end_idx,
+            next_node_offset, next_edge_offset) for one coil sub-structure.
+
+    All node and edge indices are globally unique thanks to the offsets.
+    The 'edge_lines' string already includes via connections for the topology.
+    """
+    import io
+
+    if topology in ("series", "parallel_pairs_ser"):
+        flags = series_reverse_flags_for_topology(topology, len(layer_data))
+        if port_inside:
+            flags = [not f for f in flags]
+        layer_data = reverse_nodes_for_series_flow(layer_data, flags)
+
+    offsets = []
+    cum = node_offset
+    for ld in layer_data:
+        offsets.append(cum)
+        cum += len(ld["nodes"])
+
+    def first_of(k): return offsets[k]
+    def last_of(k):  return offsets[k] + len(layer_data[k]["nodes"]) - 1
+
+    node_buf = io.StringIO()
+    for k, ld in enumerate(layer_data):
+        for i, (x, y, z) in enumerate(ld["nodes"]):
+            node_buf.write(f"N{offsets[k] + i} "
+                           f"x={x:.6g} y={y:.6g} z={z:.6g}\n")
+
+    edge_buf = io.StringIO()
+    ec = edge_offset
+    current_h = layer_data[0]["h_mm"]
+    edge_buf.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+                   f" nhinc={nhinc} nwinc={nwinc}\n")
+    for k, ld in enumerate(layer_data):
+        if ld["h_mm"] != current_h:
+            current_h = ld["h_mm"]
+            edge_buf.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+                           f" nhinc={nhinc} nwinc={nwinc}\n")
+        base = offsets[k]
+        for i in range(len(ld["nodes"]) - 1):
+            edge_buf.write(f"E{ec} N{base + i} N{base + i + 1}\n")
+            ec += 1
+
+    via_w = w_mm
+    via_h = layer_data[0]["h_mm"]
+
+    if topology == "parallel":
+        for k in range(len(layer_data) - 1):
+            edge_buf.write(f"E{ec} N{first_of(k)} N{first_of(k+1)}"
+                           f" w={via_w} h={via_h}\n"); ec += 1
+        for k in range(len(layer_data) - 1):
+            edge_buf.write(f"E{ec} N{last_of(k)} N{last_of(k+1)}"
+                           f" w={via_w} h={via_h}\n"); ec += 1
+        port_s = first_of(0)
+        port_e = last_of(0)
+
+    elif topology == "series":
+        for k in range(len(layer_data) - 1):
+            edge_buf.write(f"E{ec} N{last_of(k)} N{first_of(k+1)}"
+                           f" w={via_w} h={via_h}\n"); ec += 1
+        port_s = first_of(0)
+        port_e = last_of(len(layer_data) - 1)
+
+    elif topology == "parallel_pairs_ser":
+        if len(layer_data) != 4:
+            raise ValueError("parallel_pairs_ser requires 4 active layers")
+        edge_buf.write(f"E{ec} N{first_of(0)} N{first_of(1)}"
+                       f" w={via_w} h={via_h}\n"); ec += 1
+        edge_buf.write(f"E{ec} N{last_of(0)} N{last_of(1)}"
+                       f" w={via_w} h={via_h}\n"); ec += 1
+        edge_buf.write(f"E{ec} N{first_of(2)} N{first_of(3)}"
+                       f" w={via_w} h={via_h}\n"); ec += 1
+        edge_buf.write(f"E{ec} N{last_of(2)} N{last_of(3)}"
+                       f" w={via_w} h={via_h}\n"); ec += 1
+        edge_buf.write(f"E{ec} N{last_of(0)} N{first_of(2)}"
+                       f" w={via_w} h={via_h}\n"); ec += 1
+        port_s = first_of(0)
+        port_e = last_of(2)
+
+    else:
+        raise ValueError(f"Unknown topology: {topology}")
+
+    return (node_buf.getvalue(), edge_buf.getvalue(),
+            port_s, port_e, cum, ec)
+
+
+def write_combined_tx_rx_inp(
+    tx_layer_data, rx_layer_data,
+    out_path,
+    tx_w_mm, rx_w_mm,
+    tx_topology="parallel", rx_topology="parallel",
+    rx_port_inside=False,
+    pcb_gap_mm=2.6,
+    sigma=COPPER_SIGMA_PER_MM,
+    nhinc=1, nwinc=3,
+    fmin=1.1e5, fmax=1.4e5, freq_ndec=1,
+):
+    """
+    Emit a single FastHenry .inp containing both TX (port 1) and RX (port 2)
+    coils separated by pcb_gap_mm in Z.
+
+    TX sits at its natural z-coordinates (z[0] = 0).
+    RX is shifted up by (TX top-layer z + pcb_gap_mm).
+
+    Two .external statements produce a 2×2 Zc.mat:
+        Z[0][0] = Z11  →  L_tx, R_tx
+        Z[1][1] = Z22  →  L_rx, R_rx
+        Z[0][1] = Z12  →  mutual inductance M
+
+    tx_layer_data / rx_layer_data: output of active_layer_data(), i.e.
+    [{"slot", "z", "h_mm", "nodes"}, ...] sorted by z ascending.
+    RX z-coords will be shifted automatically.
+    """
+    # Shift RX z-coordinates above TX.
+    tx_top_z = max(ld["z"] + ld["h_mm"] for ld in tx_layer_data)
+    z_shift   = tx_top_z + pcb_gap_mm
+    rx_shifted = []
+    for ld in rx_layer_data:
+        shifted_nodes = [(x, y, z + z_shift) for (x, y, z) in ld["nodes"]]
+        rx_shifted.append({**ld, "z": ld["z"] + z_shift, "nodes": shifted_nodes})
+
+    tx_nodes, tx_edges, tx_ps, tx_pe, after_tx_nodes, after_tx_edges = \
+        _collect_segment_text(tx_layer_data,  0, 0,
+                              tx_w_mm, tx_topology, False,
+                              sigma, nhinc, nwinc)
+
+    rx_nodes, rx_edges, rx_ps, rx_pe, _, _ = \
+        _collect_segment_text(rx_shifted, after_tx_nodes, after_tx_edges,
+                              rx_w_mm, rx_topology, rx_port_inside,
+                              sigma, nhinc, nwinc)
+
+    with open(out_path, "w", newline="\n") as f:
+        f.write(f"* Combined TX+RX coil — 2-port FastHenry simulation\n")
+        f.write(f"* TX topology={tx_topology}  RX topology={rx_topology}\n")
+        f.write(f"* PCB gap={pcb_gap_mm} mm  RX z-shift={z_shift:.4f} mm\n")
+        f.write(".Units mm\n\n")
+
+        f.write("* --- TX nodes ---\n")
+        f.write(tx_nodes)
+        f.write("\n* --- RX nodes ---\n")
+        f.write(rx_nodes)
+        f.write("\n")
+
+        f.write("* --- TX conductors ---\n")
+        f.write(tx_edges)
+        f.write("\n* --- RX conductors ---\n")
+        f.write(rx_edges)
+        f.write("\n")
+
+        f.write(f"* Port 1 = TX\n")
+        f.write(f".external N{tx_ps} N{tx_pe}\n")
+        f.write(f"* Port 2 = RX\n")
+        f.write(f".external N{rx_ps} N{rx_pe}\n\n")
+        f.write(f".freq fmin={fmin} fmax={fmax} ndec={freq_ndec}\n\n.end\n")
+
+    return {
+        "tx_port": (tx_ps, tx_pe),
+        "rx_port": (rx_ps, rx_pe),
+        "z_shift": z_shift,
+    }

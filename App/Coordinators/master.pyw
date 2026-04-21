@@ -22,6 +22,7 @@ import savestate
 from parametric_tab import ParametricCoilTab
 from sim_tab import SimTab
 from dxf_coil_tab import DxfCoilTab
+from automation_tab import AutomationTab
 
 
 PROJECT_ROOT = os.path.dirname(_APP_ROOT)
@@ -79,7 +80,7 @@ class CoilApp(tk.Tk):
                                                coil_index=2,
                                                temp_dir=TEMP_DIR,
                                                on_next_tab=lambda: self._advance_tab(3))
-        self.auto_tab = PlaceholderTab(nb, "Automation — coming soon.")
+        self.auto_tab = AutomationTab(nb, app=self)
 
         nb.add(self.dxf_tx_tab,   text="  DXF TX  ")
         nb.add(self.dxf_rx_tab,   text="  DXF RX  ")
