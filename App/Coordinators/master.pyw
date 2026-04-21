@@ -52,7 +52,7 @@ class CoilApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Coil2Inductor")
-        self.geometry("1200x850")
+        self.geometry("1600x850")
 
         # Load savestate once, keep in memory; writes go through helpers.
         self._state = savestate.load(PROJECT_ROOT)
@@ -94,7 +94,7 @@ class CoilApp(tk.Tk):
         nb.add(self.param_rx_tab, text="  Parametric RX  ")
         nb.add(self.sim_tab,      text="  Simulation  ")
         nb.add(self.sim_nn_tab,   text="  Simulation NN  ")
-        nb.add(self.auto_tab,     text="  Automation  ")
+        nb.add(self.auto_tab,     text="  NN Training  ")
         nb.add(self.auto_nn_tab,  text="  Automation NN  ")
 
         self._ordered_tabs = [self.dxf_tx_tab, self.dxf_rx_tab,

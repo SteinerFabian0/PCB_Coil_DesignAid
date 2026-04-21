@@ -85,6 +85,7 @@ class SimTab(ttk.Frame):
         self.app = app
         self.temp_dir = temp_dir
         self.last_result = None
+        self._done_callbacks = []
         self._sim_thread = None
         self._sim_queue = queue.Queue()
         self._sources   = [None, None]
@@ -233,10 +234,18 @@ class SimTab(ttk.Frame):
         self.cap_rx = CapField(rx_in, "C_RX (nF):",
                                on_value_change=self._update_insights)
         self.cap_rx.pack(fill="x", padx=4, pady=2)
-        r = ttk.Frame(rx_in); r.pack(fill="x", padx=4, pady=2)
-        ttk.Label(r, text="Avg P consumption (W):",
+        rx_cap_ctrl = ttk.Frame(rx_in); rx_cap_ctrl.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(rx_cap_ctrl, text="RX # caps (1 or 2):",
                   width=22, anchor="w").pack(side="left")
-        self.p_avg_var = tk.StringVar(value="0.05")
+        self._rx_ncaps_var = tk.StringVar(value="1")
+        ttk.Spinbox(rx_cap_ctrl, textvariable=self._rx_ncaps_var,
+                    from_=1, to=2, width=3, state="readonly").pack(side="left", padx=2)
+        ttk.Button(rx_cap_ctrl, text="Auto resonance cap", width=18,
+                   command=self._auto_rx_cap).pack(side="left", padx=(6, 0))
+        r = ttk.Frame(rx_in); r.pack(fill="x", padx=4, pady=2)
+        ttk.Label(r, text="Avg P consumption (mW):",
+                  width=22, anchor="w").pack(side="left")
+        self.p_avg_var = tk.StringVar(value="50")
         ttk.Entry(r, textvariable=self.p_avg_var, width=8).pack(
             side="left", padx=2)
         r = ttk.Frame(rx_in); r.pack(fill="x", padx=4, pady=2)
@@ -639,6 +648,9 @@ class SimTab(ttk.Frame):
         self.sim_status.set(f"Done ({n}-port).")
         self.start_btn.config(state="normal")
         self._update_insights()
+        for cb in list(self._done_callbacks):
+            try: cb(result)
+            except Exception: pass
 
     def _fill_coil_result(self, slot, z_self, f):
         vars_ = self.res_tx if slot == 0 else self.res_rx
@@ -713,7 +725,7 @@ class SimTab(ttk.Frame):
             v_min = float(self.v_min_var.get())
             v_max = float(self.v_max_var.get())
             duty_pct = float(self.duty_var.get())
-            p_avg_target = float(self.p_avg_var.get())
+            p_avg_target = float(self.p_avg_var.get()) / 1000.0
             v_rect_min_needed = float(self.v_rect_min_var.get())
         except ValueError:
             return
@@ -786,6 +798,49 @@ class SimTab(ttk.Frame):
                 f"✗ At V_supply_min: short P by {sp*1000:.1f} mW, "
                 f"V by {sv:.2f} V.")
 
+    def _auto_rx_cap(self):
+        """Compute resonance cap for RX from last sim result and target frequency."""
+        if self.last_result is None:
+            messagebox.showinfo("Auto Cap", "Run simulation first to get L_RX.")
+            return
+        n = self.last_result.get("n_ports", 0)
+        if n < 2:
+            messagebox.showinfo("Auto Cap", "Need a 2-port result (TX+RX) for L_RX.")
+            return
+        Zmat = self.last_result["Zmat"]
+        f    = self.last_result["frequency"]
+        w    = 2 * math.pi * f
+        L_rx = Zmat[1][1].imag / w
+        if L_rx <= 0:
+            messagebox.showinfo("Auto Cap", "L_RX is not positive in last result.")
+            return
+        C_ideal_nf = 1e9 / (w * w * L_rx)
+        max_caps = int(self._rx_ncaps_var.get())
+        best_val, best_desc = self._find_cap_limited(C_ideal_nf, max_caps)
+        self.cap_rx.var.set(f"{best_val:g}")
+        self.cap_rx.combo_var.set(f"({best_desc})" if best_desc else "")
+
+    @staticmethod
+    def _find_cap_limited(target_nf, max_caps):
+        """Find closest E-series capacitance using up to max_caps components."""
+        e = cap_combinator.E_VALUES_NF
+        best_val, best_desc, best_err = None, None, float("inf")
+
+        def consider(val, desc):
+            nonlocal best_val, best_desc, best_err
+            err = abs(val - target_nf)
+            if err < best_err:
+                best_val, best_desc, best_err = val, desc, err
+
+        for c in e:
+            consider(c, None)
+        if max_caps >= 2:
+            for i, c1 in enumerate(e):
+                for c2 in e[i:]:
+                    consider(c1 + c2, f"{c1:g}+{c2:g} nF ||")
+                    consider((c1 * c2) / (c1 + c2), f"{c1:g}+{c2:g} nF series")
+        return best_val, best_desc
+
     # ---- reset / savestate ---------------------------------------------
     def reset_this_tab(self):
         self._sources = [None, None]; self._inp_paths = [None, None]
@@ -800,6 +855,7 @@ class SimTab(ttk.Frame):
         self.pcb_gap_var.set("2.5")
         self.cap_tx.var.set(""); self.cap_tx.combo_var.set("")
         self.cap_rx.var.set(""); self.cap_rx.combo_var.set("")
+        self._rx_ncaps_var.set("1")
         self._clear_coil_result(0); self._clear_coil_result(1)
         self.res_M.set("—"); self.res_k.set("—"); self.res_Zmat.set("—")
         for v in self.ins_vars.values(): v.set("—")
@@ -841,7 +897,7 @@ class SimTab(ttk.Frame):
             self.v_max_var.set(st.get("v_max", "4.2"))
             self.duty_var.set(st.get("duty", "50"))
             self.fc_var.set(st.get("fc", "130000"))
-            self.p_avg_var.set(st.get("p_avg", "0.1"))
+            self.p_avg_var.set(st.get("p_avg", "50"))
             self.v_rect_min_var.set(st.get("v_rect_min", "3.4"))
         except Exception:
             pass
