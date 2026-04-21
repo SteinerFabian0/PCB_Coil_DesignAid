@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-AutomationTab — GUI front-end for the LHS sweep pipeline.
+AutomationTab — GUI front-end for the LHS sweep pipeline + NN training.
 
 Stages:
   1. Generate Samples  — runs generate_lhs_samples.py in a background thread
   2. Run Sweep         — runs run_sweep.py in a background subprocess
   3. Pause / Resume    — writes/removes the STOP_SWEEP sentinel file
+  4. Train Surrogate   — runs NeuralNetwork/train_surrogate.py in a subprocess
 """
 
 import os
@@ -17,16 +18,20 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk
 
-_HERE        = os.path.dirname(os.path.abspath(__file__))
-_APP_ROOT    = os.path.dirname(_HERE)
+_HERE         = os.path.dirname(os.path.abspath(__file__))
+_APP_ROOT     = os.path.dirname(_HERE)
 _PROJECT_ROOT = os.path.dirname(_APP_ROOT)
-_SIMDATA_DIR = os.path.join(_APP_ROOT, "SimulationData")
-_MODULES_DIR = os.path.join(_APP_ROOT, "Modules")
-_GEN_SCRIPT  = os.path.join(_MODULES_DIR, "generate_lhs_samples.py")
+_SIMDATA_DIR  = os.path.join(_APP_ROOT, "SimulationData")
+_MODULES_DIR  = os.path.join(_APP_ROOT, "Modules")
+_NN_DIR       = os.path.join(_PROJECT_ROOT, "NeuralNetwork")
+_GEN_SCRIPT   = os.path.join(_MODULES_DIR, "generate_lhs_samples.py")
 _SWEEP_SCRIPT = os.path.join(_MODULES_DIR, "run_sweep.py")
+_TRAIN_SCRIPT = os.path.join(_NN_DIR, "train_surrogate.py")
 _SAMPLES_FILE = os.path.join(_SIMDATA_DIR, "lhs_samples.json")
 _RESULTS_FILE = os.path.join(_SIMDATA_DIR, "sweep_results.json")
-_STOP_FLAG   = os.path.join(_SIMDATA_DIR, "STOP_SWEEP")
+_STOP_FLAG    = os.path.join(_SIMDATA_DIR, "STOP_SWEEP")
+_MODEL_FILE   = os.path.join(_NN_DIR, "surrogate_model.pth")
+_LOSS_PLOT    = os.path.join(_NN_DIR, "loss_curve.png")
 
 for _p in (_MODULES_DIR,):
     if _p not in sys.path:
@@ -39,10 +44,13 @@ class AutomationTab(ttk.Frame):
     def __init__(self, parent, app=None, **kw):
         super().__init__(parent, **kw)
         self.app = app
-        self._log_queue       = queue.Queue()
-        self._gen_thread      = None   # thread for sample generation
-        self._sweep_proc      = None   # subprocess for sweep
-        self._sweep_thread    = None   # thread draining sweep stdout
+        self._log_queue        = queue.Queue()
+        self._train_log_queue  = queue.Queue()
+        self._gen_thread       = None   # thread for sample generation
+        self._sweep_proc       = None   # subprocess for sweep
+        self._sweep_thread     = None   # thread draining sweep stdout
+        self._train_proc       = None   # subprocess for NN training
+        self._train_thread     = None   # thread draining train stdout
         self._covered_indices = set()
         self._tag_to_idx      = {}
         self._n_total_samples = 0
@@ -161,24 +169,118 @@ class AutomationTab(ttk.Frame):
         ttk.Button(prog_frm, text="Refresh",
                    command=self._refresh_status).pack(anchor="e", padx=8, pady=(0, 4))
 
-        # ---- console output ---------------------------------------------
-        con_frm = ttk.LabelFrame(self, text="Console")
-        con_frm.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        # ---- bottom pane: console (left) + NN trainer (right) ----------
+        paned = tk.PanedWindow(self, orient="horizontal",
+                               sashwidth=5, sashrelief="flat",
+                               bg="#3c3c3c")
+        paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+
+        # --- left: console ---
+        con_frm = ttk.LabelFrame(paned, text="Console")
+        paned.add(con_frm, stretch="always")
 
         btn_bar = ttk.Frame(con_frm)
         btn_bar.pack(fill="x", padx=6, pady=(4, 0))
         ttk.Button(btn_bar, text="Clear", command=self._clear_console).pack(side="right")
 
         self._console = tk.Text(con_frm, height=16, state="disabled",
-                                 wrap="word", font=("Consolas", 9),
-                                 bg="#1e1e1e", fg="#d4d4d4",
-                                 insertbackground="white",
-                                 relief="flat", bd=0)
+                                wrap="word", font=("Consolas", 9),
+                                bg="#1e1e1e", fg="#d4d4d4",
+                                insertbackground="white",
+                                relief="flat", bd=0)
         vsb = ttk.Scrollbar(con_frm, orient="vertical",
                              command=self._console.yview)
         self._console.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y", padx=(0, 4), pady=4)
         self._console.pack(fill="both", expand=True, padx=(6, 0), pady=4)
+
+        # --- right: train surrogate NN ---
+        nn_frm = ttk.LabelFrame(paned, text="3 · Train Surrogate Neural Network")
+        paned.add(nn_frm, stretch="always")
+
+        # Hyperparameter fields
+        hp_frm = ttk.Frame(nn_frm)
+        hp_frm.pack(fill="x", padx=8, pady=(6, 0))
+
+        r = ttk.Frame(hp_frm); r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Epochs:", width=18, anchor="w").pack(side="left")
+        self._nn_epochs_var = tk.StringVar(value="800")
+        ttk.Entry(r, textvariable=self._nn_epochs_var, width=8).pack(side="left", padx=4)
+
+        r = ttk.Frame(hp_frm); r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Batch size:", width=18, anchor="w").pack(side="left")
+        self._nn_batch_var = tk.StringVar(value="128")
+        ttk.Entry(r, textvariable=self._nn_batch_var, width=8).pack(side="left", padx=4)
+
+        r = ttk.Frame(hp_frm); r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Learning rate:", width=18, anchor="w").pack(side="left")
+        self._nn_lr_var = tk.StringVar(value="0.001")
+        ttk.Entry(r, textvariable=self._nn_lr_var, width=8).pack(side="left", padx=4)
+
+        r = ttk.Frame(hp_frm); r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Val split:", width=18, anchor="w").pack(side="left")
+        self._nn_val_var = tk.StringVar(value="0.20")
+        ttk.Entry(r, textvariable=self._nn_val_var, width=8).pack(side="left", padx=4)
+
+        # Separator
+        ttk.Separator(nn_frm, orient="horizontal").pack(fill="x", padx=8, pady=6)
+
+        # Data source indicator
+        ds_row = ttk.Frame(nn_frm); ds_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(ds_row, text="Data source:", anchor="w").pack(side="left")
+        self._nn_data_status = tk.StringVar(value="checking…")
+        ttk.Label(ds_row, textvariable=self._nn_data_status,
+                  foreground="#80c8ff", font=("Consolas", 8)).pack(side="left", padx=6)
+
+        # Train button + status
+        btn_row = ttk.Frame(nn_frm); btn_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._train_btn = ttk.Button(btn_row, text="Start Training",
+                                     command=self._on_train_start)
+        self._train_btn.pack(side="left")
+        self._stop_train_btn = ttk.Button(btn_row, text="Stop",
+                                          command=self._on_train_stop,
+                                          state="disabled")
+        self._stop_train_btn.pack(side="left", padx=(6, 0))
+        self._train_status = tk.StringVar(value="—")
+        ttk.Label(btn_row, textvariable=self._train_status,
+                  foreground="gray").pack(side="left", padx=8)
+
+        # Epoch progress label (updated by log parsing)
+        ep_row = ttk.Frame(nn_frm); ep_row.pack(fill="x", padx=8, pady=(0, 2))
+        self._train_epoch_var = tk.StringVar(value="")
+        ttk.Label(ep_row, textvariable=self._train_epoch_var,
+                  foreground="#4ec94e", font=("Consolas", 8)).pack(side="left")
+
+        # Mini log (train-only output)
+        ttk.Separator(nn_frm, orient="horizontal").pack(fill="x", padx=8, pady=(4, 2))
+        log_hdr = ttk.Frame(nn_frm); log_hdr.pack(fill="x", padx=6, pady=(2, 0))
+        ttk.Label(log_hdr, text="Training log", foreground="gray",
+                  font=("Consolas", 8)).pack(side="left")
+        ttk.Button(log_hdr, text="Clear",
+                   command=self._clear_train_log).pack(side="right")
+
+        self._train_log = tk.Text(nn_frm, height=8, state="disabled",
+                                  wrap="word", font=("Consolas", 8),
+                                  bg="#1e1e1e", fg="#d4d4d4",
+                                  insertbackground="white",
+                                  relief="flat", bd=0)
+        tvsb = ttk.Scrollbar(nn_frm, orient="vertical",
+                             command=self._train_log.yview)
+        self._train_log.configure(yscrollcommand=tvsb.set)
+        tvsb.pack(side="right", fill="y", padx=(0, 4), pady=4)
+        self._train_log.pack(fill="both", expand=True, padx=(6, 0), pady=4)
+
+        # Artifact status at the very bottom
+        art_row = ttk.Frame(nn_frm); art_row.pack(fill="x", padx=8, pady=(0, 6))
+        self._artifact_status = tk.StringVar(value="")
+        ttk.Label(art_row, textvariable=self._artifact_status,
+                  foreground="#80c8ff", font=("Consolas", 8),
+                  wraplength=260, justify="left").pack(side="left")
+
+        # Set the sash position after window is rendered
+        self.after(100, lambda: paned.sash_place(0, self.winfo_width() // 2, 0))
+
+        self._refresh_nn_status()
 
     # ------------------------------------------------------------------ log
     def _log(self, text: str):
@@ -203,7 +305,9 @@ class AutomationTab(ttk.Frame):
     # ------------------------------------------------------------------ poll
     def _poll(self):
         self._flush_log()
+        self._flush_train_log()
         self._check_sweep_done()
+        self._check_train_done()
         self.after(POLL_MS, self._poll)
 
     def _check_sweep_done(self):
@@ -280,6 +384,7 @@ class AutomationTab(ttk.Frame):
             self._coverage_var.set("Coverage: none")
 
         self._redraw_progress(n_done=n_done)
+        self._refresh_nn_status()
 
     def _update_coverage(self, results: list):
         """Compute contiguous covered index ranges and update label + canvas data."""
@@ -539,3 +644,137 @@ class AutomationTab(ttk.Frame):
             self._pause_btn.config(text="Cancel Pause")
             self._sweep_status.set("Pausing after batch…")
             self._log("[sweep] Stop flag set — will pause after current batch.")
+
+    # ------------------------------------------------------------------ train
+    def _log_train(self, text: str):
+        self._train_log_queue.put(text)
+
+    def _flush_train_log(self):
+        try:
+            while True:
+                msg = self._train_log_queue.get_nowait()
+                self._train_log.configure(state="normal")
+                self._train_log.insert("end", msg + "\n")
+                self._train_log.see("end")
+                self._train_log.configure(state="disabled")
+                # Parse "Epoch  800/800  |  Train MSE: …  |  Val MSE: …"
+                if msg.startswith("Epoch"):
+                    self._train_epoch_var.set(msg.strip())
+        except queue.Empty:
+            pass
+
+    def _clear_train_log(self):
+        self._train_log.configure(state="normal")
+        self._train_log.delete("1.0", "end")
+        self._train_log.configure(state="disabled")
+
+    def _refresh_nn_status(self):
+        """Update the data-source and artifact indicators."""
+        if os.path.exists(_RESULTS_FILE):
+            try:
+                with open(_RESULTS_FILE) as f:
+                    d = json.load(f)
+                n = sum(1 for r in d.get("results", []) if r.get("ok"))
+                self._nn_data_status.set(f"{n} OK simulations in sweep_results.json")
+            except Exception:
+                self._nn_data_status.set("sweep_results.json unreadable")
+        else:
+            self._nn_data_status.set("No sweep_results.json found — run sweep first")
+
+        parts = []
+        if os.path.exists(_MODEL_FILE):
+            parts.append("model.pth ✓")
+        if os.path.exists(os.path.join(_NN_DIR, "x_scaler.pkl")):
+            parts.append("x_scaler ✓")
+        if os.path.exists(os.path.join(_NN_DIR, "y_scaler.pkl")):
+            parts.append("y_scaler ✓")
+        if os.path.exists(_LOSS_PLOT):
+            parts.append("loss_curve.png ✓")
+        self._artifact_status.set("  ".join(parts) if parts else "No trained model yet")
+
+    def _check_train_done(self):
+        if self._train_proc is not None and self._train_proc.poll() is not None:
+            rc = self._train_proc.returncode
+            self._train_proc   = None
+            self._train_thread = None
+            if rc == 0:
+                self._train_status.set("Done")
+                self._log_train("[train] Training finished successfully.")
+                self._log("[train] Training complete — model saved to NeuralNetwork/")
+            else:
+                self._train_status.set(f"Error (code {rc})")
+                self._log_train(f"[train] Process exited with code {rc}.")
+            self._train_btn.config(state="normal")
+            self._stop_train_btn.config(state="disabled")
+            self._refresh_nn_status()
+
+    def _on_train_start(self):
+        if self._train_proc is not None:
+            return
+        if not os.path.exists(_RESULTS_FILE):
+            self._log_train("[train] ERROR: sweep_results.json not found. Run the sweep first.")
+            return
+        if not os.path.exists(_TRAIN_SCRIPT):
+            self._log_train(f"[train] ERROR: train_surrogate.py not found at {_TRAIN_SCRIPT}")
+            return
+
+        # Validate hyperparameter fields
+        try:
+            epochs = int(self._nn_epochs_var.get())
+            batch  = int(self._nn_batch_var.get())
+            lr     = float(self._nn_lr_var.get())
+            val    = float(self._nn_val_var.get())
+            assert 0 < val < 1
+        except (ValueError, AssertionError):
+            self._log_train("[train] ERROR: invalid hyperparameter values.")
+            return
+
+        self._train_btn.config(state="disabled")
+        self._stop_train_btn.config(state="normal")
+        self._train_status.set("Running…")
+        self._train_epoch_var.set("")
+        self._log_train(
+            f"[train] Starting — epochs={epochs}  batch={batch}  lr={lr}  val={val}"
+        )
+        self._log(f"[train] Launched train_surrogate.py  (epochs={epochs}, batch={batch})")
+
+        env = os.environ.copy()
+        env["SURROGATE_EPOCHS"]     = str(epochs)
+        env["SURROGATE_BATCH_SIZE"] = str(batch)
+        env["SURROGATE_LR"]         = str(lr)
+        env["SURROGATE_VAL_SPLIT"]  = str(val)
+
+        try:
+            self._train_proc = subprocess.Popen(
+                [sys.executable, "-u", _TRAIN_SCRIPT],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=_NN_DIR,
+                env=env,
+            )
+        except Exception as exc:
+            self._log_train(f"[train] Failed to launch: {exc}")
+            self._train_btn.config(state="normal")
+            self._stop_train_btn.config(state="disabled")
+            self._train_status.set("Error")
+            return
+
+        def _drain():
+            for line in self._train_proc.stdout:
+                self._log_train(line.rstrip())
+
+        self._train_thread = threading.Thread(target=_drain, daemon=True)
+        self._train_thread.start()
+
+    def _on_train_stop(self):
+        if self._train_proc is None:
+            return
+        try:
+            self._train_proc.terminate()
+        except Exception:
+            pass
+        self._train_status.set("Stopped")
+        self._log_train("[train] Training stopped by user.")
+        self._train_btn.config(state="normal")
+        self._stop_train_btn.config(state="disabled")

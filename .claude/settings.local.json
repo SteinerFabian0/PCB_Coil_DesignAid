@@ -6,7 +6,9 @@
       "PowerShell($clsid = \\(Get-ItemProperty \"HKLM:\\\\SOFTWARE\\\\Classes\\\\FastHenry2.Document\\\\CLSID\"\\).\"\\(default\\)\"; Write-Host \"CLSID: $clsid\"; $server = Get-ItemProperty \"HKLM:\\\\SOFTWARE\\\\Classes\\\\CLSID\\\\$clsid\\\\LocalServer32\" -ErrorAction SilentlyContinue; if \\($server\\) { Write-Host \"LocalServer32 \\(exe\\): $\\($server.'\\(default\\)'\\)\" } else { $inproc = Get-ItemProperty \"HKLM:\\\\SOFTWARE\\\\Classes\\\\CLSID\\\\$clsid\\\\InprocServer32\" -ErrorAction SilentlyContinue; if \\($inproc\\) { Write-Host \"InprocServer32 \\(dll\\): $\\($inproc.'\\(default\\)'\\)\" } })",
       "PowerShell(Get-Process FastHenry2 -ErrorAction SilentlyContinue | Select-Object Id, WorkingSet64, CPU | Format-Table; if \\(-not \\(Get-Process FastHenry2 -ErrorAction SilentlyContinue\\)\\) { Write-Host \"FastHenry2 not currently running — checking exe size instead\"; \\(Get-Item \"C:\\\\Program Files \\(x86\\)\\\\FastFieldSolvers\\\\FastHenry2\\\\FastHenry2.exe\"\\).Length / 1MB })",
       "Bash(pip install *)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('App/Tabs/automation_tab.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('NeuralNetwork/train_surrogate.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
