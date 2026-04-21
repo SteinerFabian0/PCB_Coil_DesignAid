@@ -21,6 +21,7 @@ for _p in (_MODULES_DIR, _TABS_DIR, _SAVESTATE_DIR, _HERE):
 import savestate
 from parametric_tab import ParametricCoilTab
 from sim_tab import SimTab
+from sim_nn_tab import SimNNTab
 from dxf_coil_tab import DxfCoilTab
 from automation_tab import AutomationTab
 
@@ -59,8 +60,12 @@ class CoilApp(tk.Tk):
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
 
+        # Apply custom entry styles for the NN tab range validation.
+        SimNNTab.configure_styles()
+
         # Sim first so coil tabs can call get_target_freq() during init.
         self.sim_tab = SimTab(nb, app=self, temp_dir=TEMP_DIR)
+        self.sim_nn_tab = SimNNTab(nb, app=self)
 
         # Coil tabs — built as ordered list so Next Tab can advance
         # without each tab knowing its neighbor.
@@ -87,6 +92,7 @@ class CoilApp(tk.Tk):
         nb.add(self.param_tx_tab, text="  Parametric TX  ")
         nb.add(self.param_rx_tab, text="  Parametric RX  ")
         nb.add(self.sim_tab,      text="  Simulation  ")
+        nb.add(self.sim_nn_tab,   text="  Simulation NN  ")
         nb.add(self.auto_tab,     text="  Automation  ")
 
         self._ordered_tabs = [self.dxf_tx_tab, self.dxf_rx_tab,

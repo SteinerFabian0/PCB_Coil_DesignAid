@@ -639,6 +639,20 @@ class ParametricCoilTab(ttk.Frame):
             self.role, "Parametric Generator", dest, meta)
         self._set_sim_status("current")
 
+        # Also push parameters to the Simulation NN tab.
+        try:
+            nn_tab = getattr(self.app, "sim_nn_tab", None)
+            if nn_tab is not None:
+                nn_params = {
+                    "od":       self._last_params.od_mm,
+                    "turns":    self._last_params.turns,
+                    "w":        self._last_params.trace_width_mm,
+                    "topology": topo,
+                }
+                nn_tab.receive_parametric_params(self.role, nn_params)
+        except Exception:
+            pass
+
     def export_inp(self):
         if not self.is_ready():
             messagebox.showwarning("Export", "Generate a valid coil first.")

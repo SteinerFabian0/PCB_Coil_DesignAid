@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader, TensorDataset
 # Config
 # ---------------------------------------------------------------------------
 
-DATA_PATH   = os.path.join(os.path.dirname(__file__), "..", "App", "SimulationData", "sweep_results.json")
+DATA_PATH   = os.path.join(os.path.dirname(__file__), "..", "SimulationData", "sweep_results.json")
 OUTPUT_DIR  = os.path.dirname(__file__)
 
 # Hyperparameters — overridable via environment variables (set by the GUI)
