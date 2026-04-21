@@ -332,10 +332,40 @@ class AutomationTab(ttk.Frame):
 
         def _drain():
             for line in self._sweep_proc.stdout:
-                self._log(line.rstrip())
+                stripped = line.rstrip()
+                self._log(stripped)
+                if "[checkpoint]" in stripped:
+                    self.after(0, self._on_checkpoint)
 
         self._sweep_thread = threading.Thread(target=_drain, daemon=True)
         self._sweep_thread.start()
+
+    def _on_checkpoint(self):
+        self._refresh_status()
+        if not os.path.exists(_RESULTS_FILE):
+            return
+        try:
+            with open(_RESULTS_FILE) as f:
+                data = json.load(f)
+            results = [r for r in data.get("results", []) if r.get("ok")]
+            if not results:
+                return
+            best = max(results, key=lambda r: r.get("k", 0.0))
+            k    = best.get("k", 0.0)
+            fom  = k * (best.get("Q_tx", 0.0) * best.get("Q_rx", 0.0)) ** 0.5
+            self._log(
+                f"[best-k] tag={best.get('tag','')}  "
+                f"k={k:.4f}  FOM=k*sqrt(Q_tx*Q_rx)={fom:.2f}  |  "
+                f"TX: {best.get('tx_turns','')}t  w={best.get('tx_width',''):.3f}mm  "
+                f"OD={best.get('tx_od_mm',''):.1f}mm  "
+                f"L={best.get('L_tx_uH',0):.2f}uH  Q={best.get('Q_tx',0):.1f}  |  "
+                f"RX: {best.get('rx_turns','')}t  w={best.get('rx_width',''):.3f}mm  "
+                f"OD={best.get('rx_od_mm',''):.1f}mm  "
+                f"L={best.get('L_rx_uH',0):.2f}uH  Q={best.get('Q_rx',0):.1f}  "
+                f"topo={best.get('rx_topology','')}  M={best.get('M_uH',0):.3f}uH"
+            )
+        except Exception as exc:
+            self._log(f"[best-k] scan failed: {exc}")
 
     def _on_pause(self):
         if self._sweep_proc is None:

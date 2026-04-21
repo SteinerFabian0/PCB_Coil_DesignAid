@@ -18,10 +18,12 @@ RX fixed:   spacing=0.16, all 4 layers (outer 1oz, inner 0.5oz),
             outer_gap=0.2, inner_gap=0.6, port inside
 RX free:    OD ∈ [48,52], turns ∈ [4,25] (int), trace_width ∈ [0.2,1.2]
 
-Global:     PCB gap = 2.6 mm, freq ∈ [110000,140000]
+Global:     PCB gap = 2.6 mm, freq fixed at 125 000 Hz
 
-LHS dimensions per sample (6D):
-    [tx_turns, tx_width, rx_od, rx_turns, rx_width, freq]
+Geometry constraint:  ID of both TX and RX >= 35 mm
+
+LHS dimensions per sample (5D):
+    [tx_turns, tx_width, rx_od, rx_turns, rx_width]
 
 Run:
     python generate_lhs_samples.py [--n 1500] [--out lhs_samples.json] [--seed 42]
@@ -51,6 +53,8 @@ DEFAULT_SEED = 42
 RESOLUTION_MM = 1.5    # FastHenry segment length — coarser = faster, finer = more accurate
 
 PCB_GAP_MM   = 2.6
+FREQ_HZ      = 125_000.0
+MIN_ID_MM    = 35.0
 
 # TX fixed
 TX_OD         = 52.0
@@ -83,7 +87,6 @@ TX_WIDTH_RANGE = (0.2, 1.2)
 RX_OD_RANGE    = (48.0, 52.0)
 RX_TURNS_RANGE = (4,   25)
 RX_WIDTH_RANGE = (0.2, 1.2)
-FREQ_RANGE     = (110_000.0, 140_000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +107,10 @@ def _feasible(od, w, s, t, og, ig, layers):
     ok, msg = pc.validate_spiral(sp)
     if not ok:
         return False, msg
+    # Inner-diameter constraint: innermost trace inner edge >= MIN_ID_MM
+    id_mm = 2.0 * (sp.r_inner_centerline - w / 2.0)
+    if id_mm < MIN_ID_MM:
+        return False, f"ID {id_mm:.2f} mm < {MIN_ID_MM} mm minimum"
     stackup = pc.StackUp(
         slots=[pc.LayerSlot(active=l["active"], copper_oz=l["copper_oz"])
                for l in layers],
@@ -119,11 +126,12 @@ def _feasible(od, w, s, t, og, ig, layers):
 
 def _generate_candidates(n: int, rx_topology: str, seed: int) -> list:
     """
-    LHS over 6 dimensions:
-        0: tx_turns  1: tx_width  2: rx_od  3: rx_turns  4: rx_width  5: freq
+    LHS over 5 dimensions:
+        0: tx_turns  1: tx_width  2: rx_od  3: rx_turns  4: rx_width
+    Frequency is fixed at FREQ_HZ (125 kHz) — not swept.
     Returns list of raw candidate dicts (not yet filtered).
     """
-    sampler = qmc.LatinHypercube(d=6, seed=seed)
+    sampler = qmc.LatinHypercube(d=5, seed=seed)
     raw = sampler.random(n)
 
     candidates = []
@@ -135,11 +143,10 @@ def _generate_candidates(n: int, rx_topology: str, seed: int) -> list:
         rx_turns = _round_int(_scale(row[3], *RX_TURNS_RANGE),
                                RX_TURNS_RANGE[0], RX_TURNS_RANGE[1])
         rx_width = round(_scale(row[4], *RX_WIDTH_RANGE), 4)
-        freq     = round(_scale(row[5], *FREQ_RANGE),     1)
         candidates.append({
             "tx_turns": tx_turns, "tx_width": tx_width,
             "rx_od":    rx_od,    "rx_turns": rx_turns,
-            "rx_width": rx_width, "freq":     freq,
+            "rx_width": rx_width, "freq":     FREQ_HZ,
             "rx_topology": rx_topology,
         })
     return candidates
@@ -196,10 +203,10 @@ def _make_simparams(c: dict, branch_idx: int, sample_idx: int) -> SimParams:
         rx_topology=topo,
         rx_layers=RX_LAYERS,
         pcb_gap_mm=PCB_GAP_MM,
-        freq_hz=c["freq"],
-        fmin_hz=FREQ_RANGE[0],
-        fmax_hz=FREQ_RANGE[1],
-        freq_ndec=1,
+        freq_hz=FREQ_HZ,
+        fmin_hz=FREQ_HZ,
+        fmax_hz=FREQ_HZ,
+        freq_ndec=0,
         resolution_mm=RESOLUTION_MM,
         timeout_sec=240.0,
         tag=tag,
@@ -268,9 +275,9 @@ def dict_to_simparams(d: dict) -> SimParams:
             {"active": True, "copper_oz": 1.0},
         ]),
         pcb_gap_mm=d.get("pcb_gap_mm",     2.6),
-        freq_hz=d.get("freq_hz",        130_000.0),
-        fmin_hz=d.get("fmin_hz",        110_000.0),
-        fmax_hz=d.get("fmax_hz",        140_000.0),
+        freq_hz=d.get("freq_hz",        125_000.0),
+        fmin_hz=d.get("fmin_hz",        125_000.0),
+        fmax_hz=d.get("fmax_hz",        125_000.0),
         freq_ndec=d.get("freq_ndec",       1),
         resolution_mm=d.get("resolution_mm",  1.0),
         timeout_sec=d.get("timeout_sec",    240.0),
@@ -302,6 +309,7 @@ def main():
 
     print("=" * 70)
     print(f"LHS TX+RX sampler -- 3 branches x {n_target} valid samples each")
+    print(f"5D LHS (freq fixed at {FREQ_HZ/1e3:.0f} kHz, ID >= {MIN_ID_MM} mm)")
     print(f"Oversampling {OVERSAMPLE}x -> filtering infeasible geometries")
     print("=" * 70)
 
@@ -332,6 +340,8 @@ def main():
             "oversample":    OVERSAMPLE,
             "total_samples": len(all_params),
             "pcb_gap_mm":    PCB_GAP_MM,
+            "freq_hz":       FREQ_HZ,
+            "min_id_mm":     MIN_ID_MM,
             "summary":       summary,
         },
         "samples": [simparams_to_dict(p) for p in all_params],
