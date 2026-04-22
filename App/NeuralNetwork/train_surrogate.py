@@ -4,13 +4,16 @@ Surrogate Neural Network for PCB Coil Parameter Prediction.
 Trains a feed-forward MLP that maps physical coil parameters -> electrical characteristics,
 replacing slow FastHenry simulations during optimization.
 
-Inputs  : tx_turns, tx_width, rx_od_mm, rx_turns, rx_width, freq_hz, rx_topology (one-hot)
+Inputs include the raw geometry columns plus analytical features
+(Wheeler inductance, wire length, ln N^2, mean radius, fill factor, inner
+diameter) that are added during the append step.  Topology is one-hot
+encoded for both TX and RX.
+ 
 Outputs : L_tx_uH, L_rx_uH, M_uH, R_tx_ac, R_rx_ac
 """
 
 import json
 import os
-import pickle
 
 import joblib
 import matplotlib.pyplot as plt
@@ -26,8 +29,20 @@ from torch.utils.data import DataLoader, TensorDataset
 # Config
 # ---------------------------------------------------------------------------
 
-DATA_PATH   = os.path.join(os.path.dirname(__file__), "..", "SimulationData", "sweep_results.json")
-OUTPUT_DIR  = os.path.dirname(__file__)
+_HERE      = os.path.dirname(__file__)
+_SIMDATA   = os.path.join(_HERE, "..", "SimulationData")
+ 
+# Prefer the new global_results.json; fall back to legacy sweep_results.json
+DATA_PATH  = os.environ.get(
+    "SURROGATE_DATA",
+    os.path.join(_SIMDATA, "global_results.json"),
+)
+if not os.path.exists(DATA_PATH):
+    _legacy = os.path.join(_SIMDATA, "sweep_results.json")
+    if os.path.exists(_legacy):
+        DATA_PATH = _legacy
+ 
+OUTPUT_DIR = _HERE
 
 # Hyperparameters — overridable via environment variables (set by the GUI)
 EPOCHS      = int(os.environ.get("SURROGATE_EPOCHS",     "800"))
@@ -35,12 +50,30 @@ BATCH_SIZE  = int(os.environ.get("SURROGATE_BATCH_SIZE", "128"))
 LR          = float(os.environ.get("SURROGATE_LR",       "1e-3"))
 VAL_SPLIT   = float(os.environ.get("SURROGATE_VAL_SPLIT","0.20"))
 RANDOM_SEED = 42
-PRINT_EVERY = max(1, EPOCHS // 16)  # ~16 progress updates regardless of epoch count
+PRINT_EVERY = max(1, EPOCHS // 16)
+ 
+# Raw geometry columns pulled directly from each result row.
+BASE_INPUT_COLS = [
+    "tx_turns", "tx_width", "tx_od_mm",
+    "rx_od_mm", "rx_turns", "rx_width",
+    "freq_hz",
+    "tx_spacing_mm", "rx_spacing_mm",
+    "tx_outer_gap_mm", "tx_inner_gap_mm",
+    "rx_outer_gap_mm", "rx_inner_gap_mm",
+]
+ 
+# Analytical features added during append step (one set each for TX and RX).
+_FEATURE_SUFFIX = [
+    "wire_length_mm", "wheeler_uh", "ln_n_sq",
+    "mean_radius_mm", "fill_factor", "inner_diameter_mm",
+]
+DERIVED_INPUT_COLS = [f"{side}_{k}" for side in ("tx", "rx") for k in _FEATURE_SUFFIX]
 
-INPUT_COLS = ["tx_turns", "tx_width", "tx_od_mm", "rx_od_mm", "rx_turns", "rx_width", "freq_hz"]
 OUTPUT_COLS = ["L_tx_uH", "L_rx_uH", "M_uH", "R_tx_ac", "R_rx_ac"]
-TOPOLOGY_COL = "rx_topology"
 
+TX_TOPOLOGY_COL = "tx_topology"
+RX_TOPOLOGY_COL = "rx_topology"
+ 
 # ---------------------------------------------------------------------------
 # 1. Load data
 # ---------------------------------------------------------------------------
@@ -51,7 +84,7 @@ def load_data(path: str) -> pd.DataFrame:
 
     records = [r for r in raw["results"] if r.get("ok")]
     df = pd.DataFrame(records)
-    print(f"Loaded {len(df)} successful simulation records.")
+    print(f"Loaded {len(df)} successful simulation records from {path}")
     return df
 
 
@@ -59,27 +92,38 @@ def load_data(path: str) -> pd.DataFrame:
 # 2. Pre-process
 # ---------------------------------------------------------------------------
 
-def preprocess(df: pd.DataFrame):
-    # One-hot encode rx_topology
-    topology_dummies = pd.get_dummies(df[TOPOLOGY_COL], prefix="topo")
+def _ensure_columns(df: pd.DataFrame, cols, default=0.0) -> None:
+    for c in cols:
+        if c not in df.columns:
+            df[c] = default
+ 
 
-    X = pd.concat([df[INPUT_COLS], topology_dummies], axis=1).astype(float)
+def preprocess(df: pd.DataFrame):
+    # Tolerate legacy datasets that may lack some columns
+    _ensure_columns(df, BASE_INPUT_COLS + DERIVED_INPUT_COLS, default=0.0)
+    if TX_TOPOLOGY_COL not in df.columns:
+        df[TX_TOPOLOGY_COL] = "parallel"
+    if RX_TOPOLOGY_COL not in df.columns:
+        df[RX_TOPOLOGY_COL] = "parallel"
+ 
+    tx_dummies = pd.get_dummies(df[TX_TOPOLOGY_COL], prefix="tx_topo")
+    rx_dummies = pd.get_dummies(df[RX_TOPOLOGY_COL], prefix="rx_topo")
+ 
+    X = pd.concat(
+        [df[BASE_INPUT_COLS + DERIVED_INPUT_COLS], tx_dummies, rx_dummies],
+        axis=1,
+    ).astype(float)
     y = df[OUTPUT_COLS].astype(float)
 
     print(f"Input features  : {list(X.columns)}  ({X.shape[1]} total)")
     print(f"Output targets  : {list(y.columns)}")
 
-    # Train / val split (stratify by topology to keep class balance)
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y,
-        test_size=VAL_SPLIT,
-        random_state=RANDOM_SEED,
+        X, y, test_size=VAL_SPLIT, random_state=RANDOM_SEED,
     )
 
-    # Scale — fit ONLY on training data, then transform both splits
     x_scaler = StandardScaler()
     y_scaler = StandardScaler()
-
     X_train_s = x_scaler.fit_transform(X_train)
     X_val_s   = x_scaler.transform(X_val)
     y_train_s = y_scaler.fit_transform(y_train)
@@ -91,7 +135,7 @@ def preprocess(df: pd.DataFrame):
         X_train_s, X_val_s,
         y_train_s, y_val_s,
         x_scaler, y_scaler,
-        X.shape[1],       # n_inputs (varies with topology encoding)
+        X.shape[1],
     )
 
 

@@ -26,9 +26,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+_APP_ROOT    = os.path.dirname(_HERE)
+_MODULES_DIR = os.path.join(_APP_ROOT, "Modules")
+
+for _p in (_HERE, _MODULES_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import parametric_coil as pc
 import zc_parser
@@ -74,6 +78,14 @@ class SimParams:
         {"active": True, "copper_oz": 1.0},
     ])
 
+    # --- Per-side meshing / port choice ---
+    tx_port_inside: bool = False
+    rx_port_inside: bool = True
+    tx_nhinc:       int  = 1
+    tx_nwinc:       int  = 3
+    rx_nhinc:       int  = 1
+    rx_nwinc:       int  = 3
+ 
     # --- Global / sim params ---
     pcb_gap_mm:    float = 2.6
     freq_hz:       float = 130_000.0
@@ -83,8 +95,8 @@ class SimParams:
     resolution_mm: float = 1.0
     timeout_sec:   float = 240.0   # 4 minutes — 2-port sims are heavier
 
-    tag: str = ""
-
+    tag:     str = ""
+    sample_id: int = -1
 
 # ---------------------------------------------------------------------------
 # Geometry feasibility pre-check
@@ -138,15 +150,17 @@ def _write_inp(p: SimParams, inp_path: str) -> None:
                         p.rx_turns, p.rx_outer_gap_mm, p.rx_inner_gap_mm,
                         p.rx_layers)
 
-    # RX port_inside=True: port on inner spiral endpoints (per spec)
     pc.write_combined_tx_rx_inp(
         tx_ld, rx_ld, inp_path,
         tx_w_mm=p.tx_trace_width_mm,
         rx_w_mm=p.rx_trace_width_mm,
         tx_topology=p.tx_topology,
         rx_topology=p.rx_topology,
-        rx_port_inside=True,
+        tx_port_inside=p.tx_port_inside,
+        rx_port_inside=p.rx_port_inside,
         pcb_gap_mm=p.pcb_gap_mm,
+        tx_nhinc=p.tx_nhinc, tx_nwinc=p.tx_nwinc,
+        rx_nhinc=p.rx_nhinc, rx_nwinc=p.rx_nwinc,
         fmin=p.fmin_hz, fmax=p.fmax_hz, freq_ndec=p.freq_ndec,
     )
 
@@ -242,6 +256,7 @@ def _parse_result(zc_path: str, p: SimParams) -> dict:
     return {
         "ok":         True,
         "tag":        p.tag,
+        "sample_id":  p.sample_id,
         "freq_hz":    freq_actual,
         # TX
         "L_tx_uH":    L_tx_H  * 1e6,
@@ -256,14 +271,26 @@ def _parse_result(zc_path: str, p: SimParams) -> dict:
         # Coupling
         "M_uH":       M_H     * 1e6,
         "k":          k,
-        # Geometry echo
-        "tx_turns":   p.tx_turns,
-        "tx_width":   p.tx_trace_width_mm,
-        "tx_od_mm":   p.tx_od_mm,
-        "rx_turns":   p.rx_turns,
-        "rx_width":   p.rx_trace_width_mm,
-        "rx_od_mm":   p.rx_od_mm,
-        "rx_topology": p.rx_topology,
+        # Geometry echo (full — needed by the append step for NN features)
+        "tx_turns":        p.tx_turns,
+        "tx_width":        p.tx_trace_width_mm,
+        "tx_od_mm":        p.tx_od_mm,
+        "tx_spacing_mm":   p.tx_spacing_mm,
+        "tx_outer_gap_mm": p.tx_outer_gap_mm,
+        "tx_inner_gap_mm": p.tx_inner_gap_mm,
+        "tx_topology":     p.tx_topology,
+        "tx_port_inside":  p.tx_port_inside,
+        "tx_layers":       p.tx_layers,
+        "rx_turns":        p.rx_turns,
+        "rx_width":        p.rx_trace_width_mm,
+        "rx_od_mm":        p.rx_od_mm,
+        "rx_spacing_mm":   p.rx_spacing_mm,
+        "rx_outer_gap_mm": p.rx_outer_gap_mm,
+        "rx_inner_gap_mm": p.rx_inner_gap_mm,
+        "rx_topology":     p.rx_topology,
+        "rx_port_inside":  p.rx_port_inside,
+        "rx_layers":       p.rx_layers,
+        "pcb_gap_mm":      p.pcb_gap_mm,
     }
 
 
@@ -290,7 +317,7 @@ def run_single_sim(p: SimParams) -> dict:
     reason = _check_feasibility(p)
     if reason is not None:
         return {
-            "ok": False, "tag": p.tag,
+            "ok": False, "tag": p.tag, "sample_id": p.sample_id,
             "error": f"infeasible: {reason}",
             "pid": pid, "elapsed_sec": round(time.time() - wall_t0, 2),
         }
@@ -307,7 +334,7 @@ def run_single_sim(p: SimParams) -> dict:
 
     except Exception as exc:
         return {
-            "ok": False, "tag": p.tag, "error": str(exc),
+            "ok": False, "tag": p.tag, "sample_id": p.sample_id, "error": str(exc),
             "pid": pid, "elapsed_sec": round(time.time() - wall_t0, 2),
         }
 

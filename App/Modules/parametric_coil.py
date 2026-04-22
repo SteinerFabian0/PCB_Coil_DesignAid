@@ -732,10 +732,13 @@ def write_combined_tx_rx_inp(
     out_path,
     tx_w_mm, rx_w_mm,
     tx_topology="parallel", rx_topology="parallel",
+    tx_port_inside=False,
     rx_port_inside=False,
     pcb_gap_mm=2.6,
     sigma=COPPER_SIGMA_PER_MM,
     nhinc=1, nwinc=3,
+    tx_nhinc=None, tx_nwinc=None,
+    rx_nhinc=None, rx_nwinc=None,
     fmin=1.1e5, fmax=1.4e5, freq_ndec=1,
 ):
     """
@@ -762,15 +765,20 @@ def write_combined_tx_rx_inp(
         shifted_nodes = [(x, y, z + z_shift) for (x, y, z) in ld["nodes"]]
         rx_shifted.append({**ld, "z": ld["z"] + z_shift, "nodes": shifted_nodes})
 
+    _tx_nh = nhinc if tx_nhinc is None else tx_nhinc
+    _tx_nw = nwinc if tx_nwinc is None else tx_nwinc
+    _rx_nh = nhinc if rx_nhinc is None else rx_nhinc
+    _rx_nw = nwinc if rx_nwinc is None else rx_nwinc
+ 
     tx_nodes, tx_edges, tx_ps, tx_pe, after_tx_nodes, after_tx_edges = \
         _collect_segment_text(tx_layer_data,  0, 0,
-                              tx_w_mm, tx_topology, False,
-                              sigma, nhinc, nwinc)
+                              tx_w_mm, tx_topology, tx_port_inside,
+                              sigma, _tx_nh, _tx_nw)
 
     rx_nodes, rx_edges, rx_ps, rx_pe, _, _ = \
         _collect_segment_text(rx_shifted, after_tx_nodes, after_tx_edges,
                               rx_w_mm, rx_topology, rx_port_inside,
-                              sigma, nhinc, nwinc)
+                              sigma, _rx_nh, _rx_nw)
 
     with open(out_path, "w", newline="\n") as f:
         f.write(f"* Combined TX+RX coil — 2-port FastHenry simulation\n")

@@ -18,7 +18,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "App", "Modules"))
 
-from parallel_sim import SimParams, run_batch
+from App.NeuralNetwork.parallel_sim import SimParams, run_batch
 
 PARAM_SETS = [
     SimParams(
