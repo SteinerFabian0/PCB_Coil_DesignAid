@@ -104,7 +104,7 @@ FREQ_MAX_HZ              = "140000"
 TOTAL_SAMPLES            = "64000"
 
 # FastHenry sweep
-SWEEP_WORKERS            = "8"
+SWEEP_WORKERS            = "6"
 SWEEP_TIMEOUT_S          = "360"
 SWEEP_CKPT_EVERY         = "50"
 SWEEP_FROM_IDX           = "0"
@@ -1103,8 +1103,8 @@ class AutomationTab(ttk.Frame):
         else:
             open(_STOP_FLAG, "w").close()
             self._pause_btn.config(text="Cancel Pause")
-            self._sweep_status.set("Pausing…")
-            self._log("[sweep] Stop flag set — finishing active simulations.")
+            self._sweep_status.set("Stopping…")
+            self._log("[sweep] Stop flag set — terminating workers immediately.")
 
     # ================================================================ append
     def _on_append(self):

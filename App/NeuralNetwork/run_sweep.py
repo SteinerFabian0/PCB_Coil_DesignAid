@@ -242,10 +242,11 @@ def main() -> int:
     wall_start = time.time()
     since_ckpt = 0
 
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+    pool = ProcessPoolExecutor(max_workers=args.workers)
+    stop_signaled = False
+    try:
         fut_map = {pool.submit(run_single_sim, p): p for p in todo}
         done_count = 0
-        stop_signaled = False
         for fut in as_completed(fut_map):
             if fut.cancelled():
                 continue
@@ -279,13 +280,17 @@ def main() -> int:
                 since_ckpt = 0
 
             if not stop_signaled and _stop_requested(args.out):
-                print("[STOP] Stop flag detected — cancelling pending jobs, "
-                      "letting running jobs finish.", flush=True)
+                print("[STOP] Stop flag — terminating all workers immediately.", flush=True)
                 stop_signaled = True
-                for f in fut_map:
-                    if not f.running() and not f.done():
-                        f.cancel()
-                # No break — drain in-flight futures so their results are captured
+                _flush(args.out, meta, results)
+                for proc in pool._processes.values():
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+    finally:
+        pool.shutdown(wait=False)
 
     _flush(args.out, meta, results)
 

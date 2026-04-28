@@ -310,8 +310,12 @@ def run_single_sim(p: SimParams) -> dict:
     worker never crashes the pool.
 
     Includes "pid" and "elapsed_sec" in every result.
+
+    Fast failures (< 30 s) are retried up to 2 times with exponential backoff
+    (2 s, then 4 s) to recover from transient Windows COM / process-limit
+    errors that occur when many FastHenry instances run concurrently.
     """
-    wall_t0 = time.time()
+    overall_start = time.time()
     pid = os.getpid()
 
     reason = _check_feasibility(p)
@@ -319,27 +323,39 @@ def run_single_sim(p: SimParams) -> dict:
         return {
             "ok": False, "tag": p.tag, "sample_id": p.sample_id,
             "error": f"infeasible: {reason}",
-            "pid": pid, "elapsed_sec": round(time.time() - wall_t0, 2),
+            "pid": pid, "elapsed_sec": round(time.time() - overall_start, 2),
         }
 
-    tmp_dir = tempfile.mkdtemp(prefix="fh_sim_")
-    try:
-        inp_path = os.path.join(tmp_dir, "coil.inp")
-        _write_inp(p, inp_path)
-        zc_path = _run_fasthenry(inp_path, p)
-        result  = _parse_result(zc_path, p)
-        result["pid"]         = pid
-        result["elapsed_sec"] = round(time.time() - wall_t0, 2)
-        return result
+    last_error = "unknown error"
+    for attempt in range(3):
+        if attempt > 0:
+            time.sleep(2.0 * attempt)   # 2 s before attempt 2, 4 s before attempt 3
 
-    except Exception as exc:
-        return {
-            "ok": False, "tag": p.tag, "sample_id": p.sample_id, "error": str(exc),
-            "pid": pid, "elapsed_sec": round(time.time() - wall_t0, 2),
-        }
+        attempt_start = time.time()
+        tmp_dir = tempfile.mkdtemp(prefix="fh_sim_")
+        try:
+            inp_path = os.path.join(tmp_dir, "coil.inp")
+            _write_inp(p, inp_path)
+            zc_path = _run_fasthenry(inp_path, p)
+            result  = _parse_result(zc_path, p)
+            result["pid"]         = pid
+            result["elapsed_sec"] = round(time.time() - overall_start, 2)
+            return result
 
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception as exc:
+            last_error = str(exc)
+            attempt_elapsed = time.time() - attempt_start
+            # Long-running failures (timeout, NaN) won't improve with retries.
+            if attempt_elapsed >= 30.0:
+                break
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return {
+        "ok": False, "tag": p.tag, "sample_id": p.sample_id, "error": last_error,
+        "pid": pid, "elapsed_sec": round(time.time() - overall_start, 2),
+    }
 
 
 # ---------------------------------------------------------------------------
