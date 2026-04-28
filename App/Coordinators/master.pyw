@@ -23,8 +23,9 @@ from parametric_tab import ParametricCoilTab
 from sim_tab import SimTab
 from sim_nn_tab import SimNNTab
 from dxf_coil_tab import DxfCoilTab
-from automation_tab import AutomationTab
+from nn_training import AutomationTab
 from automation_nn_tab import AutomationNNTab
+from nn_analysis_tab import NNAnalysisTab
 
 PROJECT_ROOT = os.path.dirname(_APP_ROOT)
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
@@ -85,21 +86,25 @@ class CoilApp(tk.Tk):
                                                coil_index=2,
                                                temp_dir=TEMP_DIR,
                                                on_next_tab=lambda: self._advance_tab(3))
-        self.auto_tab = AutomationTab(nb, app=self)
-        self.auto_nn_tab = AutomationNNTab(nb, app=self)
-        
-        nb.add(self.dxf_tx_tab,   text="  DXF TX  ")
-        nb.add(self.dxf_rx_tab,   text="  DXF RX  ")
-        nb.add(self.param_tx_tab, text="  Parametric TX  ")
-        nb.add(self.param_rx_tab, text="  Parametric RX  ")
-        nb.add(self.sim_tab,      text="  Simulation  ")
-        nb.add(self.sim_nn_tab,   text="  Simulation NN  ")
-        nb.add(self.auto_tab,     text="  NN Training  ")
-        nb.add(self.auto_nn_tab,  text="  Automation NN  ")
+        self.auto_tab    = AutomationTab(nb, app=self)
+        self.auto_nn_tab = AutomationNNTab(nb, app=self,
+                                           on_next_tab=lambda: self._advance_tab(6))
+        self.nn_analysis_tab = NNAnalysisTab(nb, app=self)
+
+        nb.add(self.dxf_tx_tab,      text="  DXF TX  ")
+        nb.add(self.dxf_rx_tab,      text="  DXF RX  ")
+        nb.add(self.param_tx_tab,    text="  Parametric TX  ")
+        nb.add(self.param_rx_tab,    text="  Parametric RX  ")
+        nb.add(self.sim_tab,         text="  Simulation  ")
+        nb.add(self.sim_nn_tab,      text="  Simulation NN  ")
+        nb.add(self.auto_tab,        text="  NN Training  ")
+        nb.add(self.auto_nn_tab,     text="  Automation NN  ")
+        nb.add(self.nn_analysis_tab, text="  NN Analysis  ")
 
         self._ordered_tabs = [self.dxf_tx_tab, self.dxf_rx_tab,
                               self.param_tx_tab, self.param_rx_tab,
-                              self.sim_tab]
+                              self.sim_tab, self.auto_tab,
+                              self.auto_nn_tab, self.nn_analysis_tab]
 
         nb.select(self.param_tx_tab)
         self._nb = nb

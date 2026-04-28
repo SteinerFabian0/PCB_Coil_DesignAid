@@ -7,7 +7,7 @@ then runs fully-GPU vectorised circuit math across every drive frequency and
 cap combo to find the best TX/RX configuration.
 """
 
-import os, sys, math, threading, traceback
+import os, sys, math, threading, traceback, json, datetime
 import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -29,10 +29,12 @@ _MODEL_FILE   = os.path.join(_NN_DIR, "surrogate_model.pth")
 _X_SCALER     = os.path.join(_NN_DIR, "x_scaler.pkl")
 _Y_SCALER     = os.path.join(_NN_DIR, "y_scaler.pkl")
 
+_EXPORT_BASENAME = "nn_simulation_results"
+
 # Design space boundaries (fallback if LHS file unavailable)
 TX_OD_MM         = 53.0
 TX_TOPOLOGY      = "parallel"
-TX_TURNS_MIN     = 6
+TX_TURNS_MIN     = 5
 TX_TURNS_MAX     = 18
 TX_WIDTH_MIN     = 0.2
 TX_WIDTH_MAX     = 1.2
@@ -168,8 +170,6 @@ def _rx_effective_turns(rx_turns, topology):
 
 def _run_optimizer(params, progress_cb, log_cb, done_cb, cancel_flag):
     try:
-        import json
-
         log_cb("Loading surrogate model…")
         model, x_scaler, y_scaler, feat_cols, torch, device = _load_nn()
         log_cb(f"Running on: {device}  (PyTorch {torch.__version__})")
@@ -695,19 +695,58 @@ def _run_optimizer(params, progress_cb, log_cb, done_cb, cancel_flag):
 
 
 # ---------------------------------------------------------------------------
+# Export helpers
+# ---------------------------------------------------------------------------
+
+def _export_index_for_overwrite():
+    """Always returns 0 — for the 'overwrite' export button."""
+    return 0
+
+
+def _export_index_for_new():
+    """Find the smallest free index in SimulationData/."""
+    os.makedirs(_SIMDATA_DIR, exist_ok=True)
+    idx = 0
+    while True:
+        path = os.path.join(_SIMDATA_DIR, f"{_EXPORT_BASENAME}_{idx}.json")
+        if not os.path.exists(path):
+            return idx
+        idx += 1
+
+
+def _do_export(results, run_params, index):
+    """Write results + metadata to SimulationData/nn_simulation_results_<index>.json.
+    Returns the file path on success."""
+    os.makedirs(_SIMDATA_DIR, exist_ok=True)
+    filename = f"{_EXPORT_BASENAME}_{index}.json"
+    path = os.path.join(_SIMDATA_DIR, filename)
+    payload = {
+        "metadata": {
+            "exported_at":   datetime.datetime.now().isoformat(timespec="seconds"),
+            "run_params":    run_params,
+            "result_count":  len(results),
+        },
+        "results": results,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Tab widget
 # ---------------------------------------------------------------------------
 
 class AutomationNNTab(ttk.Frame):
 
-    def __init__(self, parent, app=None, **kw):
+    def __init__(self, parent, app=None, on_next_tab=None, **kw):
         super().__init__(parent, **kw)
-        self.app = app
+        self.app          = app
+        self._on_next_tab = on_next_tab
         self._cancel_flag = threading.Event()
         self._running     = False
         self._results         = []
         self._last_run_params = {}   # p_target_mw etc. stored at run time
-        self._selected_idx    = -1  # index of row shown in detail panels
         self._build()
 
     # -----------------------------------------------------------------------
@@ -715,27 +754,20 @@ class AutomationNNTab(ttk.Frame):
     # -----------------------------------------------------------------------
 
     def _build(self):
-        paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True)
+        # ── top-level: two equal columns ────────────────────────────────────
+        self.columnconfigure(0, weight=1, uniform="col")
+        self.columnconfigure(1, weight=1, uniform="col")
+        self.rowconfigure(0, weight=1)
 
-        # ---- Left: inputs + controls ------------------------------------
-        left_outer = ttk.Frame(paned, width=310)
-        left_outer.pack_propagate(False)
-        paned.add(left_outer, weight=0)
+        col_l = ttk.Frame(self)
+        col_l.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        col_r = ttk.Frame(self)
+        col_r.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
 
-        canvas = tk.Canvas(left_outer, highlightthickness=0)
-        vsb    = ttk.Scrollbar(left_outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        left = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=left, anchor="nw")
-        left.bind("<Configure>",
-                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
+        # ── LEFT COLUMN: all parameter groups ───────────────────────────────
         # Power requirements
-        pf = ttk.LabelFrame(left, text="Power Requirements")
-        pf.pack(fill="x", padx=8, pady=(8, 4))
+        pf = ttk.LabelFrame(col_l, text="Power Requirements")
+        pf.pack(fill="x", pady=(0, 8))
         self._v_min    = self._row(pf, "TX V_min  (V):",         "3.2")
         self._v_max    = self._row(pf, "TX V_max  (V):",         "4.2")
         self._v_rx_min = self._row(pf, "Min RX V_induced  (V):", "5.0")
@@ -743,16 +775,16 @@ class AutomationNNTab(ttk.Frame):
         self._duty_tgt = self._row(pf, "Target Duty Cycle:",     "0.60")
 
         # Frequency sweep
-        ff = ttk.LabelFrame(left, text="Frequency Sweep")
-        ff.pack(fill="x", padx=8, pady=4)
+        ff = ttk.LabelFrame(col_l, text="Frequency Sweep")
+        ff.pack(fill="x", pady=(0, 8))
         self._freq_min = self._row(ff, "Freq min (kHz):", "120")
         self._freq_max = self._row(ff, "Freq max (kHz):", "130")
         ttk.Label(ff, text="Resolution: 1 kHz steps", foreground="gray",
                   font=("TkDefaultFont", 8)).pack(anchor="w", padx=6, pady=(0, 4))
 
         # Optimizer settings
-        of = ttk.LabelFrame(left, text="Optimizer Settings")
-        of.pack(fill="x", padx=8, pady=4)
+        of = ttk.LabelFrame(col_l, text="Optimizer Settings")
+        of.pack(fill="x", pady=(0, 8))
         self._n_combos = self._row(of, "Combinations (M):", "10")
 
         rx_cap_row = ttk.Frame(of)
@@ -763,124 +795,79 @@ class AutomationNNTab(ttk.Frame):
         ttk.Spinbox(rx_cap_row, textvariable=self._rx_ncaps_var,
                     from_=1, to=2, width=4, state="readonly").pack(side="left", padx=2)
 
-        # Buttons
-        btn_row = ttk.Frame(left)
-        btn_row.pack(fill="x", padx=8, pady=6)
+        # Export
+        exp_lf = ttk.LabelFrame(col_l, text="Export Results")
+        exp_lf.pack(fill="x", pady=(0, 8))
+
+        exp_btns = ttk.Frame(exp_lf)
+        exp_btns.pack(fill="x", padx=6, pady=(6, 4))
+        self._exp_overwrite_btn = ttk.Button(
+            exp_btns, text="Export Overwrite (idx 0)",
+            command=self._on_export_overwrite)
+        self._exp_overwrite_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self._exp_new_btn = ttk.Button(
+            exp_btns, text="Export New",
+            command=self._on_export_new)
+        self._exp_new_btn.pack(side="left", expand=True, fill="x")
+
+        self._export_label_var = tk.StringVar(value="")
+        self._export_label = ttk.Label(
+            exp_lf, textvariable=self._export_label_var,
+            foreground="#228B22", font=("TkDefaultFont", 8))
+        self._export_label.pack(anchor="w", padx=6, pady=(0, 6))
+
+        # Next Tab
+        ttk.Button(col_l, text="Next Tab →  (NN Analysis)",
+                   command=self._on_next_tab_click).pack(fill="x", pady=(0, 0))
+
+        # ── RIGHT COLUMN: run controls + progress + log ──────────────────────
+        col_r.rowconfigure(2, weight=1)   # log expands
+
+        # Run / Cancel
+        run_lf = ttk.LabelFrame(col_r, text="Optimizer Control")
+        run_lf.pack(fill="x", pady=(0, 8))
+
+        btn_row = ttk.Frame(run_lf)
+        btn_row.pack(fill="x", padx=6, pady=6)
         self._run_btn = ttk.Button(btn_row, text="Run Optimizer",
-                                   command=self._on_run, width=15)
-        self._run_btn.pack(side="left")
+                                   command=self._on_run)
+        self._run_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
         self._cancel_btn = ttk.Button(btn_row, text="Cancel",
                                       command=self._on_cancel,
-                                      state="disabled", width=8)
-        self._cancel_btn.pack(side="left", padx=4)
+                                      state="disabled")
+        self._cancel_btn.pack(side="left", expand=True, fill="x")
 
         # Progress
-        prog_frm = ttk.Frame(left)
-        prog_frm.pack(fill="x", padx=8, pady=(0, 4))
-        self._progress   = ttk.Progressbar(prog_frm, mode="determinate", maximum=100)
-        self._progress.pack(fill="x")
+        prog_lf = ttk.LabelFrame(col_r, text="Progress")
+        prog_lf.pack(fill="x", pady=(0, 8))
+        self._progress = ttk.Progressbar(prog_lf, mode="determinate", maximum=100)
+        self._progress.pack(fill="x", padx=6, pady=(6, 4))
         self._status_var = tk.StringVar(value="Ready.")
-        ttk.Label(prog_frm, textvariable=self._status_var,
-                  foreground="gray", wraplength=280, justify="left").pack(
-                  fill="x", pady=(2, 0))
+        ttk.Label(prog_lf, textvariable=self._status_var,
+                  foreground="gray", wraplength=600, justify="left").pack(
+                  fill="x", padx=6, pady=(0, 6))
 
-        # Log
-        lf = ttk.LabelFrame(left, text="Log")
-        lf.pack(fill="x", padx=8, pady=4)
-        self._log_text = tk.Text(lf, height=8, state="disabled",
-                                  font=("Consolas", 8), wrap="word",
+        # Log — fills all remaining vertical space
+        log_lf = ttk.LabelFrame(col_r, text="Log")
+        log_lf.pack(fill="both", expand=True)
+        log_lf.rowconfigure(0, weight=1)
+        log_lf.columnconfigure(0, weight=1)
+        self._log_text = tk.Text(log_lf, state="disabled",
+                                  font=("Consolas", 9), wrap="word",
                                   background="#f8f8f8")
-        log_sb = ttk.Scrollbar(lf, orient="vertical",
+        log_sb = ttk.Scrollbar(log_lf, orient="vertical",
                                 command=self._log_text.yview)
         self._log_text.configure(yscrollcommand=log_sb.set)
-        log_sb.pack(side="right", fill="y")
-        self._log_text.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # ---- Right: results table + detail ------------------------------
-        right = ttk.Frame(paned)
-        paned.add(right, weight=1)
-
-        res_lf = ttk.LabelFrame(right, text="Top 10 Configurations")
-        res_lf.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        self._build_tree(res_lf)
-
-        det_lf = ttk.LabelFrame(right, text="Detail (click a row)")
-        det_lf.pack(fill="x", padx=8, pady=(0, 4))
-        self._build_detail_panels(det_lf)
-
-        send_row = ttk.Frame(right)
-        send_row.pack(fill="x", padx=8, pady=(0, 8))
-        self._send_btn = ttk.Button(send_row, text="Send Selected to Simulation",
-                                    command=self._on_send_to_sim, state="disabled",
-                                    width=30)
-        self._send_btn.pack(side="left")
+        log_sb.grid(row=0, column=1, sticky="ns", pady=4)
+        self._log_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
 
     def _row(self, parent, label, default):
         row = ttk.Frame(parent)
-        row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(row, text=label, width=26, anchor="w").pack(side="left")
+        row.pack(fill="x", padx=6, pady=3)
+        ttk.Label(row, text=label, width=28, anchor="w").pack(side="left")
         var = tk.StringVar(value=default)
-        ttk.Entry(row, textvariable=var, width=12).pack(side="left", padx=2)
+        ttk.Entry(row, textvariable=var, width=14).pack(side="left", padx=4)
         return var
-
-    def _build_tree(self, parent):
-        cols = (
-            "#", "Fitness", "Eff%", "f kHz",
-            "TX T/Ly", "TX width", "RX OD", "RX T/Ly", "RX width", "RX Topo",
-            "TX L µH", "RX L µH", "M L µH", "TX R Ω", "RX R Ω",
-            "TX DCR mΩ", "RX DCR mΩ", "TX Q", "RX Q",
-            "TX cap", "RX cap",
-            "DutyVmin", "DutyVmax", "V_ind",
-        )
-        widths = {
-            "#": 26, 
-            "Fitness": 50, 
-            "Eff%": 34, 
-            "f kHz": 42,
-            "TX T/Ly": 55, 
-            "TX width": 58,
-            "RX OD": 50, 
-            "RX T/Ly": 55, 
-            "RX width": 58, 
-            "RX Topo": 76,
-            "TX L µH": 58, 
-            "RX L µH": 58, 
-            "M L µH": 52,
-            "TX R Ω": 52, 
-            "RX R Ω": 52,
-            "TX DCR mΩ": 75, 
-            "RX DCR mΩ": 75, 
-            "TX Q": 40, 
-            "RX Q": 40,
-            "TX cap": 85, 
-            "RX cap": 50,
-            "DutyVmin": 70, 
-            "DutyVmax": 70,
-            "V_ind": 40, 
-        }
-
-        tree_f = ttk.Frame(parent)
-        tree_f.pack(fill="both", expand=True, padx=4, pady=4)
-
-        xsb = ttk.Scrollbar(tree_f, orient="horizontal")
-        ysb = ttk.Scrollbar(tree_f, orient="vertical")
-        self._tree = ttk.Treeview(tree_f, columns=cols, show="headings",
-                                   yscrollcommand=ysb.set,
-                                   xscrollcommand=xsb.set, height=12)
-        xsb.configure(command=self._tree.xview)
-        ysb.configure(command=self._tree.yview)
-        xsb.pack(side="bottom", fill="x")
-        ysb.pack(side="right", fill="y")
-        self._tree.pack(side="left", fill="both", expand=True)
-
-        for c in cols:
-            self._tree.heading(c, text=c)
-            self._tree.column(c, width=widths.get(c, 80), minwidth=36, stretch=False)
-
-        self._tree.tag_configure("rank1", background="#d4edda")
-        self._tree.tag_configure("rank2", background="#e8f4fd")
-        self._tree.tag_configure("rank3", background="#fff3cd")
-        self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     # -----------------------------------------------------------------------
     # Controls
@@ -926,10 +913,9 @@ class AutomationNNTab(ttk.Frame):
         self._run_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
         self._progress["value"] = 0
-        self._clear_tree()
-        self._clear_detail()
         self._log_clear()
         self._set_status("Running…")
+        self._export_label_var.set("")
 
         thread = threading.Thread(
             target=_run_optimizer,
@@ -944,6 +930,10 @@ class AutomationNNTab(ttk.Frame):
     def _on_cancel(self):
         self._cancel_flag.set()
         self._set_status("Cancelling…", color="orange")
+
+    def _on_next_tab_click(self):
+        if self._on_next_tab:
+            self._on_next_tab()
 
     def _progress_cb(self, frac):
         self.after(0, lambda: self._progress.configure(value=frac * 100))
@@ -968,299 +958,37 @@ class AutomationNNTab(ttk.Frame):
             return
 
         self._results = results
-        self._populate_tree(results)
-        self._set_status(f"Top {len(results)} configurations loaded.", color="green")
+        self._set_status(f"Top {len(results)} configurations ready. Use NN Analysis tab to view.",
+                         color="green")
 
     # -----------------------------------------------------------------------
-    # Tree population
+    # Export
     # -----------------------------------------------------------------------
 
-    def _clear_tree(self):
-        for iid in self._tree.get_children():
-            self._tree.delete(iid)
+    def _on_export_overwrite(self):
+        self._export(index=_export_index_for_overwrite())
 
-    def _populate_tree(self, rows):
-        self._clear_tree()
-        tag_map = {0: "rank1", 1: "rank2", 2: "rank3"}
-        for i, r in enumerate(rows):
-            tag  = tag_map.get(i, "")
-            vals = (
-                i + 1,
-                f"{r['fitness']:.4f}",
-                f"{r['eff_mid']*100:.1f}",
-                f"{r['freq_hz']/1e3:.2f}",
-                r["tx_turns"],
-                f"{r['tx_width']:.2f}",
-                f"{r['rx_od_mm']:.1f}",
-                r["rx_turns"],
-                f"{r['rx_width']:.2f}",
-                r["rx_topology"],
-                f"{r['L_tx_uH']:.3f}",
-                f"{r['L_rx_uH']:.3f}",
-                f"{r['M_uH']:.4f}",
-                f"{r['R_tx_ohm']:.3f}",
-                f"{r['R_rx_ohm']:.3f}",
-                f"{r['DCR_tx_ohm']*1e3:.1f}",
-                f"{r['DCR_rx_ohm']*1e3:.1f}",
-                f"{r['Q_tx']:.1f}",
-                f"{r['Q_rx']:.1f}",
-                r["C_tx_label"],
-                r["C_rx_label"],
-                f"{r['Duty_vmin']:.3f}",
-                f"{r['Duty_vmax']:.3f}",
-                f"{r['V_ind_min_V']:.2f}",
-            )
-            self._tree.insert("", "end", values=vals, tags=(tag,) if tag else ())
+    def _on_export_new(self):
+        self._export(index=_export_index_for_new())
 
-    # -----------------------------------------------------------------------
-    # Detail panel — 3-column (NN prediction | Sim result | Delta)
-    # -----------------------------------------------------------------------
-
-    def _build_detail_panels(self, parent):
-        """Build three equal-width text columns with a shared vertical scrollbar."""
-        FONT = ("Consolas", 9)
-        BG   = "#f8f8f8"
-        H    = 20  # line height
-
-        outer = ttk.Frame(parent)
-        outer.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Shared vertical scrollbar on the far right
-        vsb = ttk.Scrollbar(outer, orient="vertical")
-        vsb.pack(side="right", fill="y")
-
-        def _scroll_all(*args):
-            for t in (self._det_nn, self._det_sim, self._det_delta):
-                t.yview(*args)
-
-        vsb.configure(command=_scroll_all)
-
-        cols_frame = ttk.Frame(outer)
-        cols_frame.pack(fill="both", expand=True)
-        cols_frame.columnconfigure(0, weight=1, uniform="dc")
-        cols_frame.columnconfigure(2, weight=1, uniform="dc")
-        cols_frame.columnconfigure(4, weight=1, uniform="dc")
-
-        def _make_col(col_idx, title):
-            hdr = ttk.Frame(cols_frame)
-            hdr.grid(row=0, column=col_idx, sticky="ew")
-            ttk.Label(hdr, text=title, font=("TkDefaultFont", 9, "bold"),
-                      anchor="center", background="#e8eef8"
-                      ).pack(fill="x", padx=1, pady=(2, 0))
-            t = tk.Text(cols_frame, height=H, state="disabled",
-                        font=FONT, wrap="none", background=BG,
-                        borderwidth=0, highlightthickness=0)
-            t.grid(row=1, column=col_idx, sticky="nsew")
-            t.configure(yscrollcommand=vsb.set)
-
-            def _on_wheel(event):
-                delta = -1 * (event.delta // 120) if event.delta else (1 if event.num == 5 else -1)
-                _scroll_all("scroll", delta, "units")
-                return "break"
-
-            t.bind("<MouseWheel>", _on_wheel)
-            t.bind("<Button-4>", _on_wheel)
-            t.bind("<Button-5>", _on_wheel)
-            return t
-
-        self._det_nn    = _make_col(0, "NN Prediction")
-        tk.Frame(cols_frame, bg="#b0b0b0", width=1).grid(row=0, column=1, rowspan=2, sticky="ns")
-        self._det_sim   = _make_col(2, "Simulation Result")
-        tk.Frame(cols_frame, bg="#b0b0b0", width=1).grid(row=0, column=3, rowspan=2, sticky="ns")
-        self._det_delta = _make_col(4, "Delta  (Sim − NN)")
-
-    def _write_col(self, widget, lines):
-        widget.configure(state="normal")
-        widget.delete("1.0", "end")
-        widget.insert("end", "\n".join(lines))
-        widget.configure(state="disabled")
-
-    def _clear_detail(self):
-        for w in (self._det_nn, self._det_sim, self._det_delta):
-            w.configure(state="normal")
-            w.delete("1.0", "end")
-            w.configure(state="disabled")
-
-    def _on_tree_select(self, _=None):
-        sel = self._tree.selection()
-        if not sel:
-            self._send_btn.configure(state="disabled")
-            self._selected_idx = -1
+    def _export(self, index):
+        if not self._results:
+            messagebox.showwarning("Export", "No results to export — run the optimizer first.")
             return
-        iid   = sel[0]
-        items = self._tree.get_children()
-        idx   = list(items).index(iid)
-        if idx >= len(self._results):
-            self._send_btn.configure(state="disabled")
-            self._selected_idx = -1
-            return
-        self._send_btn.configure(state="normal")
-        self._selected_idx = idx
-        sim_res = getattr(self.app, "sim_tab", None)
-        sim_res = sim_res.last_result if sim_res else None
-        L, M, R = self._make_detail_columns(idx + 1, self._results[idx], sim_res)
-        self._write_col(self._det_nn,    L)
-        self._write_col(self._det_sim,   M)
-        self._write_col(self._det_delta, R)
-
-    def _populate_sim_panels(self, r_nn, sim_result):
-        """Called via callback after FastHenry completes; refreshes mid + right cols."""
-        if self._selected_idx < 0 or self._selected_idx >= len(self._results):
-            return
-        if self._results[self._selected_idx] is not r_nn:
-            return
-        L, M, R = self._make_detail_columns(self._selected_idx + 1, r_nn, sim_result)
-        self._write_col(self._det_nn,    L)
-        self._write_col(self._det_sim,   M)
-        self._write_col(self._det_delta, R)
+        try:
+            path = _do_export(self._results, self._last_run_params, index)
+            fname = os.path.basename(path)
+            self._export_label_var.set(f"Saved: {fname}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to save:\n{e}")
+            self._export_label_var.set("")
 
     # -----------------------------------------------------------------------
-    # Column content builder
+    # Send selected result to Simulation tab  (kept here for compatibility)
     # -----------------------------------------------------------------------
 
-    def _make_detail_columns(self, rank, r, sim_res=None):
-        """Build (left_lines, mid_lines, right_lines) with identical length."""
-        topo      = r["rx_topology"]
-        eff_turns = r["rx_eff_turns"]
-        tx_l_mm   = (_spiral_length_m(r["tx_od_mm"], r["tx_width"], r["tx_turns"])
-                     * 1e3 * _TX_N_LAYERS)
-        rx_l_mm   = (_spiral_length_m(r["rx_od_mm"], r["rx_width"], r["rx_turns"])
-                     * 1e3 * 4)
-
-        # Extract sim values if available
-        have_sim = (sim_res is not None and
-                    sim_res.get("n_ports", 0) == 2)
-        if have_sim:
-            Zmat  = sim_res["Zmat"]
-            f_sim = sim_res["frequency"]
-            w_s   = 2.0 * math.pi * f_sim
-            sL_tx = Zmat[0][0].imag / w_s * 1e6   # µH
-            sL_rx = Zmat[1][1].imag / w_s * 1e6   # µH
-            sM    = Zmat[0][1].imag / w_s * 1e6   # µH
-            sR_tx = Zmat[0][0].real * 1e3          # mΩ
-            sR_rx = Zmat[1][1].real * 1e3          # mΩ
-            sk    = sM / math.sqrt(sL_tx * sL_rx) if sL_tx > 0 and sL_rx > 0 else 0.0
-            sQ_tx = w_s * sL_tx * 1e-6 / Zmat[0][0].real if Zmat[0][0].real > 0 else 0.0
-            sQ_rx = w_s * sL_rx * 1e-6 / Zmat[1][1].real if Zmat[1][1].real > 0 else 0.0
-        else:
-            f_sim = sL_tx = sL_rx = sM = sR_tx = sR_rx = sk = sQ_tx = sQ_rx = None
-
-        nn_k = r["M_uH"] / math.sqrt(r["L_tx_uH"] * r["L_rx_uH"])
-
-        SEP = "─" * 44
-
-        def _pct(nn, s):
-            return f" ({(s - nn) / nn * 100:+.1f}%)" if nn != 0 else ""
-
-        def _d(nn_val, s_val, label, fmt, unit):
-            if not have_sim:
-                return ""
-            d = s_val - nn_val
-            return f"    {label:<14}{fmt.format(d)}{unit}{_pct(nn_val, s_val)}"
-
-        # Precompute sim cell strings (empty when no sim)
-        s_freq = f"    {'Frequency':<16}{f_sim/1e3:.3f} kHz"      if have_sim else "    Frequency        —"
-        s_ltx  = f"    {'L_TX':<16}{sL_tx:.4f} µH"                if have_sim else "  —"
-        s_lrx  = f"    {'L_RX':<16}{sL_rx:.4f} µH"                if have_sim else "  —"
-        s_m    = f"    {'M':<16}{sM:.5f} µH"                       if have_sim else "  —"
-        s_k    = f"    {'k':<16}{sk:.4f}"                          if have_sim else "  —"
-        s_rtx  = f"    {'R_TX':<16}{sR_tx:.2f} mΩ"                 if have_sim else "  —"
-        s_rrx  = f"    {'R_RX':<16}{sR_rx:.2f} mΩ"                 if have_sim else "  —"
-        s_qtx  = f"    {'Q_TX':<16}{sQ_tx:.1f}"                    if have_sim else "  —"
-        s_qrx  = f"    {'Q_RX':<16}{sQ_rx:.1f}"                    if have_sim else "  —"
-
-        em_hdr_m = "  EM PARAMETERS  (Simulated)"    if have_sim else "  EM PARAMETERS  (run sim…)"
-        em_hdr_r = "  DELTA  (Sim − NN)"             if have_sim else "  DELTA  (run sim…)"
-
-        rows = [
-            # ── header ────────────────────────────────────────────────────────
-            (SEP,                                          SEP,                   SEP),
-            (f"  Rank #{rank}  —  Fitness {r['fitness']:.6f}",
-             "  FastHenry Sim Results",
-             "  Delta  (Sim − NN)"),
-            (SEP,                                          SEP,                   SEP),
-            ("", "", ""),
-            # ── geometry (left only) ──────────────────────────────────────────
-            ("  GEOMETRY  (T/Ly = turns/layer)",           "",                    ""),
-            (f"    TX: OD={r['tx_od_mm']:.1f}  T={r['tx_turns']}  W={r['tx_width']:.3f} mm",
-             "", ""),
-            (f"        ID={r['tx_id_mm']:.1f} mm  wire={tx_l_mm:.0f} mm  (3 layers ||)",
-             "", ""),
-            (f"    RX: OD={r['rx_od_mm']:.1f}  T={r['rx_turns']}  W={r['rx_width']:.3f} mm  topo={topo}",
-             "", ""),
-            (f"        ID={r['rx_id_mm']:.1f} mm  wire={rx_l_mm:.0f} mm"
-             + (f"  eff.turns={eff_turns}" if topo != "parallel" else ""),
-             "", ""),
-            ("", "", ""),
-            # ── drive ─────────────────────────────────────────────────────────
-            ("  DRIVE",                                    "",                    ""),
-            (f"    {'Frequency':<16}{r['freq_hz']/1e3:.3f} kHz",   s_freq,       ""),
-            (f"    {'C_TX':<16}{r['C_tx_nf']:.4f} nF  ({r['C_tx_label']})", "", ""),
-            (f"    {'C_RX':<16}{r['C_rx_nf']:.4f} nF  ({r['C_rx_label']})", "", ""),
-            ("", "", ""),
-            # ── EM parameters ─────────────────────────────────────────────────
-            ("  EM PARAMETERS  (NN predicted)",            em_hdr_m,             em_hdr_r),
-            (f"    {'L_TX':<16}{r['L_tx_uH']:.4f} µH",
-             s_ltx,
-             _d(r["L_tx_uH"], sL_tx, "ΔL_TX", "{:+.4f}", " µH")),
-            (f"    {'L_RX':<16}{r['L_rx_uH']:.4f} µH",
-             s_lrx,
-             _d(r["L_rx_uH"], sL_rx, "ΔL_RX", "{:+.4f}", " µH")),
-            (f"    {'M':<16}{r['M_uH']:.5f} µH",
-             s_m,
-             _d(r["M_uH"],    sM,    "ΔM",    "{:+.5f}", " µH")),
-            (f"    {'k':<16}{nn_k:.4f}",
-             s_k,
-             _d(nn_k,         sk,    "Δk",    "{:+.4f}", "")),
-            (f"    {'R_TX':<16}{r['R_tx_ohm']*1e3:.2f} mΩ"
-             f"  (DCR={r['DCR_tx_ohm']*1e3:.2f}  skin={max(0,r['R_tx_ohm']-r['DCR_tx_ohm'])*1e3:.2f})",
-             s_rtx,
-             _d(r["R_tx_ohm"]*1e3, sR_tx, "ΔR_TX", "{:+.2f}", " mΩ")),
-            (f"    {'R_RX':<16}{r['R_rx_ohm']*1e3:.2f} mΩ"
-             f"  (DCR={r['DCR_rx_ohm']*1e3:.2f}  skin={max(0,r['R_rx_ohm']-r['DCR_rx_ohm'])*1e3:.2f})",
-             s_rrx,
-             _d(r["R_rx_ohm"]*1e3, sR_rx, "ΔR_RX", "{:+.2f}", " mΩ")),
-            (f"    {'Q_TX':<16}{r['Q_tx']:.1f}",          s_qtx,                ""),
-            (f"    {'Q_RX':<16}{r['Q_rx']:.1f}",          s_qrx,                ""),
-            ("", "", ""),
-            # ── circuit (left only) ───────────────────────────────────────────
-            ("  CIRCUIT",                                  "",                    ""),
-            (f"    Z_in = {r['Zin_re']*1e3:.2f}+j{r['Zin_im']*1e3:.2f} mΩ"
-             f"  ({'inductive ✓' if r['Zin_im'] > 0 else 'CAPACITIVE ✗'})",
-             "", ""),
-            (f"    V_induced_min = {r['V_ind_min_V']:.3f} V", "", ""),
-            ("", "", ""),
-            # ── performance (left only) ───────────────────────────────────────
-            ("  PERFORMANCE",                              "",                    ""),
-            (f"    Duty @ V_min   {r['Duty_vmin']:.4f}  ({r['Duty_vmin']*100:.1f}%)", "", ""),
-            (f"    Duty @ V_max   {r['Duty_vmax']:.4f}  ({r['Duty_vmax']*100:.1f}%)", "", ""),
-            (f"    Efficiency     {r['eff_mid']*100:.2f}%  (at mid supply)", "", ""),
-        ]
-
-        L = [row[0] for row in rows]
-        M = [row[1] for row in rows]
-        R = [row[2] for row in rows]
-        # Pad all to same length (they're already equal via zip, but be safe)
-        n = max(len(L), len(M), len(R))
-        L += [""] * (n - len(L))
-        M += [""] * (n - len(M))
-        R += [""] * (n - len(R))
-        return L, M, R
-
-    # -----------------------------------------------------------------------
-    # Send selected result to Simulation tab
-    # -----------------------------------------------------------------------
-
-    def _on_send_to_sim(self):
-        sel = self._tree.selection()
-        if not sel:
-            return
-        items = self._tree.get_children()
-        idx   = list(items).index(sel[0])
-        if idx >= len(self._results):
-            return
-        r = self._results[idx]
-
+    def _on_send_to_sim(self, r):
+        """Send a result dict (from analysis tab) to the simulation tab."""
         if self.app is None:
             messagebox.showerror("Send to Sim", "No app reference available.")
             return
@@ -1272,10 +1000,10 @@ class AutomationNNTab(ttk.Frame):
         try:
             self._build_and_register(r, temp_dir)
         except Exception as e:
-            messagebox.showerror("Send to Sim", f"Failed to build coils:\n{e}\n\n{traceback.format_exc()}")
+            messagebox.showerror("Send to Sim",
+                                 f"Failed to build coils:\n{e}\n\n{traceback.format_exc()}")
             return
 
-        # Push all relevant values into the sim tab
         sim = self.app.sim_tab
         freq_hz = r["freq_hz"]
         sim.freq_var.set(str(int(freq_hz)))
@@ -1286,18 +1014,19 @@ class AutomationNNTab(ttk.Frame):
         if p_mw:
             sim.p_avg_var.set(f"{p_mw:g}")
 
-        # Register one-shot callback to populate sim panels when done
         _r_ref = r
         def _sim_done_cb(result, _r=_r_ref):
             try:
                 sim._done_callbacks.remove(_sim_done_cb)
             except ValueError:
                 pass
-            self.after(0, lambda: self._populate_sim_panels(_r, result))
+            # Notify analysis tab if present
+            analysis = getattr(self.app, "nn_analysis_tab", None)
+            if analysis:
+                self.after(0, lambda: analysis.on_sim_done(_r, result))
 
         sim._done_callbacks.append(_sim_done_cb)
 
-        # Switch to Simulation tab and start
         try:
             self.app._nb.select(sim)
         except Exception:
@@ -1308,7 +1037,6 @@ class AutomationNNTab(ttk.Frame):
         """Generate TX and RX .inp files from result params and register with sim_tab."""
         os.makedirs(temp_dir, exist_ok=True)
 
-        # --- TX: 53 mm OD, 3 parallel 1-oz layers, topology = parallel ---
         tx_sp = pc.SpiralParams(
             od_mm=r["tx_od_mm"],
             trace_width_mm=r["tx_width"],
@@ -1345,7 +1073,6 @@ class AutomationNNTab(ttk.Frame):
             "nodes_by_layer": [list(ld["nodes"]) for ld in tx_layers],
         }
 
-        # --- RX: variable OD, 4 layers [1, 0.5, 0.5, 1] oz, variable topo ---
         rx_topo = r["rx_topology"]
         rx_sp = pc.SpiralParams(
             od_mm=r["rx_od_mm"],
@@ -1373,9 +1100,7 @@ class AutomationNNTab(ttk.Frame):
         pc.write_topology_inp(rx_topo, rx_layers, rx_path,
                               w_mm=r["rx_width"], fmin=fmin, fmax=fmax)
 
-        # Use writer-native node ordering so via_connections_for_topology
-        # indices (which expect post-reversal nodes) are correct in the viewer.
-        rx_flags = pc.series_reverse_flags_for_topology(rx_topo, len(rx_layers))
+        rx_flags  = pc.series_reverse_flags_for_topology(rx_topo, len(rx_layers))
         rx_native = pc.reverse_nodes_for_series_flow(rx_layers, rx_flags)
 
         rx_meta = {

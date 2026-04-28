@@ -112,6 +112,19 @@ def _load_existing(path: str) -> dict:
     return out
 
 
+def _load_global_ids(global_path: str) -> set:
+    """Return the set of sample_ids already present in global_results.json."""
+    if not os.path.exists(global_path):
+        return set()
+    try:
+        with open(global_path) as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+    return {r["sample_id"] for r in data.get("results", [])
+            if isinstance(r.get("sample_id"), int) and r["sample_id"] >= 0}
+
+
 def _flush(out_path: str, meta: dict, results: dict) -> None:
     payload = {"meta": meta, "results": list(results.values())}
     tmp = out_path + ".tmp"
@@ -159,14 +172,19 @@ def main() -> int:
     to_idx   = min(to_idx, len(params_list))
     target   = params_list[from_idx:to_idx]
 
-    existing = _load_existing(args.out)
-    todo     = [p for p in target if p.sample_id not in existing]
+    existing    = _load_existing(args.out)
+    global_ids  = _load_global_ids(os.path.join(_SIMDATA_DIR, "global_results.json"))
+    skip_ids    = set(existing) | global_ids
+    todo        = [p for p in target if p.sample_id not in skip_ids]
+
+    n_in_solver = sum(1 for p in target if p.sample_id in existing)
+    n_in_global = sum(1 for p in target if p.sample_id in global_ids and p.sample_id not in existing)
 
     print("=" * 65, flush=True)
     print(f"Sweep range [{from_idx}:{to_idx}]  ({len(target)} samples)", flush=True)
     print(f"Workers     : {args.workers}", flush=True)
     print(f"Timeout     : {args.timeout}s", flush=True)
-    print(f"Already done: {len(target) - len(todo)}", flush=True)
+    print(f"Skip (solver): {n_in_solver}  Skip (global): {n_in_global}", flush=True)
     print(f"To simulate : {len(todo)}", flush=True)
     print(f"Output file : {args.out}", flush=True)
     print("=" * 65, flush=True)

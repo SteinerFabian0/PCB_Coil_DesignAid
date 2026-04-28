@@ -48,6 +48,69 @@ _LAYER_LABELS = ["L1 (outer)", "L2 (inner)", "L3 (inner)", "L4 (outer)"]
 # Fixed pixel width for TX and RX panels
 _SIDE_WIDTH = 260
 
+# ---------------------------------------------------------------------------
+# Default values for all input fields  — edit here to change startup defaults
+# ---------------------------------------------------------------------------
+
+# TX coil
+TX_LAYERS_DEFAULT        = [True, True, True, False]   # L1, L2, L3, L4 active
+TX_OUTER_OZ_LO           = "1.0"
+TX_OUTER_OZ_HI           = "1.0"
+TX_INNER_OZ_LO           = "0.5"
+TX_INNER_OZ_HI           = "1.0"
+TX_OUTER_GAP_LO          = "0.2"
+TX_OUTER_GAP_HI          = "0.2"
+TX_INNER_GAP_LO          = "1.3"
+TX_INNER_GAP_HI          = "1.3"
+TX_ID_MIN                = "35.0"
+TX_OD_MAX                = "56.0"
+TX_SPACING_LO            = "0.16"
+TX_SPACING_HI            = "0.16"
+TX_PORT_INSIDE_DEFAULT   = False
+TX_PORT_OUTSIDE_DEFAULT  = True
+
+# RX coil
+RX_LAYERS_DEFAULT        = [True, True, True, True]
+RX_OUTER_OZ_LO           = "1.0"
+RX_OUTER_OZ_HI           = "1.0"
+RX_INNER_OZ_LO           = "0.5"
+RX_INNER_OZ_HI           = "1.0"
+RX_OUTER_GAP_LO          = "0.2"
+RX_OUTER_GAP_HI          = "0.2"
+RX_INNER_GAP_LO          = "0.6"
+RX_INNER_GAP_HI          = "0.6"
+RX_ID_MIN                = "35.0"
+RX_OD_MAX                = "55.0"
+RX_SPACING_LO            = "0.16"
+RX_SPACING_HI            = "0.16"
+RX_PORT_INSIDE_DEFAULT   = True
+RX_PORT_OUTSIDE_DEFAULT  = False
+
+# Shared / global
+RESOLUTION_MM            = "1.5"
+NHINC                    = "1"
+NWINC                    = "3"
+PCB_GAP_LO               = "2.4"
+PCB_GAP_HI               = "2.8"
+FREQ_MIN_HZ              = "110000"
+FREQ_MAX_HZ              = "140000"
+
+# Sample generation
+TOTAL_SAMPLES            = "64000"
+
+# FastHenry sweep
+SWEEP_WORKERS            = "15"
+SWEEP_TIMEOUT_S          = "360"
+SWEEP_CKPT_EVERY         = "50"
+SWEEP_FROM_IDX           = "0"
+SWEEP_TO_IDX             = ""
+
+# NN training  (tuned for large dataset ~30k–60k rows)
+NN_EPOCHS                = "300"
+NN_BATCH                 = "512"
+NN_LR                    = "0.0005"
+NN_VAL_SPLIT             = "0.15"
+
 
 # ---------------------------------------------------------------------------
 # Helper widgets
@@ -154,9 +217,25 @@ class AutomationTab(ttk.Frame):
         lyr_frm = ttk.LabelFrame(parent, text="Active Layers")
         lyr_frm.pack(fill="x", padx=4, pady=(4, 2))
 
+        _layers_def  = TX_LAYERS_DEFAULT        if side == "tx" else RX_LAYERS_DEFAULT
+        _oo_lo       = TX_OUTER_OZ_LO           if side == "tx" else RX_OUTER_OZ_LO
+        _oo_hi       = TX_OUTER_OZ_HI           if side == "tx" else RX_OUTER_OZ_HI
+        _io_lo       = TX_INNER_OZ_LO           if side == "tx" else RX_INNER_OZ_LO
+        _io_hi       = TX_INNER_OZ_HI           if side == "tx" else RX_INNER_OZ_HI
+        _og_lo       = TX_OUTER_GAP_LO          if side == "tx" else RX_OUTER_GAP_LO
+        _og_hi       = TX_OUTER_GAP_HI          if side == "tx" else RX_OUTER_GAP_HI
+        _ig_lo       = TX_INNER_GAP_LO          if side == "tx" else RX_INNER_GAP_LO
+        _ig_hi       = TX_INNER_GAP_HI          if side == "tx" else RX_INNER_GAP_HI
+        _id_min      = TX_ID_MIN                if side == "tx" else RX_ID_MIN
+        _od_max      = TX_OD_MAX                if side == "tx" else RX_OD_MAX
+        _sp_lo       = TX_SPACING_LO            if side == "tx" else RX_SPACING_LO
+        _sp_hi       = TX_SPACING_HI            if side == "tx" else RX_SPACING_HI
+        _p_in_def    = TX_PORT_INSIDE_DEFAULT   if side == "tx" else RX_PORT_INSIDE_DEFAULT
+        _p_out_def   = TX_PORT_OUTSIDE_DEFAULT  if side == "tx" else RX_PORT_OUTSIDE_DEFAULT
+
         v["layers"] = []
-        for lbl in _LAYER_LABELS:
-            bv = tk.BooleanVar(value=True)
+        for i, lbl in enumerate(_LAYER_LABELS):
+            bv = tk.BooleanVar(value=_layers_def[i])
             ttk.Checkbutton(lyr_frm, text=lbl, variable=bv).pack(anchor="w", padx=6)
             v["layers"].append(bv)
 
@@ -164,10 +243,10 @@ class AutomationTab(ttk.Frame):
         cu_frm = ttk.LabelFrame(parent, text="Copper Weight (oz)")
         cu_frm.pack(fill="x", padx=4, pady=2)
 
-        v["outer_oz_lo"] = tk.StringVar(value="1.0")
-        v["outer_oz_hi"] = tk.StringVar(value="1.0")
-        v["inner_oz_lo"] = tk.StringVar(value="0.5")
-        v["inner_oz_hi"] = tk.StringVar(value="1.0")
+        v["outer_oz_lo"] = tk.StringVar(value=_oo_lo)
+        v["outer_oz_hi"] = tk.StringVar(value=_oo_hi)
+        v["inner_oz_lo"] = tk.StringVar(value=_io_lo)
+        v["inner_oz_hi"] = tk.StringVar(value=_io_hi)
         _range_row(cu_frm, "Outer layers:", v["outer_oz_lo"], v["outer_oz_hi"])
         _range_row(cu_frm, "Inner layers:", v["inner_oz_lo"], v["inner_oz_hi"])
 
@@ -175,10 +254,10 @@ class AutomationTab(ttk.Frame):
         stk_frm = ttk.LabelFrame(parent, text="Stackup Spacing (mm)")
         stk_frm.pack(fill="x", padx=4, pady=2)
 
-        v["outer_gap_lo"] = tk.StringVar(value="0.2")
-        v["outer_gap_hi"] = tk.StringVar(value="0.2")
-        v["inner_gap_lo"] = tk.StringVar(value="0.6" if side == "rx" else "1.3")
-        v["inner_gap_hi"] = tk.StringVar(value="0.6" if side == "rx" else "1.3")
+        v["outer_gap_lo"] = tk.StringVar(value=_og_lo)
+        v["outer_gap_hi"] = tk.StringVar(value=_og_hi)
+        v["inner_gap_lo"] = tk.StringVar(value=_ig_lo)
+        v["inner_gap_hi"] = tk.StringVar(value=_ig_hi)
         _range_row(stk_frm, "Outer gap:", v["outer_gap_lo"], v["outer_gap_hi"])
         _range_row(stk_frm, "Inner gap:", v["inner_gap_lo"], v["inner_gap_hi"])
 
@@ -186,20 +265,20 @@ class AutomationTab(ttk.Frame):
         geo_frm = ttk.LabelFrame(parent, text="Geometry")
         geo_frm.pack(fill="x", padx=4, pady=2)
 
-        v["id_min"] = tk.StringVar(value="35.0")
-        v["od_max"] = tk.StringVar(value="53.0")
+        v["id_min"] = tk.StringVar(value=_id_min)
+        v["od_max"] = tk.StringVar(value=_od_max)
         _range_row(geo_frm, "Diameter (mm):", v["id_min"], v["od_max"], label_width=14)
 
-        v["spacing_lo"] = tk.StringVar(value="0.16")
-        v["spacing_hi"] = tk.StringVar(value="0.16")
+        v["spacing_lo"] = tk.StringVar(value=_sp_lo)
+        v["spacing_hi"] = tk.StringVar(value=_sp_hi)
         _range_row(geo_frm, "Spacing (mm):", v["spacing_lo"], v["spacing_hi"], label_width=14)
 
         # Port selection
         port_frm = ttk.LabelFrame(parent, text="Port Location")
         port_frm.pack(fill="x", padx=4, pady=2)
 
-        v["port_inside"]  = tk.BooleanVar(value=(side == "rx"))
-        v["port_outside"] = tk.BooleanVar(value=(side == "tx"))
+        v["port_inside"]  = tk.BooleanVar(value=_p_in_def)
+        v["port_outside"] = tk.BooleanVar(value=_p_out_def)
 
         def _guard_port(changed_var, other_var):
             def _cb(*_):
@@ -230,9 +309,9 @@ class AutomationTab(ttk.Frame):
         row1.pack(fill="x", padx=4, pady=(4, 2))
 
         for label, attr, default, width in [
-            ("Resolution (mm):", "_res_var",   "1.5", 6),
-            ("nhinc:",           "_nhinc_var", "1",   4),
-            ("nwinc:",           "_nwinc_var", "3",   4),
+            ("Resolution (mm):", "_res_var",   RESOLUTION_MM, 6),
+            ("nhinc:",           "_nhinc_var", NHINC,         4),
+            ("nwinc:",           "_nwinc_var", NWINC,         4),
         ]:
             f = ttk.Frame(row1); f.pack(side="left", padx=(0, 10))
             ttk.Label(f, text=label, anchor="w").pack(anchor="w")
@@ -243,16 +322,16 @@ class AutomationTab(ttk.Frame):
         # PCB gap as a range
         row2 = ttk.Frame(shared)
         row2.pack(fill="x", padx=4, pady=(0, 2))
-        self._pcb_gap_lo_var = tk.StringVar(value="2.4")
-        self._pcb_gap_hi_var = tk.StringVar(value="2.8")
+        self._pcb_gap_lo_var = tk.StringVar(value=PCB_GAP_LO)
+        self._pcb_gap_hi_var = tk.StringVar(value=PCB_GAP_HI)
         _range_row(row2, "PCB gap (mm):", self._pcb_gap_lo_var, self._pcb_gap_hi_var,
                    label_width=14, entry_width=6, pady=0)
 
         # Frequency range
         row3 = ttk.Frame(shared)
         row3.pack(fill="x", padx=4, pady=(0, 4))
-        self._fmin_var = tk.StringVar(value="110000")
-        self._fmax_var = tk.StringVar(value="140000")
+        self._fmin_var = tk.StringVar(value=FREQ_MIN_HZ)
+        self._fmax_var = tk.StringVar(value=FREQ_MAX_HZ)
         _range_row(row3, "Freq range (Hz):", self._fmin_var, self._fmax_var,
                    label_width=14, entry_width=10, pady=0)
 
@@ -265,7 +344,7 @@ class AutomationTab(ttk.Frame):
 
         f = ttk.Frame(gr); f.pack(side="left", padx=(0, 10))
         ttk.Label(f, text="Total samples:", anchor="w").pack(anchor="w")
-        self._n_var = tk.StringVar(value="64000")
+        self._n_var = tk.StringVar(value=TOTAL_SAMPLES)
         ttk.Entry(f, textvariable=self._n_var, width=8).pack(anchor="w")
 
         self._gen_btn = ttk.Button(gr, text="Generate Samples",
@@ -283,9 +362,9 @@ class AutomationTab(ttk.Frame):
         sw_row.pack(fill="x", padx=6, pady=(4, 2))
 
         for label, var_name, default, width in [
-            ("Workers:",    "_workers_var", "15",  5),
-            ("Timeout (s):", "_timeout_var", "360", 5),
-            ("Ckpt every:", "_ckpt_var",    "50",  5),
+            ("Workers:",     "_workers_var", SWEEP_WORKERS,   5),
+            ("Timeout (s):", "_timeout_var", SWEEP_TIMEOUT_S, 5),
+            ("Ckpt every:",  "_ckpt_var",    SWEEP_CKPT_EVERY, 5),
         ]:
             f = ttk.Frame(sw_row); f.pack(side="left", padx=(0, 10))
             ttk.Label(f, text=label, anchor="w").pack(anchor="w")
@@ -298,13 +377,13 @@ class AutomationTab(ttk.Frame):
 
         f = ttk.Frame(idx_row); f.pack(side="left", padx=(0, 10))
         ttk.Label(f, text="From idx:", anchor="w").pack(anchor="w")
-        self._from_var = tk.StringVar(value="0")
+        self._from_var = tk.StringVar(value=SWEEP_FROM_IDX)
         self._from_var.trace_add("write", lambda *_: self._redraw_sweep_bar())
         ttk.Entry(f, textvariable=self._from_var, width=7).pack(anchor="w")
 
         f = ttk.Frame(idx_row); f.pack(side="left", padx=(0, 10))
         ttk.Label(f, text="To idx:", anchor="w").pack(anchor="w")
-        self._to_var = tk.StringVar(value="")
+        self._to_var = tk.StringVar(value=SWEEP_TO_IDX)
         self._to_var.trace_add("write", lambda *_: self._redraw_sweep_bar())
         ttk.Entry(f, textvariable=self._to_var, width=7).pack(anchor="w")
 
@@ -397,10 +476,10 @@ class AutomationTab(ttk.Frame):
 
         # Hyperparameters inline
         for label, attr, default, width in [
-            ("Epochs:",     "_nn_epochs_var", "800",   6),
-            ("Batch:",      "_nn_batch_var",  "128",   5),
-            ("LR:",         "_nn_lr_var",     "0.001", 7),
-            ("Val split:",  "_nn_val_var",    "0.20",  5),
+            ("Epochs:",    "_nn_epochs_var", NN_EPOCHS,    6),
+            ("Batch:",     "_nn_batch_var",  NN_BATCH,     5),
+            ("LR:",        "_nn_lr_var",     NN_LR,        7),
+            ("Val split:", "_nn_val_var",    NN_VAL_SPLIT, 5),
         ]:
             f = ttk.Frame(row); f.pack(side="left", padx=(0, 8))
             ttk.Label(f, text=label, anchor="w").pack(anchor="w")

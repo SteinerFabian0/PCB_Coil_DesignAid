@@ -81,7 +81,7 @@ DEFAULT_DOMAIN = {
         "port_inside_allowed":  True,
     },
     "global": {
-        "pcb_gap_mm":    2.6,
+        "pcb_gap_mm":    [2.6, 2.6],
         "resolution_mm": 1.2,
         "freq_hz":       [100_000.0, 150_000.0],
     },
@@ -137,6 +137,15 @@ def _round_int(v, lo, hi):
     return int(round(max(lo, min(hi, v))))
 
 
+def _stackup_val(u: float, lo: float, hi: float) -> float:
+    """Quantize u ∈ [0,1) to one of {lo, mid, hi} (or just {lo} when lo==hi)."""
+    if hi <= lo:
+        return round(lo, 4)
+    options = [lo, (lo + hi) / 2.0, hi]
+    idx = min(int(u * len(options)), len(options) - 1)
+    return round(options[idx], 4)
+
+
 # ---------------------------------------------------------------------------
 # Config hashing / canonicalisation
 # ---------------------------------------------------------------------------
@@ -151,6 +160,11 @@ def canonicalize(cfg: dict) -> dict:
         out[side] = dst
     src_g = cfg.get("global") or {}
     out["global"] = {**DEFAULT_DOMAIN["global"], **src_g}
+    # Normalise pcb_gap_mm: old configs may store it as a scalar float.
+    g = out["global"]
+    if not isinstance(g.get("pcb_gap_mm"), list):
+        v = float(g.get("pcb_gap_mm", 2.6))
+        g["pcb_gap_mm"] = [v, v]
     return out
  
  
@@ -196,26 +210,27 @@ def _build_layers(selected: list, inner_oz: float, outer_oz: float) -> list:
 #   0  tx_turns            (int)
 #   1  tx_width_mm
 #   2  tx_od_mm
-#   3  tx_spacing_mm
-#   4  tx_outer_gap_mm
-#   5  tx_inner_gap_mm
+#   3  tx_spacing_mm       (stackup: {lo, mid, hi})
+#   4  tx_outer_gap_mm     (stackup)
+#   5  tx_inner_gap_mm     (stackup)
 #   6  tx_outer_oz          (quantised 0.5)
 #   7  tx_inner_oz          (quantised 0.5)
 #   8  rx_turns             (int)
 #   9  rx_width_mm
 #   10 rx_od_mm
-#   11 rx_spacing_mm
-#   12 rx_outer_gap_mm
-#   13 rx_inner_gap_mm
+#   11 rx_spacing_mm        (stackup)
+#   12 rx_outer_gap_mm      (stackup)
+#   13 rx_inner_gap_mm      (stackup)
 #   14 rx_outer_oz
 #   15 rx_inner_oz
-#   16 freq_hz
-#   17 tx_topology          (categorical)
-#   18 rx_topology          (categorical)
-#   19 tx_port_inside       (categorical)
-#   20 rx_port_inside       (categorical)
- 
-_LHS_DIMS = 21
+#   16 freq_hz              (stackup)
+#   17 pcb_gap_mm           (stackup)
+#   18 tx_topology          (categorical)
+#   19 rx_topology          (categorical)
+#   20 tx_port_inside       (categorical)
+#   21 rx_port_inside       (categorical)
+
+_LHS_DIMS = 22
  
  
 def _decode(u_row, cfg):
@@ -233,9 +248,9 @@ def _decode(u_row, cfg):
     tx_w     = round(_scale(u_row[1], *tx["trace_width_mm"]), 4)
     tx_od    = round(_scale(u_row[2], tx["id_min_mm"] + 2.0,
                                     tx["od_max_mm"]), 4)
-    tx_s     = round(_scale(u_row[3], *tx["trace_spacing_mm"]), 4)
-    tx_og    = round(_scale(u_row[4], *tx["outer_gap_mm"]), 4)
-    tx_ig    = round(_scale(u_row[5], *tx["inner_gap_mm"]), 4)
+    tx_s     = _stackup_val(u_row[3], *tx["trace_spacing_mm"])
+    tx_og    = _stackup_val(u_row[4], *tx["outer_gap_mm"])
+    tx_ig    = _stackup_val(u_row[5], *tx["inner_gap_mm"])
     tx_oz_o  = quantize_oz(u_row[6], *tx["outer_cu_oz"])
     tx_oz_i  = quantize_oz(u_row[7], *tx["inner_cu_oz"])
  
@@ -243,17 +258,18 @@ def _decode(u_row, cfg):
     rx_w     = round(_scale(u_row[9],  *rx["trace_width_mm"]), 4)
     rx_od    = round(_scale(u_row[10], rx["id_min_mm"] + 2.0,
                                      rx["od_max_mm"]), 4)
-    rx_s     = round(_scale(u_row[11], *rx["trace_spacing_mm"]), 4)
-    rx_og    = round(_scale(u_row[12], *rx["outer_gap_mm"]), 4)
-    rx_ig    = round(_scale(u_row[13], *rx["inner_gap_mm"]), 4)
+    rx_s     = _stackup_val(u_row[11], *rx["trace_spacing_mm"])
+    rx_og    = _stackup_val(u_row[12], *rx["outer_gap_mm"])
+    rx_ig    = _stackup_val(u_row[13], *rx["inner_gap_mm"])
     rx_oz_o  = quantize_oz(u_row[14], *rx["outer_cu_oz"])
     rx_oz_i  = quantize_oz(u_row[15], *rx["inner_cu_oz"])
  
-    freq_hz  = round(_scale(u_row[16], *glob["freq_hz"]), 2)
-    tx_topo  = _cat(u_row[17], tx_topos)
-    rx_topo  = _cat(u_row[18], rx_topos)
-    tx_p_in  = _cat(u_row[19], tx_ports)
-    rx_p_in  = _cat(u_row[20], rx_ports)
+    freq_hz     = _stackup_val(u_row[16], *glob["freq_hz"])
+    pcb_gap_mm  = _stackup_val(u_row[17], *glob["pcb_gap_mm"])
+    tx_topo     = _cat(u_row[18], tx_topos)
+    rx_topo     = _cat(u_row[19], rx_topos)
+    tx_p_in     = _cat(u_row[20], tx_ports)
+    rx_p_in     = _cat(u_row[21], rx_ports)
  
     return {
         "tx_turns": tx_turns, "tx_width": tx_w, "tx_od_mm": tx_od,
@@ -267,6 +283,7 @@ def _decode(u_row, cfg):
         "rx_inner_oz": rx_oz_i, "rx_topology": rx_topo,
         "rx_port_inside": rx_p_in,
         "freq_hz": freq_hz,
+        "pcb_gap_mm": pcb_gap_mm,
     }
  
  
@@ -333,7 +350,7 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
             "rx_port_inside":   c["rx_port_inside"],
             "rx_layers":        rx_layers,
             # Global
-            "pcb_gap_mm":       cfg["global"]["pcb_gap_mm"],
+            "pcb_gap_mm":       c["pcb_gap_mm"],
             "resolution_mm":    cfg["global"]["resolution_mm"],
             "freq_hz":          c["freq_hz"],
             "fmin_hz":          c["freq_hz"],
