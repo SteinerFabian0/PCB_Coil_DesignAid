@@ -1,0 +1,1171 @@
+{
+  "meta": {
+    "config_hash": "e8b656c06104",
+    "n_total": 64000,
+    "n_results": 14
+  },
+  "results": [
+    {
+      "ok": true,
+      "tag": "S000000",
+      "sample_id": 0,
+      "freq_hz": 110000.0,
+      "L_tx_uH": 148.70714450947193,
+      "R_tx_ac": 6.95956,
+      "R_tx_dc": 6.95956,
+      "Q_tx": 14.768031312324343,
+      "L_rx_uH": 6.604307987172479,
+      "R_rx_ac": 0.336214,
+      "R_rx_dc": 0.336214,
+      "Q_rx": 13.576382898986953,
+      "M_uH": 17.492719795230215,
+      "k": 0.5581844880876019,
+      "tx_turns": 17,
+      "tx_width": 0.5086,
+      "tx_od_mm": 54.8188,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.05,
+      "tx_topology": "series",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 6,
+      "rx_width": 1.0387,
+      "rx_od_mm": 41.0622,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 1.0,
+      "rx_topology": "parallel_pairs_ser",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.6,
+      "pid": 13584,
+      "elapsed_sec": 25.79,
+      "tx_wire_length_mm": 2311.3674187775378,
+      "rx_wire_length_mm": 630.1529066683897,
+      "tx_wheeler_uh": 21.218648488925552,
+      "rx_wheeler_uh": 2.1741023031638114,
+      "tx_ln_n_sq": 5.666426688112432,
+      "rx_ln_n_sq": 3.58351893845611,
+      "tx_mean_radius_mm": 21.63915,
+      "rx_mean_radius_mm": 16.715325,
+      "tx_fill_factor": 0.2666578862848125,
+      "rx_fill_factor": 0.22828003643363204,
+      "tx_inner_diameter_mm": 31.7378,
+      "rx_inner_diameter_mm": 25.799099999999996
+    },
+    {
+      "ok": true,
+      "tag": "S000001",
+      "sample_id": 1,
+      "freq_hz": 110000.0,
+      "L_tx_uH": 4.208490754285418,
+      "R_tx_ac": 0.256324,
+      "R_tx_dc": 0.256324,
+      "Q_tx": 11.34774738221938,
+      "L_rx_uH": 51.507603605453895,
+      "R_rx_ac": 3.73879,
+      "R_rx_dc": 3.73879,
+      "Q_rx": 9.521663425867727,
+      "M_uH": 8.655988827201293,
+      "k": 0.587919447315982,
+      "tx_turns": 10,
+      "tx_width": 0.7262,
+      "tx_od_mm": 42.3275,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "parallel",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 7,
+      "rx_width": 0.5159,
+      "rx_od_mm": 43.5926,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.6,
+      "rx_topology": "series",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.6,
+      "pid": 16528,
+      "elapsed_sec": 35.55,
+      "tx_wire_length_mm": 1042.4558406847796,
+      "rx_wire_length_mm": 850.6912972336988,
+      "tx_wheeler_uh": 5.550584567394085,
+      "rx_wheeler_uh": 4.131753073529241,
+      "tx_ln_n_sq": 4.605170185988092,
+      "rx_ln_n_sq": 3.8918202981106265,
+      "tx_mean_radius_mm": 16.5912,
+      "rx_mean_radius_mm": 19.341675,
+      "tx_fill_factor": 0.2756009209701528,
+      "rx_fill_factor": 0.12690860538190205,
+      "tx_inner_diameter_mm": 24.037300000000002,
+      "rx_inner_diameter_mm": 33.7741
+    },
+    {
+      "ok": true,
+      "tag": "S000002",
+      "sample_id": 2,
+      "freq_hz": 125000.0,
+      "L_tx_uH": 6.159881987846928,
+      "R_tx_ac": 0.420741,
+      "R_tx_dc": 0.420741,
+      "Q_tx": 11.498665449766008,
+      "L_rx_uH": 223.38223868651588,
+      "R_rx_ac": 11.8091,
+      "R_rx_dc": 11.8091,
+      "Q_rx": 14.85667832434309,
+      "M_uH": 25.32142412196608,
+      "k": 0.6826178051063462,
+      "tx_turns": 10,
+      "tx_width": 0.88,
+      "tx_od_mm": 54.7503,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 0.8,
+      "tx_topology": "parallel",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 14,
+      "rx_width": 0.3908,
+      "rx_od_mm": 53.3431,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.6,
+      "rx_topology": "series",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.6,
+      "pid": 15856,
+      "elapsed_sec": 31.44,
+      "tx_wire_length_mm": 1381.9960330921108,
+      "rx_wire_length_mm": 2001.9202282396775,
+      "tx_wheeler_uh": 7.733534275951831,
+      "rx_wheeler_uh": 17.8109782599979,
+      "tx_ln_n_sq": 4.605170185988092,
+      "rx_ln_n_sq": 5.278114659230517,
+      "tx_mean_radius_mm": 21.995150000000002,
+      "rx_mean_radius_mm": 22.75825,
+      "tx_fill_factor": 0.24459937759005956,
+      "rx_fill_factor": 0.17195083101732336,
+      "tx_inner_diameter_mm": 33.23030000000001,
+      "rx_inner_diameter_mm": 37.6899
+    },
+    {
+      "ok": true,
+      "tag": "S000003",
+      "sample_id": 3,
+      "freq_hz": 125000.0,
+      "L_tx_uH": 11.3796548254432,
+      "R_tx_ac": 0.979791,
+      "R_tx_dc": 0.979791,
+      "Q_tx": 9.121904569443892,
+      "L_rx_uH": 9.548405317832406,
+      "R_rx_ac": 1.16304,
+      "R_rx_dc": 1.16304,
+      "Q_rx": 6.448015545467052,
+      "M_uH": 6.084544403984949,
+      "k": 0.5837112953387041,
+      "tx_turns": 16,
+      "tx_width": 0.3074,
+      "tx_od_mm": 39.9232,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 0.8,
+      "tx_topology": "parallel",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 16,
+      "rx_width": 0.2068,
+      "rx_od_mm": 33.5229,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 1.0,
+      "rx_topology": "parallel",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.4,
+      "pid": 21784,
+      "elapsed_sec": 49.55,
+      "tx_wire_length_mm": 1627.1489591779286,
+      "rx_wire_length_mm": 1388.8704661366958,
+      "tx_wheeler_uh": 14.84445164525422,
+      "rx_wheeler_uh": 13.111001938295276,
+      "tx_ln_n_sq": 5.545177444479562,
+      "rx_ln_n_sq": 5.545177444479562,
+      "tx_mean_radius_mm": 16.18555,
+      "rx_mean_radius_mm": 13.815349999999999,
+      "tx_fill_factor": 0.23329760187327583,
+      "rx_fill_factor": 0.21324830713662707,
+      "tx_inner_diameter_mm": 24.819000000000003,
+      "rx_inner_diameter_mm": 21.7385
+    },
+    {
+      "ok": true,
+      "tag": "S000004",
+      "sample_id": 4,
+      "freq_hz": 125000.0,
+      "L_tx_uH": 53.51489468499126,
+      "R_tx_ac": 3.38916,
+      "R_tx_dc": 3.38916,
+      "Q_tx": 12.401450506910269,
+      "L_rx_uH": 533.800586172038,
+      "R_rx_ac": 27.8289,
+      "R_rx_dc": 27.8289,
+      "Q_rx": 15.065130134500464,
+      "M_uH": 109.51184253848926,
+      "k": 0.6479391551989248,
+      "tx_turns": 10,
+      "tx_width": 0.5594,
+      "tx_od_mm": 47.3655,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "series",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 25,
+      "rx_width": 0.222,
+      "rx_od_mm": 49.3091,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 1.0,
+      "rx_topology": "series",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.6,
+      "pid": 18656,
+      "elapsed_sec": 35.76,
+      "tx_wire_length_mm": 1255.751132307605,
+      "rx_wire_length_mm": 3120.2376775270163,
+      "tx_wheeler_uh": 7.790827561521635,
+      "rx_wheeler_uh": 43.89939862675287,
+      "tx_ln_n_sq": 4.605170185988092,
+      "rx_ln_n_sq": 6.437751649736401,
+      "tx_mean_radius_mm": 19.9859,
+      "rx_mean_radius_mm": 19.86405,
+      "tx_fill_factor": 0.18497290589865853,
+      "rx_fill_factor": 0.24116431442731975,
+      "tx_inner_diameter_mm": 32.5781,
+      "rx_inner_diameter_mm": 30.1471
+    },
+    {
+      "ok": true,
+      "tag": "S000005",
+      "sample_id": 5,
+      "freq_hz": 140000.0,
+      "L_tx_uH": 8.461222448855757,
+      "R_tx_ac": 1.2183,
+      "R_tx_dc": 1.2183,
+      "Q_tx": 6.1092341787737015,
+      "L_rx_uH": 8.415567716608825,
+      "R_rx_ac": 0.641455,
+      "R_rx_dc": 0.641455,
+      "Q_rx": 11.540513364148694,
+      "M_uH": 5.243768855730443,
+      "k": 0.6214200676019691,
+      "tx_turns": 10,
+      "tx_width": 0.3228,
+      "tx_od_mm": 51.9667,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "parallel",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 5,
+      "rx_width": 0.9445,
+      "rx_od_mm": 53.9306,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.6,
+      "rx_topology": "parallel_pairs_ser",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.6,
+      "pid": 22388,
+      "elapsed_sec": 23.82,
+      "tx_wire_length_mm": 1478.3486797777095,
+      "rx_wire_length_mm": 754.2312080793473,
+      "tx_wheeler_uh": 10.752442586151293,
+      "rx_wheeler_uh": 2.636632260460946,
+      "tx_ln_n_sq": 4.605170185988092,
+      "rx_ln_n_sq": 3.2188758248682006,
+      "tx_mean_radius_mm": 23.528650000000003,
+      "rx_mean_radius_mm": 24.007925,
+      "tx_fill_factor": 0.10432812762313175,
+      "rx_fill_factor": 0.12318328218702779,
+      "tx_inner_diameter_mm": 42.14790000000001,
+      "rx_inner_diameter_mm": 42.1011
+    },
+    {
+      "ok": true,
+      "tag": "S000006",
+      "sample_id": 6,
+      "freq_hz": 140000.0,
+      "L_tx_uH": 7.215596286747038,
+      "R_tx_ac": 0.616174,
+      "R_tx_dc": 0.616174,
+      "Q_tx": 10.30093772213693,
+      "L_rx_uH": 5.252681532543589,
+      "R_rx_ac": 0.299926,
+      "R_rx_dc": 0.299926,
+      "Q_rx": 15.405466681781505,
+      "M_uH": 3.6317680146241806,
+      "k": 0.5899177325269931,
+      "tx_turns": 14,
+      "tx_width": 0.7084,
+      "tx_od_mm": 45.5638,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "parallel",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 9,
+      "rx_width": 0.8561,
+      "rx_od_mm": 54.0644,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.6,
+      "rx_topology": "parallel",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.4,
+      "pid": 17124,
+      "elapsed_sec": 31.44,
+      "tx_wire_length_mm": 1457.2214691823185,
+      "rx_wire_length_mm": 1260.228058918603,
+      "tx_wheeler_uh": 9.398023767854522,
+      "rx_wheeler_uh": 6.694925906211455,
+      "tx_ln_n_sq": 5.278114659230517,
+      "rx_ln_n_sq": 4.394449154672439,
+      "tx_mean_radius_mm": 16.566,
+      "rx_mean_radius_mm": 22.285725,
+      "tx_fill_factor": 0.3752203307980201,
+      "rx_fill_factor": 0.21298275016854953,
+      "tx_inner_diameter_mm": 20.7002,
+      "rx_inner_diameter_mm": 35.078500000000005
+    },
+    {
+      "ok": true,
+      "tag": "S000007",
+      "sample_id": 7,
+      "freq_hz": 110000.0,
+      "L_tx_uH": 51.80710427109046,
+      "R_tx_ac": 2.26674,
+      "R_tx_dc": 2.26674,
+      "Q_tx": 15.796474231716033,
+      "L_rx_uH": 1.0739572999004434,
+      "R_rx_ac": 0.0683256,
+      "R_rx_dc": 0.0683256,
+      "Q_rx": 10.863658716498648,
+      "M_uH": 4.638715502725192,
+      "k": 0.6218842691487266,
+      "tx_turns": 12,
+      "tx_width": 1.1035,
+      "tx_od_mm": 52.6981,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 0.8,
+      "tx_topology": "series",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 4,
+      "rx_width": 1.0201,
+      "rx_od_mm": 45.0134,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 1.0,
+      "rx_topology": "parallel",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.8,
+      "pid": 4812,
+      "elapsed_sec": 11.49,
+      "tx_wire_length_mm": 1397.2930760409704,
+      "rx_wire_length_mm": 500.93260348166893,
+      "tx_wheeler_uh": 7.266090402405618,
+      "rx_wheeler_uh": 1.3838092621242553,
+      "tx_ln_n_sq": 4.969813299576001,
+      "rx_ln_n_sq": 2.772588722239781,
+      "tx_mean_radius_mm": 18.532175,
+      "rx_mean_radius_mm": 19.931475,
+      "tx_fill_factor": 0.42180019344734226,
+      "rx_fill_factor": 0.12920393498223287,
+      "tx_inner_diameter_mm": 21.4306,
+      "rx_inner_diameter_mm": 34.7125
+    },
+    {
+      "ok": true,
+      "tag": "S000008",
+      "sample_id": 8,
+      "freq_hz": 140000.0,
+      "L_tx_uH": 97.16113702294469,
+      "R_tx_ac": 6.79493,
+      "R_tx_dc": 6.79493,
+      "Q_tx": 12.57811338748155,
+      "L_rx_uH": 32.67121303580207,
+      "R_rx_ac": 1.35235,
+      "R_rx_dc": 1.35235,
+      "Q_rx": 21.251229341516623,
+      "M_uH": 35.7983803033534,
+      "k": 0.6353813359332847,
+      "tx_turns": 16,
+      "tx_width": 0.7129,
+      "tx_od_mm": 51.9626,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "series",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 11,
+      "rx_width": 0.625,
+      "rx_od_mm": 54.1745,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.8,
+      "rx_topology": "parallel_pairs_ser",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.8,
+      "pid": 20980,
+      "elapsed_sec": 35.11,
+      "tx_wire_length_mm": 1896.0014319238978,
+      "rx_wire_length_mm": 1565.6975219181202,
+      "tx_wheeler_uh": 13.929870011552751,
+      "rx_wheeler_uh": 10.479845540508826,
+      "tx_ln_n_sq": 5.545177444479562,
+      "rx_ln_n_sq": 4.795790545596741,
+      "tx_mean_radius_mm": 18.859875000000002,
+      "rx_mean_radius_mm": 22.6535,
+      "tx_fill_factor": 0.3775966171567945,
+      "rx_fill_factor": 0.195720308120158,
+      "tx_inner_diameter_mm": 23.4769,
+      "rx_inner_diameter_mm": 36.4395
+    },
+    {
+      "ok": true,
+      "tag": "S000009",
+      "sample_id": 9,
+      "freq_hz": 125000.0,
+      "L_tx_uH": 41.30058040839236,
+      "R_tx_ac": 3.5657,
+      "R_tx_dc": 3.5657,
+      "Q_tx": 9.097063690159015,
+      "L_rx_uH": 355.06703860075015,
+      "R_rx_ac": 17.6849,
+      "R_rx_dc": 17.6849,
+      "Q_rx": 15.768763182149746,
+      "M_uH": 52.392279378398264,
+      "k": 0.43264733888002455,
+      "tx_turns": 11,
+      "tx_width": 0.4086,
+      "tx_od_mm": 34.6212,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "series",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 19,
+      "rx_width": 0.2795,
+      "rx_od_mm": 50.0778,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.6,
+      "rx_topology": "series",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.8,
+      "pid": 22856,
+      "elapsed_sec": 22.16,
+      "tx_wire_length_mm": 975.9838242052691,
+      "rx_wire_length_mm": 2487.1469104886223,
+      "tx_wheeler_uh": 6.198618015884212,
+      "rx_wheeler_uh": 28.44345944454009,
+      "tx_ln_n_sq": 4.795790545596741,
+      "rx_ln_n_sq": 5.8888779583328805,
+      "tx_mean_radius_mm": 14.12115,
+      "rx_mean_radius_mm": 20.833775000000003,
+      "tx_fill_factor": 0.2258633326605836,
+      "rx_fill_factor": 0.20184172095551575,
+      "tx_inner_diameter_mm": 21.863400000000002,
+      "rx_inner_diameter_mm": 33.2573
+    },
+    {
+      "ok": true,
+      "tag": "S000010",
+      "sample_id": 10,
+      "freq_hz": 125000.0,
+      "L_tx_uH": 5.412426713110151,
+      "R_tx_ac": 0.688004,
+      "R_tx_dc": 0.688004,
+      "Q_tx": 6.178612333649224,
+      "L_rx_uH": 13.936625408762145,
+      "R_rx_ac": 0.992879,
+      "R_rx_dc": 0.992879,
+      "Q_rx": 11.024304069277324,
+      "M_uH": 4.887419119234053,
+      "k": 0.5627360728151174,
+      "tx_turns": 11,
+      "tx_width": 0.3956,
+      "tx_od_mm": 36.8025,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 0.8,
+      "tx_topology": "parallel",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 8,
+      "rx_width": 0.6513,
+      "rx_od_mm": 42.812,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.6,
+      "rx_topology": "parallel_pairs_ser",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.6,
+      "pid": 23244,
+      "elapsed_sec": 40.39,
+      "tx_wire_length_mm": 1056.530489932127,
+      "rx_wire_length_mm": 906.6875159301816,
+      "tx_wheeler_uh": 6.971652059518666,
+      "rx_wheeler_uh": 4.485882661186705,
+      "tx_ln_n_sq": 4.795790545596741,
+      "rx_ln_n_sq": 4.1588830833596715,
+      "tx_mean_radius_mm": 15.286550000000002,
+      "rx_mean_radius_mm": 18.037975,
+      "tx_fill_factor": 0.20375428072390434,
+      "rx_fill_factor": 0.1867185756716039,
+      "tx_inner_diameter_mm": 24.343700000000002,
+      "rx_inner_diameter_mm": 29.3399
+    },
+    {
+      "ok": true,
+      "tag": "S000011",
+      "sample_id": 11,
+      "freq_hz": 125000.0,
+      "L_tx_uH": 6.513575200978909,
+      "R_tx_ac": 0.508252,
+      "R_tx_dc": 0.508252,
+      "Q_tx": 10.065380952755719,
+      "L_rx_uH": 9.947833295411275,
+      "R_rx_ac": 1.10878,
+      "R_rx_dc": 1.10878,
+      "Q_rx": 7.046492541351756,
+      "M_uH": 4.998483804721302,
+      "k": 0.6209609990675793,
+      "tx_turns": 11,
+      "tx_width": 0.4941,
+      "tx_od_mm": 44.8575,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "parallel",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 12,
+      "rx_width": 0.2545,
+      "rx_od_mm": 46.5355,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 1.0,
+      "rx_topology": "parallel",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.4,
+      "pid": 2728,
+      "elapsed_sec": 46.37,
+      "tx_wire_length_mm": 1295.7462771415585,
+      "rx_wire_length_mm": 1565.050353831481,
+      "tx_wheeler_uh": 8.663225919892087,
+      "rx_wheeler_uh": 13.191049097717704,
+      "tx_ln_n_sq": 4.795790545596741,
+      "rx_ln_n_sq": 4.969813299576001,
+      "tx_mean_radius_mm": 18.747675,
+      "rx_mean_radius_mm": 20.757125000000002,
+      "tx_fill_factor": 0.19634834719505218,
+      "rx_fill_factor": 0.12095244404029937,
+      "tx_inner_diameter_mm": 30.133200000000002,
+      "rx_inner_diameter_mm": 36.493
+    },
+    {
+      "ok": true,
+      "tag": "S000012",
+      "sample_id": 12,
+      "freq_hz": 125000.0,
+      "L_tx_uH": 36.340039142104175,
+      "R_tx_ac": 3.65976,
+      "R_tx_dc": 3.65976,
+      "Q_tx": 7.798708112007346,
+      "L_rx_uH": 59.89815381856653,
+      "R_rx_ac": 7.86801,
+      "R_rx_dc": 7.86801,
+      "Q_rx": 5.979135766222972,
+      "M_uH": 15.778366410221558,
+      "k": 0.3381914497172359,
+      "tx_turns": 10,
+      "tx_width": 0.6649,
+      "tx_od_mm": 39.4943,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 0.8,
+      "tx_topology": "series",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 6,
+      "rx_width": 0.3564,
+      "rx_od_mm": 53.2605,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 0.6,
+      "rx_topology": "series",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.8,
+      "pid": 11308,
+      "elapsed_sec": 8.07,
+      "tx_wire_length_mm": 973.6690987381041,
+      "rx_wire_length_mm": 943.6822827003243,
+      "tx_wheeler_uh": 5.194870669196796,
+      "rx_wheeler_uh": 4.508141461808108,
+      "tx_ln_n_sq": 4.605170185988092,
+      "rx_ln_n_sq": 3.58351893845611,
+      "tx_mean_radius_mm": 15.496425000000002,
+      "rx_mean_radius_mm": 25.031950000000002,
+      "tx_fill_factor": 0.2743035893762593,
+      "rx_fill_factor": 0.06385039918983539,
+      "tx_inner_diameter_mm": 22.491400000000002,
+      "rx_inner_diameter_mm": 46.8673
+    },
+    {
+      "ok": true,
+      "tag": "S000013",
+      "sample_id": 13,
+      "freq_hz": 140000.0,
+      "L_tx_uH": 40.32019960079856,
+      "R_tx_ac": 2.88282,
+      "R_tx_dc": 2.88282,
+      "Q_tx": 12.303057422940038,
+      "L_rx_uH": 9.236545754127926,
+      "R_rx_ac": 0.491685,
+      "R_rx_dc": 0.491685,
+      "Q_rx": 16.52458382907756,
+      "M_uH": 11.32729603226483,
+      "k": 0.5869621827061053,
+      "tx_turns": 9,
+      "tx_width": 1.1101,
+      "tx_od_mm": 54.6782,
+      "tx_spacing_mm": 0.16,
+      "tx_outer_gap_mm": 0.2,
+      "tx_inner_gap_mm": 1.3,
+      "tx_topology": "series",
+      "tx_port_inside": false,
+      "tx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": true,
+          "copper_oz": 0.5
+        },
+        {
+          "active": false,
+          "copper_oz": 1.0
+        }
+      ],
+      "rx_turns": 7,
+      "rx_width": 0.8844,
+      "rx_od_mm": 41.8584,
+      "rx_spacing_mm": 0.16,
+      "rx_outer_gap_mm": 0.2,
+      "rx_inner_gap_mm": 1.0,
+      "rx_topology": "parallel_pairs_ser",
+      "rx_port_inside": true,
+      "rx_layers": [
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        },
+        {
+          "active": true,
+          "copper_oz": 1.0
+        }
+      ],
+      "pcb_gap_mm": 2.4,
+      "pid": 22884,
+      "elapsed_sec": 15.24,
+      "tx_wire_length_mm": 1209.356877397554,
+      "rx_wire_length_mm": 751.7762105001996,
+      "tx_wheeler_uh": 5.7704500553013505,
+      "rx_wheeler_uh": 3.045697631252538,
+      "tx_ln_n_sq": 4.394449154672439,
+      "rx_ln_n_sq": 3.8918202981106265,
+      "tx_mean_radius_mm": 21.386125,
+      "rx_mean_radius_mm": 17.0927,
+      "tx_fill_factor": 0.27835687858366115,
+      "rx_fill_factor": 0.22445254406852042,
+      "tx_inner_diameter_mm": 30.866299999999995,
+      "rx_inner_diameter_mm": 26.512400000000007
+    }
+  ]
+}

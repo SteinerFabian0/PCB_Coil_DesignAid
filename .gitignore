@@ -9,3 +9,5 @@ temp/Zc.mat
 /App/Savestate/__pycache__
 /__pycache__
 /.claude
+/App/NeuralNetwork/__pycache__
+App/SimulationData/solver_output.json
