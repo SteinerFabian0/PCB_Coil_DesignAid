@@ -326,6 +326,10 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
             continue
 
         sample_id = len(valid)
+
+        tx_nwinc = 2 if c["tx_width"] < 0.4 else 3
+        rx_nwinc = 2 if c["rx_width"] < 0.4 else 3
+
         sample = {
             "id":            sample_id,
             "tag":           f"S{sample_id:06d}",
@@ -360,6 +364,8 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
             "nwinc":            cfg["tx"]["nwinc"],
             "rx_nhinc":         cfg["rx"]["nhinc"],
             "rx_nwinc":         cfg["rx"]["nwinc"],
+            "tx_nwinc":         tx_nwinc,
+            "rx_nwinc":         rx_nwinc,
         }
         valid.append(sample)
  
