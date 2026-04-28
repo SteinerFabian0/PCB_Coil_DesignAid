@@ -92,11 +92,11 @@ def _load_samples(path: str, timeout_sec: float):
         payload = json.load(f)
     samples = payload["samples"]
     params  = [sample_to_simparams(d, timeout_sec) for d in samples]
-    return params, payload.get("meta", {})
+    return params, samples, payload.get("meta", {})
 
 
 def _load_existing(path: str) -> dict:
-    """Return {sample_id: result_dict} for already-written solver rows."""
+    """Return {uuid: result_dict} for already-written local results."""
     if not os.path.exists(path):
         return {}
     try:
@@ -106,14 +106,14 @@ def _load_existing(path: str) -> dict:
         return {}
     out = {}
     for r in data.get("results", []):
-        sid = r.get("sample_id")
-        if isinstance(sid, int) and sid >= 0:
-            out[sid] = r
+        uuid_val = r.get("uuid")
+        if uuid_val:
+            out[uuid_val] = r
     return out
 
 
-def _load_global_ids(global_path: str) -> set:
-    """Return the set of sample_ids already present in global_results.json."""
+def _load_global_uuids(global_path: str) -> set:
+    """Return the set of UUIDs already present in global_results.json."""
     if not os.path.exists(global_path):
         return set()
     try:
@@ -121,8 +121,7 @@ def _load_global_ids(global_path: str) -> set:
             data = json.load(f)
     except Exception:
         return set()
-    return {r["sample_id"] for r in data.get("results", [])
-            if isinstance(r.get("sample_id"), int) and r["sample_id"] >= 0}
+    return {r["uuid"] for r in data.get("results", []) if r.get("uuid")}
 
 
 def _flush(out_path: str, meta: dict, results: dict) -> None:
@@ -146,18 +145,24 @@ def _stop_requested(out_path: str) -> bool:
 # ---------------------------------------------------------------------------
  
 def _one_line_report(r: dict) -> str:
-    sid = r.get("sample_id", -1)
-    tag = r.get("tag", f"S{sid:06d}" if sid >= 0 else "S?")
-    t   = float(r.get("elapsed_sec", 0.0))
+    batch = r.get("batch")
+    snum  = r.get("sample_num")
+    t     = float(r.get("elapsed_sec", 0.0))
+    if batch is not None and snum is not None:
+        label = f"B{batch:02d}·S{snum:05d}"
+    else:
+        label = r.get("tag", "?")
     if r.get("ok"):
-        return f"{tag} OK    {t:6.1f}s"
+        return f"{label}  OK    {t:6.1f}s"
     err = r.get("error", "")[:80]
-    return f"{tag} FAIL  {t:6.1f}s  {err}"
+    return f"{label}  FAIL  {t:6.1f}s  {err}"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="FastHenry sweep runner")
     parser.add_argument("--samples", default=os.path.join(_SIMDATA_DIR, "lhs_samples.json"))
-    parser.add_argument("--out",     default=os.path.join(_SIMDATA_DIR, "solver_output.json"))
+    parser.add_argument("--out",     default=None)
+    parser.add_argument("--batch",   type=int, default=None, dest="batch",
+                        help="Batch number (derives --out if not specified)")
     parser.add_argument("--workers",          type=int, default=8)
     parser.add_argument("--timeout",          type=int, default=360)
     parser.add_argument("--checkpoint-every", type=int, default=25, dest="ckpt_every")
@@ -165,26 +170,44 @@ def main() -> int:
     parser.add_argument("--to-idx",           type=int, default=None, dest="to_idx")
     args = parser.parse_args()
 
-    params_list, sample_meta = _load_samples(args.samples, args.timeout)
+    params_list, samples_list, sample_meta = _load_samples(args.samples, args.timeout)
+
+    if args.out is None:
+        batch_num = args.batch if args.batch is not None else sample_meta.get("batch")
+        if batch_num is None:
+            print("ERROR: --out or --batch must be specified", file=sys.stderr)
+            return 1
+        args.out = os.path.join(_SIMDATA_DIR, f"results_batch_{batch_num}.json")
+
+    batch_num = args.batch if args.batch is not None else sample_meta.get("batch")
 
     from_idx = max(0, args.from_idx)
     to_idx   = args.to_idx if args.to_idx is not None else len(params_list)
     to_idx   = min(to_idx, len(params_list))
     target   = params_list[from_idx:to_idx]
+    target_samples = samples_list[from_idx:to_idx]
 
     existing    = _load_existing(args.out)
-    global_ids  = _load_global_ids(os.path.join(_SIMDATA_DIR, "global_results.json"))
-    skip_ids    = set(existing) | global_ids
-    todo        = [p for p in target if p.sample_id not in skip_ids]
+    global_uuids = _load_global_uuids(os.path.join(_SIMDATA_DIR, "global_results.json"))
+    skip_uuids  = set(existing) | global_uuids
 
-    n_in_solver = sum(1 for p in target if p.sample_id in existing)
-    n_in_global = sum(1 for p in target if p.sample_id in global_ids and p.sample_id not in existing)
+    todo = []
+    todo_samples = []
+    for i, p in enumerate(target):
+        sample = target_samples[i]
+        uuid_val = sample.get("uuid")
+        if uuid_val and uuid_val not in skip_uuids:
+            todo.append(p)
+            todo_samples.append(sample)
+
+    n_in_local = sum(1 for s in target_samples if s.get("uuid") in existing)
+    n_in_global = sum(1 for s in target_samples if s.get("uuid") in global_uuids and s.get("uuid") not in existing)
 
     print("=" * 65, flush=True)
     print(f"Sweep range [{from_idx}:{to_idx}]  ({len(target)} samples)", flush=True)
     print(f"Workers     : {args.workers}", flush=True)
     print(f"Timeout     : {args.timeout}s", flush=True)
-    print(f"Skip (solver): {n_in_solver}  Skip (global): {n_in_global}", flush=True)
+    print(f"Skip (local) : {n_in_local}  Skip (global): {n_in_global}", flush=True)
     print(f"To simulate : {len(todo)}", flush=True)
     print(f"Output file : {args.out}", flush=True)
     print("=" * 65, flush=True)
@@ -205,23 +228,27 @@ def main() -> int:
             pass
  
     from concurrent.futures import ProcessPoolExecutor, as_completed
- 
+
     meta = {**sample_meta,
             "workers":    args.workers,
             "timeout":    args.timeout,
             "from_idx":   from_idx,
             "to_idx":     to_idx,
             "range_total": len(target)}
- 
+
     results = dict(existing)
+    sample_by_id = {p.sample_id: s for p, s in zip(target, target_samples)}
 
     wall_start = time.time()
     since_ckpt = 0
- 
+
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         fut_map = {pool.submit(run_single_sim, p): p for p in todo}
         done_count = 0
+        stop_signaled = False
         for fut in as_completed(fut_map):
+            if fut.cancelled():
+                continue
             p = fut_map[fut]
             try:
                 r = fut.result()
@@ -230,35 +257,43 @@ def main() -> int:
                      "error": f"worker crash: {exc}", "elapsed_sec": 0.0}
             sid = r.get("sample_id", p.sample_id)
             r["sample_id"] = sid
-            results[sid] = r
+
+            sample = sample_by_id.get(sid)
+            if sample:
+                r["uuid"] = sample.get("uuid")
+                r["batch"] = sample.get("batch")
+                r["sample_num"] = sample.get("sample_num")
+
+            if r.get("ok"):
+                uuid_val = r.get("uuid")
+                if uuid_val:
+                    results[uuid_val] = r
+
             done_count += 1
             since_ckpt += 1
- 
+
             print(_one_line_report(r), flush=True)
- 
+
             if since_ckpt >= args.ckpt_every:
                 _flush(args.out, meta, results)
                 since_ckpt = 0
- 
-            if _stop_requested(args.out):
-                print("[STOP] Stop flag detected — draining in-flight jobs.",
-                      flush=True)
-                # Cancel what we can and break; as_completed will still yield
-                # already-running futures.
+
+            if not stop_signaled and _stop_requested(args.out):
+                print("[STOP] Stop flag detected — cancelling pending jobs, "
+                      "letting running jobs finish.", flush=True)
+                stop_signaled = True
                 for f in fut_map:
                     if not f.running() and not f.done():
                         f.cancel()
-                # Don't break — let remaining complete naturally.
- 
+                # No break — drain in-flight futures so their results are captured
+
     _flush(args.out, meta, results)
- 
+
     wall = time.time() - wall_start
-    ok    = sum(1 for r in results.values() if r.get("ok")
-                and from_idx <= r.get("sample_id", -1) < to_idx)
-    fail  = sum(1 for r in results.values() if not r.get("ok")
-                and from_idx <= r.get("sample_id", -1) < to_idx)
+    ok = len(results)
+    failed = len(todo) - len(results)
     print("=" * 65, flush=True)
-    print(f"Done in {wall:.1f}s  |  OK: {ok}  Failed: {fail}", flush=True)
+    print(f"Done in {wall:.1f}s  |  OK: {ok}  Failed: {failed}", flush=True)
     print(f"Output: {args.out}", flush=True)
     print("=" * 65, flush=True)
  

@@ -19,13 +19,14 @@ CLI usage:
 """
 
 from __future__ import annotations
- 
+
 import argparse
 import hashlib
 import json
 import math
 import os
 import sys
+import uuid as uuid_module
 
 from scipy.stats import qmc
 
@@ -87,6 +88,26 @@ DEFAULT_DOMAIN = {
     },
     "n_total": 20_000,
 }
+
+
+# ---------------------------------------------------------------------------
+# UUID generation for deduplication
+# ---------------------------------------------------------------------------
+
+def sample_uuid(sample: dict) -> str:
+    """Deterministic UUID based on all simulation-relevant parameters."""
+    SIM_KEYS = [
+        "tx_turns", "tx_trace_width_mm", "tx_od_mm", "tx_spacing_mm",
+        "tx_outer_gap_mm", "tx_inner_gap_mm", "tx_topology", "tx_port_inside",
+        "tx_layers", "rx_turns", "rx_trace_width_mm", "rx_od_mm",
+        "rx_spacing_mm", "rx_outer_gap_mm", "rx_inner_gap_mm", "rx_topology",
+        "rx_port_inside", "rx_layers", "pcb_gap_mm", "resolution_mm",
+        "freq_hz", "nhinc", "nwinc", "rx_nhinc", "rx_nwinc",
+    ]
+    canonical = {k: sample[k] for k in SIM_KEYS if k in sample}
+    payload = json.dumps(canonical, sort_keys=True, default=str).encode()
+    h = hashlib.sha256(payload).digest()[:16]
+    return str(uuid_module.UUID(bytes=h))
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +388,7 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
             "tx_nwinc":         tx_nwinc,
             "rx_nwinc":         rx_nwinc,
         }
+        sample["uuid"] = sample_uuid(sample)
         valid.append(sample)
  
     log(f"LHS: {len(valid)} valid / {rejected} rejected "
@@ -395,11 +417,17 @@ def write_domain_master(cfg: dict, out_path: str,
  
  
 def write_samples_file(samples: list, cfg: dict, out_path: str,
-                       config_hash_: str) -> None:
+                       config_hash_: str, batch_num: int = None) -> None:
+    for i, sample in enumerate(samples, start=1):
+        sample["sample_num"] = i
+        if batch_num is not None:
+            sample["batch"] = batch_num
+
     payload = {
         "meta": {
-            "seed":          HARDCODED_SEED,
+            "batch":         batch_num,
             "n_samples":     len(samples),
+            "seed":          HARDCODED_SEED,
             "config_hash":   config_hash_,
             "domain":        canonicalize(cfg),
         },
@@ -410,6 +438,47 @@ def write_samples_file(samples: list, cfg: dict, out_path: str,
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2, default=str)
     os.replace(tmp, out_path)
+
+
+# ---------------------------------------------------------------------------
+# Global results metadata
+# ---------------------------------------------------------------------------
+
+def _load_global_results(path: str) -> dict:
+    """Load global_results.json, return empty structure if missing."""
+    if not os.path.exists(path):
+        return {"meta": {"n_lhs_batches": 0, "lhs_batches": {}}, "results": []}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {"meta": {"n_lhs_batches": 0, "lhs_batches": {}}, "results": []}
+
+
+def _next_batch_number(global_path: str) -> int:
+    """Determine the next batch number by reading global_results metadata."""
+    data = _load_global_results(global_path)
+    n_batches = data.get("meta", {}).get("n_lhs_batches", 0)
+    return n_batches + 1
+
+
+def _update_global_batch_metadata(global_path: str, batch_num: int,
+                                  batch_file: str, n_samples: int) -> None:
+    """Update global_results.json with new batch metadata."""
+    data = _load_global_results(global_path)
+    meta = data.setdefault("meta", {})
+    lhs_batches = meta.setdefault("lhs_batches", {})
+
+    lhs_batches[str(batch_num)] = {
+        "file": batch_file,
+        "n_samples": n_samples,
+    }
+    meta["n_lhs_batches"] = max(meta.get("n_lhs_batches", 0), batch_num)
+
+    tmp = global_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    os.replace(tmp, global_path)
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +494,9 @@ def main() -> int:
     parser.add_argument("--config", required=True,
                         help="Path to the domain config JSON "
                              "(written by the GUI on Generate)")
-    parser.add_argument("--out", default=os.path.join(_SIMDATA_DIR, "lhs_samples.json"))
     parser.add_argument("--master", default=os.path.join(_SIMDATA_DIR, "domain_master.json"))
+    parser.add_argument("--global", dest="global_", default=os.path.join(_SIMDATA_DIR, "global_results.json"),
+                        help="Path to global_results.json for batch tracking")
     parser.add_argument("--n", type=int, default=None,
                         help="Override total sample count from config")
     args = parser.parse_args()
@@ -437,16 +507,23 @@ def main() -> int:
         print("ERROR: n_total must be > 0", file=sys.stderr)
         return 2
 
+    batch_num = _next_batch_number(args.global_)
     samples = generate_samples(cfg, n_total)
     if not samples:
         print("ERROR: no feasible samples — check the domain config", file=sys.stderr)
         return 3
 
     h = write_domain_master(cfg, args.master, n_total, len(samples))
-    write_samples_file(samples, cfg, args.out, h)
 
-    print(f"Wrote {len(samples)} samples -> {args.out}")
+    out_path = os.path.join(_SIMDATA_DIR, f"lhs_batch_{batch_num}.json")
+    write_samples_file(samples, cfg, out_path, h, batch_num=batch_num)
+
+    _update_global_batch_metadata(args.global_, batch_num,
+                                   f"lhs_batch_{batch_num}.json", len(samples))
+
+    print(f"Wrote {len(samples)} samples -> {out_path}")
     print(f"Domain master       -> {args.master}  (hash {h})")
+    print(f"Batch {batch_num} registered in global_results.json")
     return 0
 
 

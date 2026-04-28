@@ -91,40 +91,34 @@ def append_solver_to_global(solver_path: str = SOLVER_FILE,
                             domain_master_path: str | None = None,
                             log=print) -> dict:
     """
-    Merge OK rows from *solver_path* into *global_path*.
- 
+    Merge OK rows from *solver_path* (local results file) into *global_path*.
+    Uses UUID-based deduplication.
+
     Returns a summary dict::
-        {"added": N, "skipped_existing": M, "skipped_fail": F, "total": T}
+        {"added": N, "skipped_existing": M, "total": T}
     """
     sol = _load(solver_path)
     glb = _load(global_path)
- 
-    existing_ids = {r.get("sample_id") for r in glb.get("results", [])
-                    if isinstance(r.get("sample_id"), int) and r["sample_id"] >= 0}
- 
-    added, skipped_exist, skipped_fail = 0, 0, 0
+
+    existing_uuids = {r.get("uuid") for r in glb.get("results", []) if r.get("uuid")}
+
+    added = 0
     new_rows = list(glb.get("results", []))
- 
+
     for r in sol.get("results", []):
-        if not r.get("ok"):
-            skipped_fail += 1
+        uuid_val = r.get("uuid")
+        if not uuid_val:
             continue
-        sid = r.get("sample_id")
-        if not isinstance(sid, int) or sid < 0:
-            skipped_fail += 1
+        if uuid_val in existing_uuids:
             continue
-        if sid in existing_ids:
-            skipped_exist += 1
-            continue
+
         enriched = enrich_row(r)
         new_rows.append(enriched)
-        existing_ids.add(sid)
+        existing_uuids.add(uuid_val)
         added += 1
- 
-    # Keep rows sorted by sample_id for readability + deterministic coverage.
-    new_rows.sort(key=lambda x: x.get("sample_id", 1 << 30))
- 
-    # Preserve / update meta
+
+    new_rows.sort(key=lambda x: (x.get("batch", 0), x.get("sample_num", 0)))
+
     meta = dict(glb.get("meta", {}))
     if domain_master_path and os.path.exists(domain_master_path):
         try:
@@ -135,17 +129,15 @@ def append_solver_to_global(solver_path: str = SOLVER_FILE,
         except Exception:
             pass
     meta["n_results"] = len(new_rows)
- 
+
     _save(global_path, {"meta": meta, "results": new_rows})
- 
+
     summary = {
         "added":            added,
-        "skipped_existing": skipped_exist,
-        "skipped_fail":     skipped_fail,
+        "skipped_existing": len(new_rows) - added - len(glb.get("results", [])),
         "total":            len(new_rows),
     }
     log(f"Appended {added} rows  "
-        f"(skipped {skipped_exist} duplicates, {skipped_fail} failures)  "
         f"-> {global_path}  [total now {len(new_rows)}]")
     return summary
  
@@ -156,13 +148,17 @@ def append_solver_to_global(solver_path: str = SOLVER_FILE,
  
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Append valid solver outputs into global_results.json")
-    parser.add_argument("--solver", default=SOLVER_FILE)
+        description="Append valid results into global_results.json")
+    parser.add_argument("--local", default=None,
+                        help="Local results file (results_batch_N.json)")
+    parser.add_argument("--solver", default=None,
+                        help="Deprecated: use --local")
     parser.add_argument("--global", dest="global_", default=GLOBAL_FILE)
     parser.add_argument("--domain", default=os.path.join(_SIMDATA_DIR, "domain_master.json"))
     args = parser.parse_args()
- 
-    summary = append_solver_to_global(args.solver, args.global_, args.domain)
+
+    local_path = args.local or args.solver or SOLVER_FILE
+    summary = append_solver_to_global(local_path, args.global_, args.domain)
     print(json.dumps(summary, indent=2))
     return 0
  

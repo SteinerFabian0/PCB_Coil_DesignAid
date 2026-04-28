@@ -15,6 +15,7 @@ import json
 import queue
 import threading
 import subprocess
+import glob
 import tkinter as tk
 from tkinter import ttk
 
@@ -30,12 +31,16 @@ _APPEND_SCRIPT = os.path.join(_NN_DIR, "append_results.py")
 _TRAIN_SCRIPT  = os.path.join(_NN_DIR, "train_surrogate.py")
 
 _DOMAIN_FILE  = os.path.join(_SIMDATA_DIR, "domain_master.json")
-_SAMPLES_FILE = os.path.join(_SIMDATA_DIR, "lhs_samples.json")
-_SOLVER_FILE  = os.path.join(_SIMDATA_DIR, "solver_output.json")
 _GLOBAL_FILE  = os.path.join(_SIMDATA_DIR, "global_results.json")
 _STOP_FLAG    = os.path.join(_SIMDATA_DIR, "STOP_SWEEP")
 _MODEL_FILE   = os.path.join(_NN_DIR, "surrogate_model.pth")
 _LOSS_PLOT    = os.path.join(_NN_DIR, "loss_curve.png")
+
+def _batch_samples_path(n: int) -> str:
+    return os.path.join(_SIMDATA_DIR, f"lhs_batch_{n}.json")
+
+def _batch_results_path(n: int) -> str:
+    return os.path.join(_SIMDATA_DIR, f"results_batch_{n}.json")
 
 for _p in (_NN_DIR, _MODULES_DIR):
     if _p not in sys.path:
@@ -99,7 +104,7 @@ FREQ_MAX_HZ              = "140000"
 TOTAL_SAMPLES            = "64000"
 
 # FastHenry sweep
-SWEEP_WORKERS            = "15"
+SWEEP_WORKERS            = "8"
 SWEEP_TIMEOUT_S          = "360"
 SWEEP_CKPT_EVERY         = "50"
 SWEEP_FROM_IDX           = "0"
@@ -144,6 +149,8 @@ class AutomationTab(ttk.Frame):
         self._covered_global = set()
         self._n_target       = 0
         self._n_total_samples = 0
+        self._active_batch_num = None
+        self._batch_var = tk.StringVar()
         self._build()
         self._refresh_status()
         self.after(POLL_MS, self._poll)
@@ -358,8 +365,20 @@ class AutomationTab(ttk.Frame):
         sw_frm = ttk.LabelFrame(parent, text="2 · Run FastHenry Sweep")
         sw_frm.pack(fill="x", padx=4, pady=2)
 
+        # Batch selector row
+        batch_row = ttk.Frame(sw_frm)
+        batch_row.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(batch_row, text="Batch:", width=10, anchor="w").pack(side="left")
+        self._batch_combobox = ttk.Combobox(batch_row, textvariable=self._batch_var,
+                                             state="readonly", width=30)
+        self._batch_combobox.pack(side="left", padx=(0, 6))
+        self._batch_combobox.bind("<<ComboboxSelected>>", lambda _: self._on_batch_selected())
+        self._batch_status = tk.StringVar(value="—")
+        ttk.Label(batch_row, textvariable=self._batch_status,
+                  foreground="gray", font=("Consolas", 8)).pack(side="left")
+
         sw_row = ttk.Frame(sw_frm)
-        sw_row.pack(fill="x", padx=6, pady=(4, 2))
+        sw_row.pack(fill="x", padx=6, pady=(0, 2))
 
         for label, var_name, default, width in [
             ("Workers:",     "_workers_var", SWEEP_WORKERS,   5),
@@ -419,9 +438,28 @@ class AutomationTab(ttk.Frame):
         self._console.pack(fill="both", expand=True, padx=(4, 0), pady=(0, 2))
 
     def _build_bottom(self, parent):
+        # ---- Sweep progress bar ----
+        sp_frm = ttk.LabelFrame(parent, text="Sweep Progress  (current index range)")
+        sp_frm.pack(fill="x", padx=10, pady=(4, 2))
+
+        self._sweep_bar = tk.Canvas(sp_frm, height=14, bg="#3c3c3c",
+                                    highlightthickness=1,
+                                    highlightbackground="#606060")
+        self._sweep_bar.pack(fill="x", padx=6, pady=(4, 2))
+        self._sweep_bar.bind("<Configure>", lambda _: self._redraw_sweep_bar())
+
+        sstat_row = ttk.Frame(sp_frm)
+        sstat_row.pack(fill="x", padx=6, pady=(0, 4))
+        self._sstat_done  = tk.StringVar(value="Done: —")
+        self._sstat_ok    = tk.StringVar(value="OK: —")
+        for sv in (self._sstat_done, self._sstat_ok):
+            ttk.Label(sstat_row, textvariable=sv).pack(side="left", padx=10)
+        ttk.Button(sstat_row, text="Refresh",
+                   command=self._refresh_status).pack(side="right", padx=6)
+
         # ---- Global progress bar ----
         gp_frm = ttk.LabelFrame(parent, text="Global Progress  (global_results.json)")
-        gp_frm.pack(fill="x", padx=10, pady=(4, 2))
+        gp_frm.pack(fill="x", padx=10, pady=2)
 
         self._global_bar = tk.Canvas(gp_frm, height=14, bg="#3c3c3c",
                                      highlightthickness=1,
@@ -442,26 +480,6 @@ class AutomationTab(ttk.Frame):
         self._append_status = tk.StringVar(value="")
         ttk.Label(gstat_row, textvariable=self._append_status,
                   foreground="#80c8ff", font=("Consolas", 8)).pack(side="right", padx=4)
-
-        # ---- Sweep progress bar ----
-        sp_frm = ttk.LabelFrame(parent, text="Sweep Progress  (current index range)")
-        sp_frm.pack(fill="x", padx=10, pady=2)
-
-        self._sweep_bar = tk.Canvas(sp_frm, height=14, bg="#3c3c3c",
-                                    highlightthickness=1,
-                                    highlightbackground="#606060")
-        self._sweep_bar.pack(fill="x", padx=6, pady=(4, 2))
-        self._sweep_bar.bind("<Configure>", lambda _: self._redraw_sweep_bar())
-
-        sstat_row = ttk.Frame(sp_frm)
-        sstat_row.pack(fill="x", padx=6, pady=(0, 4))
-        self._sstat_done  = tk.StringVar(value="Done: —")
-        self._sstat_ok    = tk.StringVar(value="OK: —")
-        self._sstat_fail  = tk.StringVar(value="Failed: —")
-        for sv in (self._sstat_done, self._sstat_ok, self._sstat_fail):
-            ttk.Label(sstat_row, textvariable=sv).pack(side="left", padx=10)
-        ttk.Button(sstat_row, text="Refresh",
-                   command=self._refresh_status).pack(side="right", padx=6)
 
         # ---- NN trainer — horizontal inline ----
         self._build_nn_panel(parent)
@@ -645,7 +663,7 @@ class AutomationTab(ttk.Frame):
                 self._sweep_status.set(f"Exited (code {rc})")
                 self._log(f"[sweep] Process exited with code {rc}.")
             self._sweep_btn.config(state="normal")
-            self._pause_btn.config(state="disabled")
+            self._pause_btn.config(state="disabled", text="Pause")
             self._refresh_status()
 
     def _check_train_done(self):
@@ -664,43 +682,118 @@ class AutomationTab(ttk.Frame):
             self._stop_train_btn.config(state="disabled")
             self._refresh_nn_status()
 
+    # ================================================================ batch selection
+    def _scan_available_batches(self) -> list:
+        """Return list of available batch numbers (sorted ascending)."""
+        pattern = os.path.join(_SIMDATA_DIR, "lhs_batch_*.json")
+        files = glob.glob(pattern)
+        batches = []
+        for f in files:
+            basename = os.path.basename(f)
+            if basename.startswith("lhs_batch_") and basename.endswith(".json"):
+                try:
+                    n = int(basename[10:-5])
+                    batches.append(n)
+                except (ValueError, IndexError):
+                    pass
+        return sorted(batches)
+
+    def _update_batch_selector(self):
+        """Scan available batches and update the combobox."""
+        batches = self._scan_available_batches()
+        if not batches:
+            self._batch_combobox["values"] = []
+            self._batch_var.set("")
+            self._active_batch_num = None
+            self._batch_status.set("No batches available")
+            return
+
+        options = []
+        for b in batches:
+            samples_path = _batch_samples_path(b)
+            try:
+                with open(samples_path) as f:
+                    data = json.load(f)
+                n_samples = data.get("meta", {}).get("n_samples", 0)
+                options.append(f"Batch {b} ({n_samples:,} samples)")
+            except Exception:
+                options.append(f"Batch {b} (error reading)")
+
+        self._batch_combobox["values"] = options
+
+        if len(batches) == 1:
+            self._active_batch_num = batches[0]
+            self._batch_var.set(options[0])
+        elif batches:
+            self._active_batch_num = batches[-1]
+            self._batch_var.set(options[-1])
+            self._batch_status.set(f"Auto-selected batch {self._active_batch_num}")
+
+    def _on_batch_selected(self):
+        """Called when user selects a batch from the combobox."""
+        selected = self._batch_var.get()
+        if not selected:
+            self._active_batch_num = None
+            return
+        try:
+            batch_num = int(selected.split()[1])
+            self._active_batch_num = batch_num
+            self._batch_status.set(f"Batch {batch_num} loaded")
+            self._refresh_sweep_status()
+            self._refresh_samples_status()
+        except (ValueError, IndexError):
+            pass
+
     # ================================================================ status
     def _refresh_status(self):
         os.makedirs(_SIMDATA_DIR, exist_ok=True)
+        self._update_batch_selector()
         self._refresh_samples_status()
         self._refresh_sweep_status()
         self._refresh_global_status()
         self._refresh_nn_status()
 
     def _refresh_samples_status(self):
-        if os.path.exists(_SAMPLES_FILE):
+        if self._active_batch_num is None:
+            self._gen_status.set("no batch selected")
+            self._n_total_samples = 0
+            return
+
+        samples_path = _batch_samples_path(self._active_batch_num)
+        if os.path.exists(samples_path):
             try:
-                with open(_SAMPLES_FILE) as f:
+                with open(samples_path) as f:
                     d = json.load(f)
                 n = len(d.get("samples", []))
                 self._n_total_samples = n
-                self._gen_status.set(f"{n} samples on disk")
+                self._gen_status.set(f"{n} samples (batch {self._active_batch_num})")
             except Exception:
                 self._gen_status.set("file unreadable")
                 self._n_total_samples = 0
         else:
-            self._gen_status.set("no samples file")
+            self._gen_status.set("sample file not found")
             self._n_total_samples = 0
 
     def _refresh_sweep_status(self):
         self._sweep_covered = set()
         self._sweep_n_range = 0
         self._sweep_n_ok    = 0
-        self._sweep_n_fail  = 0
 
-        if not os.path.exists(_SOLVER_FILE):
+        if self._active_batch_num is None:
             self._sstat_done.set("Done: —")
             self._sstat_ok.set("OK: —")
-            self._sstat_fail.set("Failed: —")
             self._redraw_sweep_bar()
             return
+
+        results_path = _batch_results_path(self._active_batch_num)
+        if not os.path.exists(results_path):
+            self._sstat_done.set("Done: —")
+            self._sstat_ok.set("OK: —")
+            self._redraw_sweep_bar()
+            return
+
         try:
-            with open(_SOLVER_FILE) as f:
+            with open(results_path) as f:
                 d = json.load(f)
         except Exception:
             self._sstat_done.set("Done: (unreadable)")
@@ -714,17 +807,15 @@ class AutomationTab(ttk.Frame):
         n_range  = to_idx - from_idx
 
         covered = set()
-        n_ok = n_fail = 0
+        n_ok = 0
         for r in results:
-            sid = r.get("sample_id")
+            sid = r.get("sample_num")
             if not isinstance(sid, int):
                 continue
-            if from_idx <= sid < to_idx:
+            if from_idx < sid <= to_idx:
                 covered.add(sid)
                 if r.get("ok"):
                     n_ok += 1
-                else:
-                    n_fail += 1
 
         n_done = len(covered)
         self._sweep_covered  = covered
@@ -732,12 +823,10 @@ class AutomationTab(ttk.Frame):
         self._sweep_to_idx   = to_idx
         self._sweep_n_range  = n_range
         self._sweep_n_ok     = n_ok
-        self._sweep_n_fail   = n_fail
 
         pct = f"{100*n_done//n_range}%" if n_range else "—"
         self._sstat_done.set(f"Done: {n_done}/{n_range}  ({pct})")
         self._sstat_ok.set(f"OK: {n_ok}")
-        self._sstat_fail.set(f"Failed: {n_fail}")
         self._redraw_sweep_bar()
 
     def _refresh_global_status(self):
@@ -861,7 +950,7 @@ class AutomationTab(ttk.Frame):
 
         covered = getattr(self, "_sweep_covered", set())
         if covered:
-            in_range = sorted(i for i in covered if run_from <= i < run_to)
+            in_range = sorted(i for i in covered if run_from < i <= run_to)
             if in_range:
                 lo = hi = in_range[0]
                 for idx in in_range[1:]:
@@ -874,7 +963,7 @@ class AutomationTab(ttk.Frame):
                 c.create_rectangle(_x(lo), 1, _x(hi + 1), h - 1,
                                    fill="#4ec94e", outline="")
 
-            outside = sorted(i for i in covered if not (run_from <= i < run_to))
+            outside = sorted(i for i in covered if not (run_from < i <= run_to))
             if outside:
                 lo = hi = outside[0]
                 for idx in outside[1:]:
@@ -915,8 +1004,8 @@ class AutomationTab(ttk.Frame):
             try:
                 cmd = [sys.executable, _GEN_SCRIPT,
                        "--config", cfg_path,
-                       "--out",    _SAMPLES_FILE,
                        "--master", _DOMAIN_FILE,
+                       "--global", _GLOBAL_FILE,
                        "--n",      str(cfg["n_total"])]
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -944,8 +1033,12 @@ class AutomationTab(ttk.Frame):
     def _on_sweep_start(self):
         if self._sweep_proc is not None:
             return
-        if not os.path.exists(_SAMPLES_FILE):
-            self._log("[sweep] ERROR: No samples file — generate first.")
+        if self._active_batch_num is None:
+            self._log("[sweep] ERROR: No batch selected — generate first.")
+            return
+        samples_path = _batch_samples_path(self._active_batch_num)
+        if not os.path.exists(samples_path):
+            self._log("[sweep] ERROR: Sample file not found — select a valid batch.")
             return
         try:
             workers  = int(self._workers_var.get())
@@ -960,9 +1053,11 @@ class AutomationTab(ttk.Frame):
         if os.path.exists(_STOP_FLAG):
             os.remove(_STOP_FLAG)
 
+        results_path = _batch_results_path(self._active_batch_num)
         cmd = [sys.executable, _SWEEP_SCRIPT,
-               "--samples",          _SAMPLES_FILE,
-               "--out",              _SOLVER_FILE,
+               "--samples",          samples_path,
+               "--out",              results_path,
+               "--batch",            str(self._active_batch_num),
                "--workers",          str(workers),
                "--timeout",          str(timeout),
                "--checkpoint-every", str(ckpt),
@@ -982,7 +1077,7 @@ class AutomationTab(ttk.Frame):
 
         self._sweep_status.set("Running…")
         self._sweep_btn.config(state="disabled")
-        self._pause_btn.config(state="normal")
+        self._pause_btn.config(state="normal", text="Pause")
 
         def _drain():
             for line in self._sweep_proc.stdout:
@@ -1009,7 +1104,7 @@ class AutomationTab(ttk.Frame):
             open(_STOP_FLAG, "w").close()
             self._pause_btn.config(text="Cancel Pause")
             self._sweep_status.set("Pausing…")
-            self._log("[sweep] Stop flag set — will pause after current batch.")
+            self._log("[sweep] Stop flag set — finishing active simulations.")
 
     # ================================================================ append
     def _on_append(self):
@@ -1017,14 +1112,23 @@ class AutomationTab(ttk.Frame):
             self._log("[append] Already running.")
             return
 
+        if self._active_batch_num is None:
+            self._log("[append] ERROR: No batch selected.")
+            return
+
+        results_path = _batch_results_path(self._active_batch_num)
+        if not os.path.exists(results_path):
+            self._log(f"[append] ERROR: No results for batch {self._active_batch_num}.")
+            return
+
         self._append_btn.config(state="disabled")
         self._append_status.set("Appending…")
-        self._log("[append] Merging solver_output.json → global_results.json …")
+        self._log(f"[append] Merging batch {self._active_batch_num} → global_results.json …")
 
         def _run():
             try:
                 cmd = [sys.executable, _APPEND_SCRIPT,
-                       "--solver", _SOLVER_FILE,
+                       "--local", results_path,
                        "--global", _GLOBAL_FILE,
                        "--domain", _DOMAIN_FILE]
                 proc = subprocess.Popen(
