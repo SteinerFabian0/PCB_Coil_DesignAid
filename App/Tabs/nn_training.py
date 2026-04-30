@@ -354,6 +354,24 @@ class AutomationTab(ttk.Frame):
         self._n_var = tk.StringVar(value=TOTAL_SAMPLES)
         ttk.Entry(f, textvariable=self._n_var, width=8).pack(anchor="w")
 
+        # Ground circle controls
+        f = ttk.Frame(gr); f.pack(side="left", padx=(0, 10))
+        self._gp_enabled_var = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(f, text="Add ground circles",
+                            variable=self._gp_enabled_var,
+                            command=self._update_gp_state)
+        cb.pack(anchor="w")
+        gp_row = ttk.Frame(f); gp_row.pack(anchor="w", pady=(2, 0))
+        ttk.Label(gp_row, text="Min (mm):").pack(side="left", padx=(20, 2))
+        self._gp_min_var = tk.StringVar(value="10.0")
+        self._gp_min_entry = ttk.Entry(gp_row, textvariable=self._gp_min_var, width=6)
+        self._gp_min_entry.pack(side="left")
+        ttk.Label(gp_row, text="Max (mm):").pack(side="left", padx=(6, 2))
+        self._gp_max_var = tk.StringVar(value="20.0")
+        self._gp_max_entry = ttk.Entry(gp_row, textvariable=self._gp_max_var, width=6)
+        self._gp_max_entry.pack(side="left")
+        self._update_gp_state()
+
         self._gen_btn = ttk.Button(gr, text="Generate Samples",
                                    command=self._on_generate)
         self._gen_btn.pack(side="left", padx=(0, 8))
@@ -698,6 +716,12 @@ class AutomationTab(ttk.Frame):
                     pass
         return sorted(batches)
 
+    def _update_gp_state(self):
+        """Enable/disable ground circle min/max inputs based on checkbox."""
+        state = "normal" if self._gp_enabled_var.get() else "disabled"
+        self._gp_min_entry.config(state=state)
+        self._gp_max_entry.config(state=state)
+
     def _update_batch_selector(self):
         """Scan available batches and update the combobox."""
         batches = self._scan_available_batches()
@@ -1007,6 +1031,13 @@ class AutomationTab(ttk.Frame):
                        "--master", _DOMAIN_FILE,
                        "--global", _GLOBAL_FILE,
                        "--n",      str(cfg["n_total"])]
+                if self._gp_enabled_var.get():
+                    cmd.append("--ground-circle-enabled")
+                    cmd.append("1")
+                    cmd.append("--ground-circle-min")
+                    cmd.append(str(self._gp_min_var.get()))
+                    cmd.append("--ground-circle-max")
+                    cmd.append(str(self._gp_max_var.get()))
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, cwd=_NN_DIR)

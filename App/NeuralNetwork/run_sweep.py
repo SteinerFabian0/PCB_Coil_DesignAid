@@ -82,6 +82,7 @@ def sample_to_simparams(d: dict, timeout_sec: float) -> SimParams:
         freq_ndec=d.get("freq_ndec", 0),
         resolution_mm=d.get("resolution_mm", 1.2),
         timeout_sec=float(timeout_sec),
+        ground_circle_dia_mm=float(d.get("ground_circle_dia_mm", 0.0)),
         tag=d.get("tag", f"S{int(d.get('id', -1)):06d}"),
         sample_id=int(d.get("id", -1)),
     )

@@ -94,6 +94,7 @@ class SimParams:
     freq_ndec:     int   = 1
     resolution_mm: float = 1.0
     timeout_sec:   float = 240.0   # 4 minutes — 2-port sims are heavier
+    ground_circle_dia_mm: float = 0.0  # ground plane diameter; 0 = disabled
 
     tag:     str = ""
     sample_id: int = -1
@@ -162,6 +163,7 @@ def _write_inp(p: SimParams, inp_path: str) -> None:
         tx_nhinc=p.tx_nhinc, tx_nwinc=p.tx_nwinc,
         rx_nhinc=p.rx_nhinc, rx_nwinc=p.rx_nwinc,
         fmin=p.fmin_hz, fmax=p.fmax_hz, freq_ndec=p.freq_ndec,
+        ground_circle_dia_mm=p.ground_circle_dia_mm,
     )
 
 
@@ -291,6 +293,7 @@ def _parse_result(zc_path: str, p: SimParams) -> dict:
         "rx_port_inside":  p.rx_port_inside,
         "rx_layers":       p.rx_layers,
         "pcb_gap_mm":      p.pcb_gap_mm,
+        "ground_circle_dia_mm": p.ground_circle_dia_mm,
     }
 
 

@@ -740,6 +740,7 @@ def write_combined_tx_rx_inp(
     tx_nhinc=None, tx_nwinc=None,
     rx_nhinc=None, rx_nwinc=None,
     fmin=1.1e5, fmax=1.4e5, freq_ndec=1,
+    ground_circle_dia_mm=0.0,
 ):
     """
     Emit a single FastHenry .inp containing both TX (port 1) and RX (port 2)
@@ -797,6 +798,25 @@ def write_combined_tx_rx_inp(
         f.write("\n* --- RX conductors ---\n")
         f.write(rx_edges)
         f.write("\n")
+
+        if ground_circle_dia_mm > 0:
+            from ground_plane import GroundPlaneParams, ground_plane_inp_block
+
+            # TX ground circle at layer 3 (index 2) z-position
+            tx_layer_zs = [ld["z"] for ld in tx_layer_data]
+            if len(tx_layer_zs) > 2:
+                tx_gp_z = tx_layer_zs[2]
+                tx_gp = GroundPlaneParams(dia_mm=ground_circle_dia_mm, z_mm=tx_gp_z)
+                f.write(ground_plane_inp_block(tx_gp, node_offset=100_000, edge_offset=100_000))
+                f.write("\n")
+
+            # RX ground circle at layer 2 (index 1) z-position
+            rx_layer_zs = [ld["z"] for ld in rx_shifted]
+            if len(rx_layer_zs) > 1:
+                rx_gp_z = rx_layer_zs[1]
+                rx_gp = GroundPlaneParams(dia_mm=ground_circle_dia_mm, z_mm=rx_gp_z)
+                f.write(ground_plane_inp_block(rx_gp, node_offset=110_000, edge_offset=110_000))
+                f.write("\n")
 
         f.write(f"* Port 1 = TX\n")
         f.write(f".external N{tx_ps} N{tx_pe}\n")

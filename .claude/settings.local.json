@@ -12,7 +12,10 @@
       "Bash(python -c \"import json; d=json.load\\(open\\('App/SimulationData/lhs_samples.json'\\)\\); s=d['samples'][0] if isinstance\\(d,dict\\) else d[0]; print\\(list\\(s.keys\\(\\)\\)\\); print\\(s\\)\")",
       "Bash(python -c \"import ast, sys; src=open\\('App/Tabs/automation_nn_tab.py'\\).read\\(\\); ast.parse\\(src\\); print\\('Syntax OK'\\)\")",
       "Bash(python -c \"import ast; src=open\\('App/Tabs/automation_nn_tab.py', encoding='utf-8'\\).read\\(\\); ast.parse\\(src\\); print\\('Syntax OK'\\)\")",
-      "Bash(xargs ls *)"
+      "Bash(xargs ls *)",
+      "Bash(python -c \"import parametric_coil as pc; print\\('parametric_coil imported successfully'\\)\")",
+      "Bash(python -m py_compile App/NeuralNetwork/parallel_sim.py App/NeuralNetwork/run_sweep.py App/NeuralNetwork/generate_lhs_samples.py App/NeuralNetwork/train_surrogate.py)",
+      "Bash(python -m py_compile App/Tabs/nn_training.py App/Tabs/sim_tab.py)"
     ]
   }
 }

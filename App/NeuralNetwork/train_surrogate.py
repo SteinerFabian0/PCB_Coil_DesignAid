@@ -60,6 +60,7 @@ BASE_INPUT_COLS = [
     "tx_spacing_mm", "rx_spacing_mm",
     "tx_outer_gap_mm", "tx_inner_gap_mm",
     "rx_outer_gap_mm", "rx_inner_gap_mm",
+    "ground_circle_dia_mm",
 ]
  
 # Analytical features added during append step (one set each for TX and RX).

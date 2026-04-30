@@ -137,6 +137,18 @@ class SimTab(ttk.Frame):
         self.pcb_gap_var.trace_add(
             "write",
             lambda *_a: (self._save_state(), self._redraw_stackup()))
+
+        # Ground plane diameter
+        ttk.Label(gf, text="Ground plane dia (mm):").pack(side="left", padx=(16, 0))
+        self.gp_dia_var = tk.StringVar(value="0")
+        ttk.Entry(gf, textvariable=self.gp_dia_var, width=6).pack(
+            side="left", padx=4)
+        ttk.Label(gf, text="(0 = none)", foreground="gray", font=("", 8)).pack(
+            side="left", padx=(0, 4))
+        self.gp_dia_var.trace_add(
+            "write",
+            lambda *_a: self._save_state())
+
         self._update_gap_visibility()
 
         # Row 2: solver settings.
@@ -569,6 +581,8 @@ class SimTab(ttk.Frame):
             port_combiner.combine_two_port(
                 self._inp_paths[0], self._inp_paths[1], run_path,
                 pcb_gap_mm=gap)
+            # Append ground plane if configured
+            self._append_ground_plane(run_path)
         elif self._sources[0]:
             shutil.copyfile(self._inp_paths[0], run_path)
         elif self._sources[1]:
@@ -576,6 +590,73 @@ class SimTab(ttk.Frame):
         else:
             raise RuntimeError("No coil source registered")
         return run_path
+
+    def _append_ground_plane(self, run_path: str) -> None:
+        """Inject passive ground plane mesh into an existing combined .inp."""
+        try:
+            dia = float(self.gp_dia_var.get())
+        except ValueError:
+            return
+        if dia <= 0:
+            return
+
+        import sys
+        _APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _MODULES_DIR = os.path.join(_APP_ROOT, "Modules")
+        if _MODULES_DIR not in sys.path:
+            sys.path.insert(0, _MODULES_DIR)
+
+        from ground_plane import GroundPlaneParams, ground_plane_inp_block
+
+        with open(run_path, "r") as f:
+            content = f.read()
+
+        # Extract layer z-positions from the already-written .inp node declarations.
+        # Sections are marked by "* --- TX nodes ---" and "* --- RX nodes ---" comments.
+        import re as _re
+        _node_re = _re.compile(r"^N\d+\s+x=[^\s]+\s+y=[^\s]+\s+z=([^\s]+)", _re.MULTILINE)
+
+        def _layer_zs_in_section(text_block):
+            zs = sorted({round(float(m.group(1)), 6) for m in _node_re.finditer(text_block)})
+            return zs
+
+        tx_sec_start = content.find("* --- TX nodes ---")
+        rx_sec_start = content.find("* --- RX nodes ---")
+
+        tx_zs, rx_zs = [], []
+        if tx_sec_start != -1 and rx_sec_start != -1:
+            tx_zs = _layer_zs_in_section(content[tx_sec_start:rx_sec_start])
+            # RX section ends at the first non-node section (conductors comment)
+            rx_sec_end = content.find("* --- TX conductors ---", rx_sec_start)
+            if rx_sec_end == -1:
+                rx_sec_end = content.find("* --- RX conductors ---", rx_sec_start)
+            rx_block = content[rx_sec_start: rx_sec_end if rx_sec_end != -1 else len(content)]
+            rx_zs = _layer_zs_in_section(rx_block)
+
+        # TX ground sits between TX layers 3 and 4 → use index 2 (0-based) if available.
+        # RX ground sits between RX layers 1 and 2 → use index 1 (0-based) if available.
+        tx_gp_z = tx_zs[2] if len(tx_zs) > 2 else (tx_zs[-1] if tx_zs else 1.5)
+        rx_gp_z = rx_zs[1] if len(rx_zs) > 1 else (rx_zs[0] if rx_zs else 4.3)
+
+        tx_gp = GroundPlaneParams(dia_mm=dia, z_mm=tx_gp_z)
+        rx_gp = GroundPlaneParams(dia_mm=dia, z_mm=rx_gp_z)
+
+        tx_block = ground_plane_inp_block(tx_gp, node_offset=100_000, edge_offset=100_000)
+        rx_block = ground_plane_inp_block(rx_gp, node_offset=110_000, edge_offset=110_000)
+
+        # Insert both blocks before the final .end directive
+        insert_before = "\n.end\n"
+        idx = content.rfind(insert_before)
+        if idx == -1:
+            # Fallback: append before end of file
+            new_content = (content.rstrip() + "\n\n* --- Ground planes ---\n"
+                          + tx_block + "\n" + rx_block + "\n.end\n")
+        else:
+            new_content = (content[:idx] + "\n* --- Ground planes ---\n"
+                          + tx_block + "\n" + rx_block + insert_before)
+
+        with open(run_path, "w", newline="\n") as f:
+            f.write(new_content)
 
     def _worker(self, inp_path, max_iter, tol, target_f):
         try:
@@ -853,6 +934,7 @@ class SimTab(ttk.Frame):
         self.freq_var.set(self.DEFAULT_FREQ)
         self.maxiter_var.set(""); self.tol_var.set("")
         self.pcb_gap_var.set("2.5")
+        self.gp_dia_var.set("0")
         self.cap_tx.var.set(""); self.cap_tx.combo_var.set("")
         self.cap_rx.var.set(""); self.cap_rx.combo_var.set("")
         self._rx_ncaps_var.set("1")
@@ -873,6 +955,7 @@ class SimTab(ttk.Frame):
             "max_iter":     self.maxiter_var.get(),
             "tol":          self.tol_var.get(),
             "pcb_gap":      self.pcb_gap_var.get(),
+            "gp_dia":       self.gp_dia_var.get(),
             "c_tx":         self.cap_tx.var.get(),
             "c_rx":         self.cap_rx.var.get(),
             "v_min":        self.v_min_var.get(),
@@ -891,6 +974,7 @@ class SimTab(ttk.Frame):
             self.maxiter_var.set(st.get("max_iter", ""))
             self.tol_var.set(st.get("tol", ""))
             self.pcb_gap_var.set(st.get("pcb_gap", "2.5"))
+            self.gp_dia_var.set(st.get("gp_dia", "0"))
             self.cap_tx.var.set(st.get("c_tx", ""))
             self.cap_rx.var.set(st.get("c_rx", ""))
             self.v_min_var.set(st.get("v_min", "3.3"))

@@ -103,6 +103,7 @@ def sample_uuid(sample: dict) -> str:
         "rx_spacing_mm", "rx_outer_gap_mm", "rx_inner_gap_mm", "rx_topology",
         "rx_port_inside", "rx_layers", "pcb_gap_mm", "resolution_mm",
         "freq_hz", "nhinc", "nwinc", "rx_nhinc", "rx_nwinc",
+        "ground_circle_dia_mm",
     ]
     canonical = {k: sample[k] for k in SIM_KEYS if k in sample}
     payload = json.dumps(canonical, sort_keys=True, default=str).encode()
@@ -251,7 +252,7 @@ def _build_layers(selected: list, inner_oz: float, outer_oz: float) -> list:
 #   20 tx_port_inside       (categorical)
 #   21 rx_port_inside       (categorical)
 
-_LHS_DIMS = 22
+_LHS_DIMS = 22  # Note: ground_circle is expanded after LHS generation, not a 23rd dimension
  
  
 def _decode(u_row, cfg):
@@ -309,8 +310,16 @@ def _decode(u_row, cfg):
  
  
 def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
-                     oversample: int = 8, log=print) -> list:
-    """Return up to *n_total* feasible sample dicts (deterministic)."""
+                     oversample: int = 8, log=print,
+                     ground_circle_enabled: bool = False,
+                     ground_circle_min_mm: float = 10.0,
+                     ground_circle_max_mm: float = 20.0) -> list:
+    """Return up to *n_total* feasible sample dicts (deterministic).
+
+    If ground_circle_enabled=True, each base sample is expanded into
+    (max_mm - min_mm + 1) copies, one per 1mm diameter step.
+    Total output = n_total * (max_mm - min_mm + 1) when enabled.
+    """
     cfg = canonicalize(cfg)
     n_candidates = max(n_total * oversample, n_total + 100)
     sampler = qmc.LatinHypercube(d=_LHS_DIMS, seed=seed)
@@ -384,15 +393,36 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
             "nhinc":            cfg["tx"]["nhinc"],
             "nwinc":            cfg["tx"]["nwinc"],
             "rx_nhinc":         cfg["rx"]["nhinc"],
-            "rx_nwinc":         cfg["rx"]["nwinc"],
             "tx_nwinc":         tx_nwinc,
             "rx_nwinc":         rx_nwinc,
+            # Ground plane (always included; may be 0)
+            "ground_circle_dia_mm": 0.0,
         }
         sample["uuid"] = sample_uuid(sample)
         valid.append(sample)
  
     log(f"LHS: {len(valid)} valid / {rejected} rejected "
         f"out of {n_candidates} candidates")
+
+    # Expand samples by ground circle diameter if enabled
+    if ground_circle_enabled:
+        diameters = list(range(int(ground_circle_min_mm), int(ground_circle_max_mm) + 1))
+        if not diameters:
+            log(f"WARNING: ground_circle_min ({ground_circle_min_mm}) > ground_circle_max "
+                f"({ground_circle_max_mm}) — ground circle expansion skipped")
+        else:
+            n_base = len(valid)
+            expanded = []
+            for sample in valid:
+                for dia in diameters:
+                    new_sample = sample.copy()
+                    new_sample["ground_circle_dia_mm"] = float(dia)
+                    new_sample["uuid"] = sample_uuid(new_sample)
+                    expanded.append(new_sample)
+            valid = expanded
+            log(f"Ground circles enabled: expanded {n_base} base samples "
+                f"× {len(diameters)} diameters = {len(valid)} total samples")
+
     return valid
 
 
@@ -499,6 +529,12 @@ def main() -> int:
                         help="Path to global_results.json for batch tracking")
     parser.add_argument("--n", type=int, default=None,
                         help="Override total sample count from config")
+    parser.add_argument("--ground-circle-enabled", type=int, default=0,
+                        help="1 = expand samples by ground circle diameter, 0 = no ground circle")
+    parser.add_argument("--ground-circle-min", type=float, default=10.0,
+                        help="Minimum ground circle diameter (mm)")
+    parser.add_argument("--ground-circle-max", type=float, default=20.0,
+                        help="Maximum ground circle diameter (mm)")
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -508,7 +544,12 @@ def main() -> int:
         return 2
 
     batch_num = _next_batch_number(args.global_)
-    samples = generate_samples(cfg, n_total)
+    samples = generate_samples(
+        cfg, n_total,
+        ground_circle_enabled=bool(args.ground_circle_enabled),
+        ground_circle_min_mm=args.ground_circle_min,
+        ground_circle_max_mm=args.ground_circle_max,
+    )
     if not samples:
         print("ERROR: no feasible samples — check the domain config", file=sys.stderr)
         return 3
