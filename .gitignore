@@ -12,3 +12,4 @@ temp/Zc.mat
 /App/NeuralNetwork/__pycache__
 App/SimulationData/solver_output.json
 App/SimulationData/results_batch_1.json
+/tools

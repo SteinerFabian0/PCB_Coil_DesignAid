@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Wrapper around FastHenry2's OLE Automation interface.
+FastHenry runner — cross-platform.
 
-Starts the FastHenry2 COM object (console window stays hidden), runs a
-simulation, polls for completion, and pulls results directly without
-touching Zc.mat. Zc.mat still lands on disk - we optionally copy it out
-to the user's requested location.
+Windows default: wraps FastHenry2's OLE Automation (COM) interface.
+Linux mode:      subprocess call to the native fasthenry binary.
 
-Requires pywin32:  pip install pywin32
-
-The API is Windows-only. On other platforms this module will import
-but fail at dispatch time.
+Set  FASTHENRY_BACKEND=linux  (or pass --linux to master.pyw) to use the
+subprocess backend.  FASTHENRY_BIN overrides the binary name (default:
+"fasthenry").
 """
 
 import os
 import time
 
 
-# Imported lazily so the module can at least be imported on non-Windows
-# systems for test discovery etc.
+def _use_linux():
+    return os.environ.get("FASTHENRY_BACKEND", "").lower() == "linux"
+
+
+# Windows COM helpers — imported lazily so the module is importable on Linux.
 _win32com = None
 
 
@@ -92,10 +92,76 @@ def _extract_single_port_scalar(matrix_3d, freq_index):
 
 
 # -------------------------------------------------------------------------
-# The runner
+# Linux subprocess runner
 # -------------------------------------------------------------------------
 
-class FastHenryRunner:
+class LinuxFastHenryRunner:
+    """Native subprocess runner for Linux FastHenry installations."""
+
+    POLL_INTERVAL_SEC = 0.5
+    DEFAULT_TIMEOUT_SEC = 60 * 30
+
+    def __init__(self):
+        self._work_dir = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def run(self, inp_path, max_iter=None, tol=None, extra_args=None,
+            timeout_sec=DEFAULT_TIMEOUT_SEC, progress_cb=None):
+        import subprocess
+
+        self._work_dir = os.path.dirname(os.path.abspath(inp_path))
+        bin_name = os.environ.get("FASTHENRY_BIN", "fasthenry")
+
+        cmd = [bin_name]
+        if max_iter is not None:
+            cmd.append(f"-i{int(max_iter)}")
+        if tol is not None:
+            cmd.append(f"-t{tol:g}")
+        cmd.append(inp_path)
+
+        proc = subprocess.Popen(
+            cmd, cwd=self._work_dir,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+        t0 = time.time()
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                return ret == 0
+            elapsed = time.time() - t0
+            if elapsed > timeout_sec:
+                proc.terminate()
+                return False
+            if progress_cb is not None:
+                try:
+                    progress_cb(elapsed)
+                except Exception:
+                    pass
+            time.sleep(self.POLL_INTERVAL_SEC)
+
+    def export_zc_mat(self, dest_path):
+        import shutil
+        if self._work_dir is None:
+            raise RuntimeError("No simulation has been run yet")
+        src = os.path.join(self._work_dir, "Zc.mat")
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"Zc.mat not found in {self._work_dir}")
+        if os.path.abspath(src) == os.path.abspath(dest_path):
+            return
+        shutil.copyfile(src, dest_path)
+
+
+# -------------------------------------------------------------------------
+# Windows COM runner
+# -------------------------------------------------------------------------
+
+class _WinFastHenryRunner:
     """
     Context-manager-friendly wrapper.
 
@@ -253,3 +319,14 @@ class FastHenryRunner:
         if os.path.abspath(src) == os.path.abspath(dest_path):
             return
         shutil.copyfile(src, dest_path)
+
+
+# -------------------------------------------------------------------------
+# Public factory — call sites use FastHenryRunner() unchanged
+# -------------------------------------------------------------------------
+
+def FastHenryRunner():
+    """Return the right runner for the active backend."""
+    if _use_linux():
+        return LinuxFastHenryRunner()
+    return _WinFastHenryRunner()

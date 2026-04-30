@@ -172,39 +172,52 @@ def _write_inp(p: SimParams, inp_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _run_fasthenry(inp_path: str, p: SimParams) -> str:
-    import pythoncom
-    import win32com.client as w32c
+    work_dir = os.path.dirname(os.path.abspath(inp_path))
 
-    pythoncom.CoInitialize()
-    fh = w32c.Dispatch("FastHenry2.Document")
-    try:
-        # Do NOT pass -i. FastHenry's default iteration cap is correct;
-        # overriding it with any value (even a large one) triggers a C-style
-        # argv bug in the solver that zeros the cap and produces all-NaN output.
-        cmdline = f'"{inp_path}"'
-
-        started = fh.Run(cmdline)
-        if not started:
-            raise RuntimeError("FastHenry2.Run() returned False")
-
+    if os.environ.get("FASTHENRY_BACKEND", "").lower() == "linux":
+        import subprocess
+        bin_name = os.environ.get("FASTHENRY_BIN", "fasthenry")
+        proc = subprocess.Popen(
+            [bin_name, inp_path],
+            cwd=work_dir,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
         t0 = time.time()
-        while fh.IsRunning:
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                break
             if time.time() - t0 > p.timeout_sec:
-                try:
-                    fh.Stop()
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"FastHenry timed out after {p.timeout_sec:.0f}s"
-                )
+                proc.terminate()
+                raise RuntimeError(f"FastHenry timed out after {p.timeout_sec:.0f}s")
             time.sleep(0.25)
-    finally:
-        try:
-            fh.Quit
-        except Exception:
-            pass
+    else:
+        import pythoncom
+        import win32com.client as w32c
 
-    zc_path = os.path.join(os.path.dirname(inp_path), "Zc.mat")
+        pythoncom.CoInitialize()
+        fh = w32c.Dispatch("FastHenry2.Document")
+        try:
+            cmdline = f'"{inp_path}"'
+            started = fh.Run(cmdline)
+            if not started:
+                raise RuntimeError("FastHenry2.Run() returned False")
+            t0 = time.time()
+            while fh.IsRunning:
+                if time.time() - t0 > p.timeout_sec:
+                    try:
+                        fh.Stop()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"FastHenry timed out after {p.timeout_sec:.0f}s")
+                time.sleep(0.25)
+        finally:
+            try:
+                fh.Quit
+            except Exception:
+                pass
+
+    zc_path = os.path.join(work_dir, "Zc.mat")
     if not os.path.exists(zc_path):
         raise FileNotFoundError("Zc.mat not produced by FastHenry")
     return zc_path

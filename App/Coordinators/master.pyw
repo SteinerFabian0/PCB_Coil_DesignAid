@@ -9,6 +9,18 @@ import os, sys, glob, shutil
 import tkinter as tk
 from tkinter import ttk
 
+# Must be set before any runner import so child processes inherit it too.
+_LINUX_MODE = "--linux" in sys.argv
+if _LINUX_MODE:
+    os.environ["FASTHENRY_BACKEND"] = "linux"
+    sys.argv.remove("--linux")
+
+# Scale factor applied to all tkinter fonts, window geometry, and fixed pixel
+# widths on Linux. Increase if widgets are still too small, decrease if overflow.
+LINUX_SCALE = 1.75
+if _LINUX_MODE:
+    os.environ["COIL_GUI_SCALE"] = str(LINUX_SCALE)
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _APP_ROOT = os.path.dirname(_HERE)
 _MODULES_DIR = os.path.join(_APP_ROOT, "Modules")
@@ -53,7 +65,11 @@ class CoilApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Coil2Inductor")
-        self.geometry("1600x850")
+        if _LINUX_MODE:
+            self.tk.call("tk", "scaling", LINUX_SCALE)
+            self.geometry(f"{int(1600 * LINUX_SCALE)}x{int(850 * LINUX_SCALE)}")
+        else:
+            self.geometry("1600x850")
 
         # Load savestate once, keep in memory; writes go through helpers.
         self._state = savestate.load(PROJECT_ROOT)

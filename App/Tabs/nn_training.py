@@ -50,8 +50,10 @@ POLL_MS = 400
 
 _LAYER_LABELS = ["L1 (outer)", "L2 (inner)", "L3 (inner)", "L4 (outer)"]
 
-# Fixed pixel width for TX and RX panels
-_SIDE_WIDTH = 260
+_GUI_SCALE = float(os.environ.get("COIL_GUI_SCALE", "1.0"))
+
+# Fixed pixel width for TX and RX panels — scaled on Linux
+_SIDE_WIDTH = int(260 * _GUI_SCALE)
 
 # ---------------------------------------------------------------------------
 # Default values for all input fields  — edit here to change startup defaults
@@ -176,7 +178,7 @@ class AutomationTab(ttk.Frame):
 
         def _on_cfg_frame(_):
             cfg_canvas.configure(scrollregion=cfg_canvas.bbox("all"))
-            h = min(cfg_inner.winfo_reqheight(), 520)
+            h = min(cfg_inner.winfo_reqheight(), int(520 * _GUI_SCALE))
             cfg_canvas.configure(height=h)
 
         cfg_canvas.bind("<Configure>", _on_cfg_resize)
