@@ -30,7 +30,6 @@ _SWEEP_SCRIPT  = os.path.join(_NN_DIR, "run_sweep.py")
 _APPEND_SCRIPT = os.path.join(_NN_DIR, "append_results.py")
 _TRAIN_SCRIPT  = os.path.join(_NN_DIR, "train_surrogate.py")
 
-_DOMAIN_FILE  = os.path.join(_SIMDATA_DIR, "domain_master.json")
 _GLOBAL_FILE  = os.path.join(_SIMDATA_DIR, "global_results.json")
 _STOP_FLAG    = os.path.join(_SIMDATA_DIR, "STOP_SWEEP")
 _MODEL_FILE   = os.path.join(_NN_DIR, "surrogate_model.pth")
@@ -41,6 +40,9 @@ def _batch_samples_path(n: int) -> str:
 
 def _batch_results_path(n: int) -> str:
     return os.path.join(_SIMDATA_DIR, f"results_batch_{n}.json")
+
+def _batch_domain_path(n: int) -> str:
+    return os.path.join(_SIMDATA_DIR, f"domain_batch_{n}.json")
 
 for _p in (_NN_DIR, _MODULES_DIR):
     if _p not in sys.path:
@@ -393,9 +395,12 @@ class AutomationTab(ttk.Frame):
                                              state="readonly", width=30)
         self._batch_combobox.pack(side="left", padx=(0, 6))
         self._batch_combobox.bind("<<ComboboxSelected>>", lambda _: self._on_batch_selected())
+        self._delete_batch_btn = ttk.Button(batch_row, text="Delete Batch",
+                                            command=self._on_delete_batch)
+        self._delete_batch_btn.pack(side="left", padx=(6, 0))
         self._batch_status = tk.StringVar(value="—")
         ttk.Label(batch_row, textvariable=self._batch_status,
-                  foreground="gray", font=("Consolas", 8)).pack(side="left")
+                  foreground="gray", font=("Consolas", 8)).pack(side="left", padx=(8, 0))
 
         sw_row = ttk.Frame(sw_frm)
         sw_row.pack(fill="x", padx=6, pady=(0, 2))
@@ -480,6 +485,7 @@ class AutomationTab(ttk.Frame):
         # ---- Global progress bar ----
         gp_frm = ttk.LabelFrame(parent, text="Global Progress  (global_results.json)")
         gp_frm.pack(fill="x", padx=10, pady=2)
+        self._gp_frm = gp_frm
 
         self._global_bar = tk.Canvas(gp_frm, height=14, bg="#3c3c3c",
                                      highlightthickness=1,
@@ -770,6 +776,77 @@ class AutomationTab(ttk.Frame):
         except (ValueError, IndexError):
             pass
 
+    def _on_delete_batch(self):
+        """Delete the currently selected batch and all associated files."""
+        import tkinter.messagebox as mb
+
+        bn = self._active_batch_num
+        if bn is None:
+            mb.showwarning("Delete Batch", "No batch selected.")
+            return
+
+        if self._sweep_proc is not None:
+            mb.showwarning("Delete Batch",
+                           "A sweep is running. Stop it before deleting a batch.")
+            return
+
+        files_to_delete = []
+        for path_fn in (_batch_samples_path, _batch_results_path, _batch_domain_path):
+            p = path_fn(bn)
+            if os.path.exists(p):
+                files_to_delete.append(os.path.basename(p))
+
+        file_list = "\n  ".join(files_to_delete) if files_to_delete else "(none found on disk)"
+        msg = (f"Delete Batch {bn}?\n\n"
+               f"Files to remove:\n  {file_list}\n\n"
+               f"Results for batch {bn} will also be removed from global_results.json.\n\n"
+               "This cannot be undone.")
+        if not mb.askyesno("Confirm Delete", msg, icon="warning"):
+            return
+
+        # Delete files
+        for path_fn in (_batch_samples_path, _batch_results_path, _batch_domain_path):
+            p = path_fn(bn)
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError as exc:
+                self._log(f"[delete] WARNING: could not remove {p}: {exc}")
+
+        # Remove from global_results.json
+        if os.path.exists(_GLOBAL_FILE):
+            try:
+                with open(_GLOBAL_FILE) as f:
+                    gdata = json.load(f)
+
+                # Strip results belonging to this batch
+                gdata["results"] = [
+                    r for r in gdata.get("results", [])
+                    if r.get("batch") != bn
+                ]
+
+                # Remove batch from meta
+                meta = gdata.setdefault("meta", {})
+                lhs_batches = meta.get("lhs_batches", {})
+                lhs_batches.pop(str(bn), None)
+                meta["lhs_batches"] = lhs_batches
+
+                # Recompute n_lhs_batches as max remaining key
+                remaining_keys = [int(k) for k in lhs_batches]
+                meta["n_lhs_batches"] = max(remaining_keys) if remaining_keys else 0
+                meta["n_results"] = len(gdata["results"])
+
+                tmp = _GLOBAL_FILE + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(gdata, f, indent=2, default=str)
+                os.replace(tmp, _GLOBAL_FILE)
+            except Exception as exc:
+                self._log(f"[delete] ERROR updating global_results.json: {exc}")
+
+        self._log(f"[delete] Batch {bn} deleted.")
+        self._active_batch_num = None
+        self._refresh_status()
+
     # ================================================================ status
     def _refresh_status(self):
         os.makedirs(_SIMDATA_DIR, exist_ok=True)
@@ -859,10 +936,48 @@ class AutomationTab(ttk.Frame):
         self._covered_global = set()
         n_ok = 0
         n_target = 0
+        bn = self._active_batch_num
 
-        if os.path.exists(_DOMAIN_FILE):
+        if os.path.exists(_GLOBAL_FILE):
             try:
-                with open(_DOMAIN_FILE) as f:
+                with open(_GLOBAL_FILE) as f:
+                    d = json.load(f)
+                lhs_batches = d.get("meta", {}).get("lhs_batches", {})
+
+                if bn is not None:
+                    # Scope to the selected batch only
+                    n_target = int(lhs_batches.get(str(bn), {}).get("n_samples", 0))
+                    for r in d.get("results", []):
+                        if r.get("batch") != bn:
+                            continue
+                        sid = r.get("sample_id")
+                        if isinstance(sid, int) and sid >= 0:
+                            self._covered_global.add(sid)
+                            if r.get("ok"):
+                                n_ok += 1
+                else:
+                    # No batch selected — show all batches combined with offsets
+                    cumulative = 0
+                    batch_offsets = {}
+                    for batch_key in sorted(lhs_batches, key=lambda k: int(k)):
+                        b = int(batch_key)
+                        batch_offsets[b] = cumulative
+                        cumulative += int(lhs_batches[batch_key].get("n_samples", 0))
+                    n_target = cumulative
+                    for r in d.get("results", []):
+                        sid = r.get("sample_id")
+                        batch = r.get("batch", 1)
+                        if isinstance(sid, int) and sid >= 0:
+                            self._covered_global.add(batch_offsets.get(batch, 0) + sid)
+                            if r.get("ok"):
+                                n_ok += 1
+            except Exception:
+                pass
+
+        # Fallback: domain file for selected batch
+        if n_target == 0 and bn is not None:
+            try:
+                with open(_batch_domain_path(bn)) as f:
                     dm = json.load(f)
                 n_target = int(dm.get("n_total", 0))
             except Exception:
@@ -873,20 +988,10 @@ class AutomationTab(ttk.Frame):
 
         self._n_target = n_target
 
-        if os.path.exists(_GLOBAL_FILE):
-            try:
-                with open(_GLOBAL_FILE) as f:
-                    d = json.load(f)
-                for r in d.get("results", []):
-                    sid = r.get("sample_id")
-                    if isinstance(sid, int) and sid >= 0:
-                        self._covered_global.add(sid)
-                        if r.get("ok"):
-                            n_ok += 1
-            except Exception:
-                pass
-
-        self._gstat_ok.set(f"Global OK: {n_ok}")
+        batch_label = f"Batch {bn}" if bn is not None else "all batches"
+        self._gp_frm.configure(
+            text=f"Global Progress — {batch_label}  (global_results.json)")
+        self._gstat_ok.set(f"OK in global: {n_ok}")
         self._gstat_total.set(f"Target: {n_target}")
         self._redraw_global_bar()
 
@@ -1030,7 +1135,6 @@ class AutomationTab(ttk.Frame):
             try:
                 cmd = [sys.executable, _GEN_SCRIPT,
                        "--config", cfg_path,
-                       "--master", _DOMAIN_FILE,
                        "--global", _GLOBAL_FILE,
                        "--n",      str(cfg["n_total"])]
                 if self._gp_enabled_var.get():
@@ -1163,7 +1267,7 @@ class AutomationTab(ttk.Frame):
                 cmd = [sys.executable, _APPEND_SCRIPT,
                        "--local", results_path,
                        "--global", _GLOBAL_FILE,
-                       "--domain", _DOMAIN_FILE]
+                       "--domain", _batch_domain_path(self._active_batch_num)]
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, cwd=_NN_DIR)

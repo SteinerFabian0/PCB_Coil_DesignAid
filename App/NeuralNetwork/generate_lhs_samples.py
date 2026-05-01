@@ -310,24 +310,39 @@ def _decode(u_row, cfg):
  
  
 def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
-                     oversample: int = 8, log=print,
+                     oversample: int = 32, log=print,
                      ground_circle_enabled: bool = False,
                      ground_circle_min_mm: float = 10.0,
                      ground_circle_max_mm: float = 20.0) -> list:
     """Return up to *n_total* feasible sample dicts (deterministic).
 
-    If ground_circle_enabled=True, each base sample is expanded into
-    (max_mm - min_mm + 1) copies, one per 1mm diameter step.
-    Total output = n_total * (max_mm - min_mm + 1) when enabled.
+    If ground_circle_enabled=True, each base sample is expanded into 3 copies
+    (min, mid, max diameter).  n_total base samples are divided by 3 so the
+    total output stays approximately n_total.
     """
+    # Determine ground circle diameters up front so we can size n_base correctly.
+    if ground_circle_enabled:
+        if ground_circle_max_mm <= ground_circle_min_mm:
+            gc_diameters = [float(ground_circle_min_mm)]
+        else:
+            span = ground_circle_max_mm - ground_circle_min_mm
+            gc_diameters = [
+                round(ground_circle_min_mm + span * t, 1)
+                for t in (0.0, 1/3, 2/3, 1.0)
+            ]
+        n_base = max(1, round(n_total / len(gc_diameters)))
+    else:
+        gc_diameters = []
+        n_base = n_total
+
     cfg = canonicalize(cfg)
-    n_candidates = max(n_total * oversample, n_total + 100)
+    n_candidates = max(n_base * oversample, n_base + 100)
     sampler = qmc.LatinHypercube(d=_LHS_DIMS, seed=seed)
     raw = sampler.random(n_candidates)
- 
+
     valid, rejected = [], 0
-    for i, row in enumerate(raw):
-        if len(valid) >= n_total:
+    for row in raw:
+        if len(valid) >= n_base:
             break
         c = _decode(row, cfg)
 
@@ -405,23 +420,19 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
         f"out of {n_candidates} candidates")
 
     # Expand samples by ground circle diameter if enabled
-    if ground_circle_enabled:
-        diameters = list(range(int(ground_circle_min_mm), int(ground_circle_max_mm) + 1))
-        if not diameters:
-            log(f"WARNING: ground_circle_min ({ground_circle_min_mm}) > ground_circle_max "
-                f"({ground_circle_max_mm}) — ground circle expansion skipped")
-        else:
-            n_base = len(valid)
-            expanded = []
-            for sample in valid:
-                for dia in diameters:
-                    new_sample = sample.copy()
-                    new_sample["ground_circle_dia_mm"] = float(dia)
-                    new_sample["uuid"] = sample_uuid(new_sample)
-                    expanded.append(new_sample)
-            valid = expanded
-            log(f"Ground circles enabled: expanded {n_base} base samples "
-                f"× {len(diameters)} diameters = {len(valid)} total samples")
+    if ground_circle_enabled and gc_diameters:
+        n_base_actual = len(valid)
+        expanded = []
+        for sample in valid:
+            for dia in gc_diameters:
+                new_sample = sample.copy()
+                new_sample["ground_circle_dia_mm"] = float(dia)
+                new_sample["tag"] = f"{sample['tag']}-D{dia:.0f}"
+                new_sample["uuid"] = sample_uuid(new_sample)
+                expanded.append(new_sample)
+        valid = expanded
+        log(f"Ground circles enabled: expanded {n_base_actual} base samples "
+            f"× {len(gc_diameters)} diameters {gc_diameters} = {len(valid)} total samples")
 
     return valid
 
@@ -441,6 +452,10 @@ def write_domain_master(cfg: dict, out_path: str,
     canon["config_hash"] = h
     canon["tx"]["allowed_topologies"] = allowed_topologies(canon["tx"]["layers_selected"])
     canon["rx"]["allowed_topologies"] = allowed_topologies(canon["rx"]["layers_selected"])
+    # Preserve ground-circle settings so domain_lookup can check them.
+    for _gc_key in ("ground_circle_enabled", "ground_circle_min_mm", "ground_circle_max_mm"):
+        if _gc_key in cfg:
+            canon[_gc_key] = cfg[_gc_key]
     with open(out_path, "w") as f:
         json.dump(canon, f, indent=2, default=str)
     return h
@@ -493,7 +508,8 @@ def _next_batch_number(global_path: str) -> int:
 
 
 def _update_global_batch_metadata(global_path: str, batch_num: int,
-                                  batch_file: str, n_samples: int) -> None:
+                                  batch_file: str, n_samples: int,
+                                  domain_file: str = "") -> None:
     """Update global_results.json with new batch metadata."""
     data = _load_global_results(global_path)
     meta = data.setdefault("meta", {})
@@ -501,6 +517,7 @@ def _update_global_batch_metadata(global_path: str, batch_num: int,
 
     lhs_batches[str(batch_num)] = {
         "file": batch_file,
+        "domain_file": domain_file,
         "n_samples": n_samples,
     }
     meta["n_lhs_batches"] = max(meta.get("n_lhs_batches", 0), batch_num)
@@ -524,7 +541,9 @@ def main() -> int:
     parser.add_argument("--config", required=True,
                         help="Path to the domain config JSON "
                              "(written by the GUI on Generate)")
-    parser.add_argument("--master", default=os.path.join(_SIMDATA_DIR, "domain_master.json"))
+    parser.add_argument("--master", default=None,
+                        help="Path to write domain file "
+                             "(default: domain_batch_N.json auto-derived from batch number)")
     parser.add_argument("--global", dest="global_", default=os.path.join(_SIMDATA_DIR, "global_results.json"),
                         help="Path to global_results.json for batch tracking")
     parser.add_argument("--n", type=int, default=None,
@@ -544,6 +563,12 @@ def main() -> int:
         return 2
 
     batch_num = _next_batch_number(args.global_)
+
+    # Store ground circle settings in the config so the domain file captures them.
+    cfg["ground_circle_enabled"] = bool(args.ground_circle_enabled)
+    cfg["ground_circle_min_mm"]  = float(args.ground_circle_min)
+    cfg["ground_circle_max_mm"]  = float(args.ground_circle_max)
+
     samples = generate_samples(
         cfg, n_total,
         ground_circle_enabled=bool(args.ground_circle_enabled),
@@ -554,16 +579,19 @@ def main() -> int:
         print("ERROR: no feasible samples — check the domain config", file=sys.stderr)
         return 3
 
-    h = write_domain_master(cfg, args.master, n_total, len(samples))
+    domain_filename = f"domain_batch_{batch_num}.json"
+    master_path = args.master or os.path.join(_SIMDATA_DIR, domain_filename)
+    h = write_domain_master(cfg, master_path, n_total, len(samples))
 
     out_path = os.path.join(_SIMDATA_DIR, f"lhs_batch_{batch_num}.json")
     write_samples_file(samples, cfg, out_path, h, batch_num=batch_num)
 
     _update_global_batch_metadata(args.global_, batch_num,
-                                   f"lhs_batch_{batch_num}.json", len(samples))
+                                   f"lhs_batch_{batch_num}.json", len(samples),
+                                   domain_file=domain_filename)
 
     print(f"Wrote {len(samples)} samples -> {out_path}")
-    print(f"Domain master       -> {args.master}  (hash {h})")
+    print(f"Domain file         -> {master_path}  (hash {h})")
     print(f"Batch {batch_num} registered in global_results.json")
     return 0
 

@@ -32,8 +32,8 @@ for _p in (_MODULES, _NN_DIR):
         sys.path.insert(0, _p)
 
 import cap_combinator
+import domain_lookup as _dl
 
-_RESULTS_FILE = os.path.join(_SIMDATA, "sweep_results.json")
 _MODEL_FILE   = os.path.join(_NN_DIR,  "surrogate_model.pth")
 _X_SCALER     = os.path.join(_NN_DIR,  "x_scaler.pkl")
 _Y_SCALER     = os.path.join(_NN_DIR,  "y_scaler.pkl")
@@ -103,30 +103,6 @@ def _try_load_nn():
     return model, x_scaler, y_scaler, feature_cols, torch, np
 
 
-def _load_lhs_ranges(results_path):
-    """Return per-field min/max from all OK simulation results."""
-    if not os.path.exists(results_path):
-        return {}
-    try:
-        with open(results_path) as f:
-            data = json.load(f)
-    except Exception:
-        return {}
-    ok = [r for r in data.get("results", []) if r.get("ok")]
-    if not ok:
-        return {}
-
-    numeric_keys = ["tx_turns", "tx_width", "tx_od_mm",
-                    "rx_od_mm", "rx_turns", "rx_width", "freq_hz"]
-    ranges = {}
-    for key in numeric_keys:
-        vals = [r[key] for r in ok if key in r]
-        if vals:
-            ranges[key] = (min(vals), max(vals))
-
-    topologies = set(r.get("rx_topology", "") for r in ok)
-    ranges["rx_topology"] = sorted(topologies)
-    return ranges
 
 
 def _resonant_cap_nf(L_uH, freq_hz):
@@ -161,8 +137,9 @@ class SimNNTab(ttk.Frame):
         super().__init__(parent, **kw)
         self.app = app
 
-        self._ranges = {}       # field → (min, max) or list for topology
-        self._run_btn = None    # set in _build
+        self._ranges  = {}     # field → (min, max) or list for topology
+        self._domains = []     # [(batch_num, domain_dict), ...] from domain files
+        self._run_btn = None   # set in _build
         self._field_widgets = {}  # field_key → Entry widget (for red highlight)
         self._result_vars = {}    # key → StringVar (output labels)
         self._topo_var = tk.StringVar(value="parallel")
@@ -266,6 +243,13 @@ class SimNNTab(ttk.Frame):
         ttk.Label(btn_row, textvariable=self._status_var,
                   foreground="gray").pack(side="left", padx=10)
 
+        # Domain coverage indicator
+        dom_row = ttk.Frame(body); dom_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._domain_var = tk.StringVar(value="")
+        self._domain_label = ttk.Label(dom_row, textvariable=self._domain_var,
+                                       font=("TkDefaultFont", 8))
+        self._domain_label.pack(side="left")
+
         # ---- Coupling results -------------------------------------------
         coup = ttk.LabelFrame(body, text="Coupling (NN estimate)")
         coup.pack(fill="x", padx=8, pady=4)
@@ -353,7 +337,8 @@ class SimNNTab(ttk.Frame):
     # -----------------------------------------------------------------------
 
     def _refresh_ranges(self):
-        self._ranges = _load_lhs_ranges(_RESULTS_FILE)
+        self._domains = _dl.load_all_domains(_SIMDATA)
+        self._ranges  = _dl.union_ranges(self._domains)
         self._update_range_labels()
         self._validate_inputs()
 
@@ -410,6 +395,7 @@ class SimNNTab(ttk.Frame):
                 entry.configure(style="TEntry")
             if self._run_btn:
                 self._run_btn.configure(state="disabled")
+            self._domain_var.set("")
             return
 
         for key, entry in self._field_widgets.items():
@@ -451,6 +437,21 @@ class SimNNTab(ttk.Frame):
         if self._run_btn:
             self._run_btn.configure(
                 state="normal" if not any_bad else "disabled")
+
+        # Domain coverage status
+        vals_all = dict(vals)
+        vals_all["rx_topology"] = self._topo_var.get()
+        matching = _dl.find_matching_domains(vals_all, self._domains)
+        if matching:
+            batches = ", ".join(f"batch {n}" for n in matching)
+            self._domain_var.set(f"In training domain: {batches}")
+            self._domain_label.configure(foreground="#208020")
+        elif self._domains:
+            self._domain_var.set("Outside all training domains")
+            self._domain_label.configure(foreground="#cc4400")
+        else:
+            self._domain_var.set("No domain files found — range hints unavailable")
+            self._domain_label.configure(foreground="#808080")
 
     @staticmethod
     def _set_entry_color(entry, bad):

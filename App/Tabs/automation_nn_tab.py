@@ -24,7 +24,6 @@ from cap_combinator import E_VALUES_NF
 import parametric_coil as pc
 
 _SIMDATA_DIR  = os.path.join(_APP_ROOT, "SimulationData")
-_SAMPLES_FILE = os.path.join(_SIMDATA_DIR, "lhs_samples.json")
 _MODEL_FILE   = os.path.join(_NN_DIR, "surrogate_model.pth")
 _X_SCALER     = os.path.join(_NN_DIR, "x_scaler.pkl")
 _Y_SCALER     = os.path.join(_NN_DIR, "y_scaler.pkl")
@@ -199,60 +198,39 @@ def _run_optimizer(params, progress_cb, log_cb, done_cb, cancel_flag):
                f"[{drive_freqs[0]/1e3:.0f}–{drive_freqs[-1]/1e3:.0f} kHz, 1 kHz res]  "
                f"(R_ac scaled from F0={F0_HZ/1e3:.0f} kHz via √f)")
 
-        # ---- Derive geometry bounds from LHS samples ----------------------
+        # ---- Derive geometry bounds from domain batch files ----------------
         try:
-            with open(_SAMPLES_FILE, "r") as _f:
-                _lhs = json.load(_f)
-            if isinstance(_lhs, dict):
-                _samples  = _lhs.get("samples", [])
-                _rng_dict = (_lhs.get("ranges") or _lhs.get("param_ranges")
-                             or _lhs.get("bounds") or {})
-            else:
-                _samples, _rng_dict = _lhs, {}
-            if _samples:
-                log_cb(f"LHS sample keys: {list(_samples[0].keys())}")
-            _aliases = {
-                "tx_turns":    ["tx_turns",          "TX_turns",    "n_turns_tx"],
-                "tx_width":    ["tx_trace_width_mm",  "tx_width",    "tx_width_mm", "TX_width"],
-                "rx_od_mm":    ["rx_od_mm",           "rx_od",       "RX_od_mm"],
-                "rx_turns":    ["rx_turns",           "RX_turns",    "n_turns_rx"],
-                "rx_width":    ["rx_trace_width_mm",  "rx_width",    "rx_width_mm", "RX_width"],
-                "rx_topology": ["rx_topology",        "topology",    "rx_topo"],
-            }
-            def _resolve(canonical):
-                for a in _aliases[canonical]:
-                    if (_samples and a in _samples[0]) or a in _rng_dict:
-                        return a
-                return None
-            def _bound(canonical):
-                if _rng_dict:
-                    k = next((a for a in _aliases[canonical] if a in _rng_dict), None)
-                    if k:
-                        v = _rng_dict[k]
-                        if isinstance(v, (list, tuple)) and len(v) == 2:
-                            return float(v[0]), float(v[1])
-                k = _resolve(canonical)
-                if k is None or not _samples:
-                    raise KeyError(f"No key found for '{canonical}'")
-                vals = [s[k] for s in _samples if k in s]
-                if not vals: raise ValueError(f"Empty values for '{k}'")
-                return float(min(vals)), float(max(vals))
-            def _ibound(c):
-                lo, hi = _bound(c); return int(round(lo)), int(round(hi))
-            tx_turns_min, tx_turns_max = _ibound("tx_turns")
-            tx_width_min, tx_width_max = _bound("tx_width")
-            rx_od_min,    rx_od_max    = _bound("rx_od_mm")
-            rx_turns_min, rx_turns_max = _ibound("rx_turns")
-            rx_width_min, rx_width_max = _bound("rx_width")
-            _tk    = _resolve("rx_topology")
-            _topos = sorted({s[_tk] for s in _samples if _tk and _tk in s})
-            rx_topologies = _topos if _topos else RX_TOPOLOGIES
-            log_cb(f"Bounds from LHS: tx_turns [{tx_turns_min}–{tx_turns_max}], "
+            import domain_lookup as _dl
+            _domains = _dl.load_all_domains(_SIMDATA_DIR)
+            if not _domains:
+                raise ValueError("No domain_batch_*.json files found")
+            _rngs = _dl.union_ranges(_domains)
+            batch_nums = [n for n, _ in _domains]
+            log_cb(f"Domain files: batch(es) {batch_nums}")
+
+            def _rng(key, default_lo, default_hi):
+                r = _rngs.get(key)
+                if r and len(r) == 2:
+                    return float(r[0]), float(r[1])
+                return float(default_lo), float(default_hi)
+
+            def _irng(key, default_lo, default_hi):
+                lo, hi = _rng(key, default_lo, default_hi)
+                return int(round(lo)), int(round(hi))
+
+            tx_turns_min, tx_turns_max = _irng("tx_turns", TX_TURNS_MIN, TX_TURNS_MAX)
+            tx_width_min, tx_width_max = _rng("tx_width",  TX_WIDTH_MIN, TX_WIDTH_MAX)
+            rx_od_min,    rx_od_max    = _rng("rx_od_mm",  RX_OD_MIN,    RX_OD_MAX)
+            rx_turns_min, rx_turns_max = _irng("rx_turns", RX_TURNS_MIN, RX_TURNS_MAX)
+            rx_width_min, rx_width_max = _rng("rx_width",  RX_WIDTH_MIN, RX_WIDTH_MAX)
+            rx_topologies = _rngs.get("rx_topology") or RX_TOPOLOGIES
+
+            log_cb(f"Bounds from domain: tx_turns [{tx_turns_min}–{tx_turns_max}], "
                    f"tx_width [{tx_width_min:.2f}–{tx_width_max:.2f} mm], "
                    f"rx_od [{rx_od_min:.1f}–{rx_od_max:.1f} mm], "
                    f"rx_turns [{rx_turns_min}–{rx_turns_max}]")
         except Exception as _e:
-            log_cb(f"Warning: could not read LHS bounds ({_e}), using hardcoded defaults.")
+            log_cb(f"Warning: could not read domain bounds ({_e}), using hardcoded defaults.")
             tx_turns_min, tx_turns_max = TX_TURNS_MIN, TX_TURNS_MAX
             tx_width_min, tx_width_max = TX_WIDTH_MIN, TX_WIDTH_MAX
             rx_od_min,    rx_od_max    = RX_OD_MIN,    RX_OD_MAX

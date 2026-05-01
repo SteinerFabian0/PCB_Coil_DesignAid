@@ -238,7 +238,6 @@ def main() -> int:
             "range_total": len(target)}
 
     results = dict(existing)
-    sample_by_id = {p.sample_id: s for p, s in zip(target, target_samples)}
 
     wall_start = time.time()
     since_ckpt = 0
@@ -246,25 +245,30 @@ def main() -> int:
     pool = ProcessPoolExecutor(max_workers=args.workers)
     stop_signaled = False
     try:
-        fut_map = {pool.submit(run_single_sim, p): p for p in todo}
+        # Map each future directly to its (SimParams, sample_dict) so that
+        # ground-circle variants sharing the same base `id` are never confused.
+        fut_to_sample: dict = {}
+        for p, s in zip(todo, todo_samples):
+            fut = pool.submit(run_single_sim, p)
+            fut_to_sample[fut] = (p, s)
+
         done_count = 0
-        for fut in as_completed(fut_map):
+        for fut in as_completed(fut_to_sample):
             if fut.cancelled():
                 continue
-            p = fut_map[fut]
+            p, sample = fut_to_sample[fut]
             try:
                 r = fut.result()
             except Exception as exc:
                 r = {"ok": False, "tag": p.tag, "sample_id": p.sample_id,
                      "error": f"worker crash: {exc}", "elapsed_sec": 0.0}
-            sid = r.get("sample_id", p.sample_id)
-            r["sample_id"] = sid
 
-            sample = sample_by_id.get(sid)
-            if sample:
-                r["uuid"] = sample.get("uuid")
-                r["batch"] = sample.get("batch")
-                r["sample_num"] = sample.get("sample_num")
+            # Annotate with the exact sample that was submitted (not a dict-lookup
+            # that would collide when multiple variants share the same base id).
+            r["uuid"]       = sample.get("uuid")
+            r["batch"]      = sample.get("batch")
+            r["sample_num"] = sample.get("sample_num")
+            r["sample_id"]  = sample.get("id", p.sample_id)
 
             if r.get("ok"):
                 uuid_val = r.get("uuid")
@@ -284,11 +288,11 @@ def main() -> int:
                 print("[STOP] Stop flag — terminating all workers immediately.", flush=True)
                 stop_signaled = True
                 _flush(args.out, meta, results)
-                for proc in pool._processes.values():
-                    try:
+                try:
+                    for proc in pool._processes.values():
                         proc.terminate()
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
                 break
     finally:
         pool.shutdown(wait=False)

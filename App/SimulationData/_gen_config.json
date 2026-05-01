@@ -7,7 +7,7 @@
       false
     ],
     "od_max_mm": 56.0,
-    "id_min_mm": 20.0,
+    "id_min_mm": 25.0,
     "trace_spacing_mm": [
       0.16,
       0.16
@@ -41,7 +41,7 @@
       true
     ],
     "od_max_mm": 55.0,
-    "id_min_mm": 20.0,
+    "id_min_mm": 25.0,
     "trace_spacing_mm": [
       0.16,
       0.16
@@ -78,5 +78,5 @@
       140000.0
     ]
   },
-  "n_total": 64000
+  "n_total": 8000
 }
