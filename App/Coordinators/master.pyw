@@ -113,7 +113,7 @@ class CoilApp(tk.Tk):
         nb.add(self.param_rx_tab,    text="  Parametric RX  ")
         nb.add(self.sim_tab,         text="  Simulation  ")
         nb.add(self.sim_nn_tab,      text="  Simulation NN  ")
-        nb.add(self.auto_tab,        text="  NN Training  ")
+        nb.add(self.auto_tab,        text="  NN Setup  ")
         nb.add(self.auto_nn_tab,     text="  Automation NN  ")
         nb.add(self.nn_analysis_tab, text="  NN Analysis  ")
 

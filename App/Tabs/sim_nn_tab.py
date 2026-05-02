@@ -24,19 +24,18 @@ from tkinter import ttk, messagebox
 _HERE      = os.path.dirname(os.path.abspath(__file__))
 _APP_ROOT  = os.path.dirname(_HERE)
 _MODULES   = os.path.join(_APP_ROOT, "Modules")
-_NN_DIR    = os.path.join(_APP_ROOT, "NeuralNetwork")
-_SIMDATA   = os.path.join(_APP_ROOT, "SimulationData")
+_NN_DIR     = os.path.join(_APP_ROOT, "NeuralNetwork")
+_NN_SCRIPTS = os.path.join(_NN_DIR, "scripts")
+_SIMDATA    = os.path.join(_APP_ROOT, "SimulationData")
 
-for _p in (_MODULES, _NN_DIR):
+for _p in (_MODULES, _NN_DIR, _NN_SCRIPTS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import cap_combinator
 import domain_lookup as _dl
 
-_MODEL_FILE   = os.path.join(_NN_DIR,  "surrogate_model.pth")
-_X_SCALER     = os.path.join(_NN_DIR,  "x_scaler.pkl")
-_Y_SCALER     = os.path.join(_NN_DIR,  "y_scaler.pkl")
+_NN_V2_DIR = os.path.join(_NN_DIR, "NN_V2")
 
 TOPOLOGY_CHOICES = [
     ("All parallel",  "parallel"),
@@ -57,22 +56,25 @@ OUT_R_RX  = 4
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _try_load_nn():
+def _try_load_nn(model_dir):
     """Import torch/joblib lazily and load the trained model + scalers.
     Returns (model, x_scaler, y_scaler, feature_columns) or raises."""
     import torch
     import joblib
     import numpy as np
 
-    if not os.path.exists(_MODEL_FILE):
-        raise FileNotFoundError(f"Model not found: {_MODEL_FILE}")
-    if not os.path.exists(_X_SCALER):
-        raise FileNotFoundError(f"x_scaler not found: {_X_SCALER}")
-    if not os.path.exists(_Y_SCALER):
-        raise FileNotFoundError(f"y_scaler not found: {_Y_SCALER}")
+    mf = os.path.join(model_dir, "surrogate_model.pth")
+    xf = os.path.join(model_dir, "x_scaler.pkl")
+    yf = os.path.join(model_dir, "y_scaler.pkl")
+    if not os.path.exists(mf):
+        raise FileNotFoundError(f"Model not found: {mf}")
+    if not os.path.exists(xf):
+        raise FileNotFoundError(f"x_scaler not found: {xf}")
+    if not os.path.exists(yf):
+        raise FileNotFoundError(f"y_scaler not found: {yf}")
 
-    x_scaler = joblib.load(_X_SCALER)
-    y_scaler = joblib.load(_Y_SCALER)
+    x_scaler = joblib.load(xf)
+    y_scaler = joblib.load(yf)
 
     # Reconstruct model architecture — must match train_surrogate.py
     import torch.nn as nn
@@ -91,7 +93,7 @@ def _try_load_nn():
 
     n_in = x_scaler.n_features_in_
     model = _CoilNN(n_in)
-    model.load_state_dict(torch.load(_MODEL_FILE, map_location="cpu"))
+    model.load_state_dict(torch.load(mf, map_location="cpu"))
     model.eval()
 
     # Reconstruct feature column names from the scaler
@@ -143,6 +145,7 @@ class SimNNTab(ttk.Frame):
         self._field_widgets = {}  # field_key → Entry widget (for red highlight)
         self._result_vars = {}    # key → StringVar (output labels)
         self._topo_var = tk.StringVar(value="parallel")
+        self._gc_enabled = tk.BooleanVar(value=False)
 
         self._build()
         self.after(300, self._refresh_ranges)
@@ -233,6 +236,29 @@ class SimNNTab(ttk.Frame):
         self._rx_cap_combo_display = tk.StringVar(value="")
         ttk.Label(rx_cap_row, textvariable=self._rx_cap_combo_display,
                   foreground="gray").pack(side="left", padx=4)
+
+        # ---- NN Model (from NN Setup tab) -----------------------------------
+        model_frm = ttk.LabelFrame(body, text="NN Model")
+        model_frm.pack(fill="x", padx=8, pady=(4, 2))
+        mrow = ttk.Frame(model_frm); mrow.pack(fill="x", padx=6, pady=4)
+        ttk.Label(mrow, text="Folder:", foreground="gray").pack(side="left")
+        self._model_label_var = tk.StringVar(value="(select in NN Setup tab)")
+        ttk.Label(mrow, textvariable=self._model_label_var,
+                  foreground="#80c8ff", font=("Consolas", 8),
+                  wraplength=500, justify="left").pack(side="left", padx=6)
+
+        # ---- Ground Circle ----------------------------------------------
+        gc_frm = ttk.LabelFrame(body, text="Ground Circle")
+        gc_frm.pack(fill="x", padx=8, pady=(4, 2))
+        gc_row = ttk.Frame(gc_frm); gc_row.pack(fill="x", padx=6, pady=4)
+        ttk.Checkbutton(gc_row, text="Enable ground circle",
+                        variable=self._gc_enabled,
+                        command=self._on_gc_toggle).pack(side="left")
+        ttk.Label(gc_row, text="  Diameter (mm):").pack(side="left")
+        self._gc_dia_var = tk.StringVar(value="21.0")
+        self._gc_dia_entry = ttk.Entry(gc_row, textvariable=self._gc_dia_var, width=8)
+        self._gc_dia_entry.pack(side="left", padx=4)
+        self._on_gc_toggle()
 
         # ---- Run button --------------------------------------------------
         btn_row = ttk.Frame(body); btn_row.pack(fill="x", padx=8, pady=(4, 2))
@@ -337,7 +363,18 @@ class SimNNTab(ttk.Frame):
     # -----------------------------------------------------------------------
 
     def _refresh_ranges(self):
-        self._domains = _dl.load_all_domains(_SIMDATA)
+        model_dir = self._get_model_dir()
+        domain_path = os.path.join(model_dir, "domain.json") if model_dir else None
+        if domain_path and os.path.exists(domain_path):
+            try:
+                import json
+                with open(domain_path) as f:
+                    d = json.load(f)
+                self._domains = [(0, d)]
+            except Exception:
+                self._domains = []
+        else:
+            self._domains = []
         self._ranges  = _dl.union_ranges(self._domains)
         self._update_range_labels()
         self._validate_inputs()
@@ -463,6 +500,22 @@ class SimNNTab(ttk.Frame):
     def _on_input_change(self):
         self._validate_inputs()
 
+    def _get_model_dir(self) -> str:
+        if self.app is not None and hasattr(self.app, "auto_tab"):
+            return self.app.auto_tab.get_model_folder()
+        return _NN_V2_DIR
+
+    def _on_gc_toggle(self):
+        state = "normal" if self._gc_enabled.get() else "disabled"
+        self._gc_dia_entry.configure(state=state)
+
+    @staticmethod
+    def _short_path(p):
+        try:
+            return os.path.relpath(p)
+        except ValueError:
+            return p
+
     # -----------------------------------------------------------------------
     # Public: receive parameters from parametric tab
     # -----------------------------------------------------------------------
@@ -534,6 +587,16 @@ class SimNNTab(ttk.Frame):
         topo = self._topo_var.get()
         freq_hz = vals["freq_hz"]
 
+        gc_dia = 0.0
+        if self._gc_enabled.get():
+            try:
+                gc_dia = float(self._gc_dia_var.get())
+                if gc_dia <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Ground Circle", "GC diameter must be a positive number.")
+                return
+
         try:
             c_tx_nf = float(self._tx_cap_var.get())
             if c_tx_nf <= 0:
@@ -541,18 +604,20 @@ class SimNNTab(ttk.Frame):
         except (ValueError, TypeError):
             c_tx_nf = None
 
+        model_dir = self._get_model_dir()
+        self._model_label_var.set(self._short_path(model_dir))
         self._run_btn.configure(state="disabled")
         self._status_var.set("Running NN…")
 
         thread = threading.Thread(
             target=self._run_worker,
-            args=(vals, topo, freq_hz, c_tx_nf),
+            args=(vals, topo, freq_hz, c_tx_nf, gc_dia, model_dir),
             daemon=True)
         thread.start()
 
-    def _run_worker(self, vals, topo, freq_hz, c_tx_nf):
+    def _run_worker(self, vals, topo, freq_hz, c_tx_nf, gc_dia, model_dir):
         try:
-            model, x_scaler, y_scaler, feat_cols, torch, np = _try_load_nn()
+            model, x_scaler, y_scaler, feat_cols, torch, np = _try_load_nn(model_dir)
         except Exception as e:
             self.after(0, lambda: self._on_run_error(f"Cannot load NN model:\n{e}"))
             return
@@ -565,10 +630,11 @@ class SimNNTab(ttk.Frame):
 
         row = {k: vals[k] for k in base_cols}
         row.update(one_hot)
+        row["ground_circle_dia_mm"] = gc_dia
 
         if feat_cols is not None:
             try:
-                x_vec = np.array([[row[c] for c in feat_cols]], dtype=np.float32)
+                x_vec = np.array([[row.get(c, 0.0) for c in feat_cols]], dtype=np.float32)
             except KeyError as e:
                 self.after(0, lambda: self._on_run_error(
                     f"Feature mismatch — retrain model?\nMissing: {e}"))

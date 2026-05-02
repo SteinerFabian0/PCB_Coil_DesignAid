@@ -16,3 +16,6 @@ App/SimulationData/results_batch_1.json
 /.claude
 App/SimulationData/results_batch_2.json
 App/SimulationData/global_results.json
+App/NeuralNetwork/NN_V2/global_results.json
+/App/NeuralNetwork/scripts/__pycache__
+/App/NeuralNetwork/NN_V2
