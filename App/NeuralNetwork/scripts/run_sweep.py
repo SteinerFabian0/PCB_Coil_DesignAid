@@ -147,11 +147,10 @@ def _stop_requested(out_path: str) -> bool:
 # Parallel runner
 # ---------------------------------------------------------------------------
  
-def _one_line_report(r: dict) -> str:
-    uuid_val = r.get("uuid", "")
-    short_id = uuid_val[:8] if uuid_val else r.get("tag", "????????")
+def _one_line_report(r: dict, uuid_val: str) -> str:
+    short_id = uuid_val[:8] if uuid_val else "????????"
     t = float(r.get("elapsed_sec", 0.0))
-    if r.get("ok"):
+    if "error" not in r:
         return f"{short_id}  OK    {t:6.1f}s"
     err = r.get("error", "")[:80]
     return f"{short_id}  FAIL  {t:6.1f}s  {err}"
@@ -225,19 +224,17 @@ def main() -> int:
             try:
                 r = fut.result()
             except Exception as exc:
-                r = {"ok": False, "tag": p.tag,
-                     "error": f"worker crash: {exc}", "elapsed_sec": 0.0}
+                r = {"error": f"worker crash: {exc}", "elapsed_sec": 0.0}
 
-            r["uuid"]           = sample.get("uuid")
+            uuid_val = sample.get("uuid")
+            r["uuid"]           = uuid_val
             r["hasGroundCircle"] = sample.get("hasGroundCircle", False)
 
-            if r.get("ok"):
-                uuid_val = r.get("uuid")
-                if uuid_val:
-                    results[uuid_val] = r
+            if "error" not in r and uuid_val:
+                results[uuid_val] = r
 
             since_ckpt += 1
-            print(_one_line_report(r), flush=True)
+            print(_one_line_report(r, uuid_val), flush=True)
 
             if since_ckpt >= args.ckpt_every:
                 _flush(args.out, meta, results)

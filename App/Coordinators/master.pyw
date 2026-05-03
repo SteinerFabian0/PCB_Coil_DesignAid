@@ -35,8 +35,8 @@ from parametric_tab import ParametricCoilTab
 from sim_tab import SimTab
 from sim_nn_tab import SimNNTab
 from dxf_coil_tab import DxfCoilTab
-from nn_training import AutomationTab
-from automation_nn_tab import AutomationNNTab
+from nn_setup import AutomationTab
+from nn_optimisation import NNOptimisationTab
 from nn_analysis_tab import NNAnalysisTab
 
 PROJECT_ROOT = os.path.dirname(_APP_ROOT)
@@ -103,8 +103,8 @@ class CoilApp(tk.Tk):
                                                temp_dir=TEMP_DIR,
                                                on_next_tab=lambda: self._advance_tab(3))
         self.auto_tab    = AutomationTab(nb, app=self)
-        self.auto_nn_tab = AutomationNNTab(nb, app=self,
-                                           on_next_tab=lambda: self._advance_tab(6))
+        self.nn_optim_tab = NNOptimisationTab(nb, app=self,
+                                             on_next_tab=lambda: self._advance_tab(6))
         self.nn_analysis_tab = NNAnalysisTab(nb, app=self)
 
         nb.add(self.dxf_tx_tab,      text="  DXF TX  ")
@@ -114,13 +114,13 @@ class CoilApp(tk.Tk):
         nb.add(self.sim_tab,         text="  Simulation  ")
         nb.add(self.sim_nn_tab,      text="  Simulation NN  ")
         nb.add(self.auto_tab,        text="  NN Setup  ")
-        nb.add(self.auto_nn_tab,     text="  Automation NN  ")
+        nb.add(self.nn_optim_tab,    text="  NN Optimisation  ", state="disabled")
         nb.add(self.nn_analysis_tab, text="  NN Analysis  ")
 
         self._ordered_tabs = [self.dxf_tx_tab, self.dxf_rx_tab,
                               self.param_tx_tab, self.param_rx_tab,
                               self.sim_tab, self.auto_tab,
-                              self.auto_nn_tab, self.nn_analysis_tab]
+                              self.nn_optim_tab, self.nn_analysis_tab]
 
         nb.select(self.param_tx_tab)
         self._nb = nb
@@ -185,6 +185,21 @@ class CoilApp(tk.Tk):
 
     def load_sim_tab_state(self):
         return self._state.get("sim", {})
+
+    def persist_nn_setup_folder(self, folder: str):
+        self._state.setdefault("nn_setup", {})["folder"] = folder
+        savestate.save(PROJECT_ROOT, self._state)
+
+    def load_nn_setup_folder(self) -> str:
+        return self._state.get("nn_setup", {}).get("folder", "")
+
+    def set_nn_optim_tab_visible(self, visible: bool):
+        """Show or hide (disable) the NN Optimisation tab."""
+        try:
+            state = "normal" if visible else "disabled"
+            self._nb.tab(self.nn_optim_tab, state=state)
+        except Exception:
+            pass
 
     def _on_close(self):
         # Final flush.

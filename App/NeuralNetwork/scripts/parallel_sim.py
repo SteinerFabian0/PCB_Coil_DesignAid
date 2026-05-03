@@ -151,6 +151,8 @@ def _write_inp(p: SimParams, inp_path: str) -> None:
                         p.rx_turns, p.rx_outer_gap_mm, p.rx_inner_gap_mm,
                         p.rx_layers)
 
+    # Always include a low-frequency point (_DC_FREQ_HZ) so DC resistance
+    # is extracted from a separate block rather than reusing the AC block.
     pc.write_combined_tx_rx_inp(
         tx_ld, rx_ld, inp_path,
         tx_w_mm=p.tx_trace_width_mm,
@@ -162,7 +164,7 @@ def _write_inp(p: SimParams, inp_path: str) -> None:
         pcb_gap_mm=p.pcb_gap_mm,
         tx_nhinc=p.tx_nhinc, tx_nwinc=p.tx_nwinc,
         rx_nhinc=p.rx_nhinc, rx_nwinc=p.rx_nwinc,
-        fmin=p.fmin_hz, fmax=p.fmax_hz, freq_ndec=p.freq_ndec,
+        fmin=p.freq_hz, fmax=p.freq_hz, freq_ndec=0,
         ground_circle_dia_mm=p.ground_circle_dia_mm,
     )
 
@@ -263,29 +265,22 @@ def _parse_result(zc_path: str, p: SimParams) -> dict:
     Q_tx  = (omega * L_tx_H) / R_tx if R_tx > 0 else 0.0
     Q_rx  = (omega * L_rx_H) / R_rx if R_rx > 0 else 0.0
 
-    # DC resistance: lowest-frequency block diagonal
-    z_dc_block = min(blocks, key=lambda b: b["frequency"])
-    R_tx_dc = z_dc_block["matrix"][0][0].real
-    R_rx_dc = z_dc_block["matrix"][1][1].real
+    def _r5(v):
+        return round(v, 5)
 
     return {
-        "ok":         True,
-        "tag":        p.tag,
-        "sample_id":  p.sample_id,
         "freq_hz":    freq_actual,
         # TX
-        "L_tx_uH":    L_tx_H  * 1e6,
-        "R_tx_ac":    R_tx,
-        "R_tx_dc":    R_tx_dc,
-        "Q_tx":       Q_tx,
+        "L_tx_uH":    _r5(L_tx_H  * 1e6),
+        "R_tx_ac":    _r5(R_tx),
+        "Q_tx":       _r5(Q_tx),
         # RX
-        "L_rx_uH":    L_rx_H  * 1e6,
-        "R_rx_ac":    R_rx,
-        "R_rx_dc":    R_rx_dc,
-        "Q_rx":       Q_rx,
+        "L_rx_uH":    _r5(L_rx_H  * 1e6),
+        "R_rx_ac":    _r5(R_rx),
+        "Q_rx":       _r5(Q_rx),
         # Coupling
-        "M_uH":       M_H     * 1e6,
-        "k":          k,
+        "M_uH":       _r5(M_H     * 1e6),
+        "k":          _r5(k),
         # Geometry echo (full — needed by the append step for NN features)
         "tx_turns":        p.tx_turns,
         "tx_width":        p.tx_trace_width_mm,
@@ -337,7 +332,6 @@ def run_single_sim(p: SimParams) -> dict:
     reason = _check_feasibility(p)
     if reason is not None:
         return {
-            "ok": False, "tag": p.tag, "sample_id": p.sample_id,
             "error": f"infeasible: {reason}",
             "pid": pid, "elapsed_sec": round(time.time() - overall_start, 2),
         }
@@ -369,7 +363,7 @@ def run_single_sim(p: SimParams) -> dict:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return {
-        "ok": False, "tag": p.tag, "sample_id": p.sample_id, "error": last_error,
+        "error": last_error,
         "pid": pid, "elapsed_sec": round(time.time() - overall_start, 2),
     }
 
@@ -406,11 +400,7 @@ def run_batch(
             try:
                 results[idx] = fut.result()
             except Exception as exc:
-                results[idx] = {
-                    "ok": False,
-                    "tag": params_list[idx].tag,
-                    "error": f"executor error: {exc}",
-                }
+                results[idx] = {"error": f"executor error: {exc}"}
             done_count += 1
             if progress_cb is not None:
                 try:

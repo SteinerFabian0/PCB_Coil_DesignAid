@@ -261,8 +261,12 @@ def _decode(u_row, cfg):
     tx_oz_i  = quantize_oz(u_row[7], *tx["inner_cu_oz"])
 
     rx_w     = round(_scale(u_row[9],  *rx["trace_width_mm"]), 4)
-    rx_od    = round(_scale(u_row[10], rx["id_min_mm"] + 2.0,
-                                     rx["od_max_mm"]), 4)
+    # RX OD must be <= TX OD and >= TX OD - 4 mm
+    rx_od_lo = max(rx["id_min_mm"] + 2.0, tx_od - 4.0)
+    rx_od_hi = min(rx["od_max_mm"], tx_od)
+    if rx_od_hi < rx_od_lo:
+        rx_od_hi = rx_od_lo
+    rx_od    = round(_scale(u_row[10], rx_od_lo, rx_od_hi), 4)
     rx_s     = _stackup_val(u_row[11], *rx["trace_spacing_mm"])
     rx_og    = _stackup_val(u_row[12], *rx["outer_gap_mm"])
     rx_ig    = _stackup_val(u_row[13], *rx["inner_gap_mm"])

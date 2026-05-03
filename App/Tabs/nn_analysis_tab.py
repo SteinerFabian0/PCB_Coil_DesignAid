@@ -327,7 +327,7 @@ def _analysis_worker(raw, params, log_cb, done_cb):
                 C_rx_nf      = c_rx_nf,
                 C_tx_label   = _cap_label(c_tx_nf, max_caps=2),       # TX: always allow 2 caps
                 C_rx_label   = _cap_label(c_rx_nf, max_caps=rx_max_caps),
-                # aliases expected by automation_nn_tab._on_send_to_sim
+                # aliases expected by nn_optimisation._on_send_to_sim
                 eff_mid      = eta_sys,
                 Duty_vmin    = d_show_min,
                 Duty_vmax    = d_show_max,
@@ -593,7 +593,7 @@ class NNAnalysisTab(ttk.Frame):
             self._log_append(f"RAM data detected: {n:,} combinations.")
 
     def _get_ram(self):
-        auto = getattr(self.app, "auto_nn_tab", None)
+        auto = getattr(self.app, "nn_optim_tab", None)
         if auto is None:
             return None
         r = getattr(auto, "_results", {})
@@ -918,9 +918,9 @@ class NNAnalysisTab(ttk.Frame):
         if self._selected_idx < 0 or self._selected_idx >= len(self._results):
             return
         r = self._results[self._selected_idx]
-        auto_nn = getattr(self.app, "auto_nn_tab", None)
+        auto_nn = getattr(self.app, "nn_optim_tab", None)
         if auto_nn is None:
-            messagebox.showerror("Send to Sim", "AutomationNNTab not available.")
+            messagebox.showerror("Send to Sim", "NNOptimisationTab not available.")
             return
         auto_nn._last_run_params = self._run_params
         auto_nn._on_send_to_sim(r)
