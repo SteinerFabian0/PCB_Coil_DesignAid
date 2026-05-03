@@ -41,25 +41,51 @@ for _p in (_NN_DIR, _NN_SCRIPTS, _MODULES):
         sys.path.insert(0, _p)
 
 import parametric_coil as pc
+from cap_combinator import E_VALUES_NF
 
 
 # ── Fallback domain ───────────────────────────────────────────────────────────
 _FALLBACK_DOMAIN = {
     "tx": {
-        "od_max_mm": 53.0, "id_min_mm": 35.0,
-        "trace_width_mm": [0.2, 1.2], "turns": [6, 18],
+        "od_max_mm": 55.0, "id_min_mm": 35.0,
+        "trace_width_mm": [0.2, 1.6], "turns": [6, 18],
         "allowed_topologies": ["parallel", "series"],
     },
     "rx": {
-        "od_max_mm": 53.0, "id_min_mm": 35.0,
+        "od_max_mm": 55.0, "id_min_mm": 35.0,
         "trace_width_mm": [0.2, 1.2], "turns": [4, 25],
         "allowed_topologies": ["parallel", "series", "parallel_pairs_ser"],
     },
-    "global": {"freq_hz": [110000.0, 135000.0]},
-    "ground_circle_enabled": False,
+    "global": {"freq_hz": [340000.0, 380000.0]},
+    "ground_circle_enabled": True,
     "ground_circle_min_mm": 18.0,
     "ground_circle_max_mm": 24.0,
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI Defaults  ← tweak these to change the tab's initial values
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_TX_OD_MAX      = "55.0"   # mm
+DEFAULT_TX_ID_MIN      = "35.0"   # mm
+DEFAULT_RX_OD_MAX      = "55.0"   # mm
+DEFAULT_RX_ID_MIN      = "35.0"   # mm
+DEFAULT_GC_ENABLED     = True
+DEFAULT_GC_DIA         = "20.0"   # mm
+DEFAULT_P_TARGET_MW    = "50"     # mW
+DEFAULT_V_MIN          = "3.2"    # V
+DEFAULT_V_MAX          = "4.4"    # V
+DEFAULT_D_MIN_PCT      = ""       # blank = no floor
+DEFAULT_DITHER_AMP_KHZ = "10.0"           # frequency dither amplitude (kHz)
+DEFAULT_ZVS_MARGIN_PCT = "15.0"           # f_drive_min must be this % above f0_tx
+DEFAULT_N_COMBOS_M     = "20"     # millions
+DEFAULT_MAX_ITERS      = "20"
+DEFAULT_TOP_K          = "12"
+DEFAULT_FH_WORKERS     = "12"
+DEFAULT_FH_TIMEOUT_S   = "360"
+DEFAULT_TR_EPOCHS      = "300"
+DEFAULT_TR_BATCH       = "512"
+DEFAULT_TR_LR          = "0.0005"
+DEFAULT_TR_VAL_SPLIT   = "0.15"
 
 # ── Physical constants ────────────────────────────────────────────────────────
 BATCH_SIZE   = 500_000
@@ -245,7 +271,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
     tx_width_max = params["tx_width_max"]
     tx_turns_min = params["tx_turns_min"]
 
-    rx_od_max    = min(params["rx_od_max"], tx_od_max)
+    rx_od_max    = min(params["rx_od_max"], tx_od_max + 5.0)
     rx_id_min    = params["rx_id_min"]
     rx_width_min = params["rx_width_min"]
     rx_width_max = params["rx_width_max"]
@@ -279,6 +305,11 @@ def _nn_sweep(params, log_cb, cancel_flag):
     log_cb(f"  Topologies: {topologies}")
 
     # Accumulators
+    dither_amp_hz  = params.get("dither_amp_hz", 0.0)
+    zvs_margin     = params.get("zvs_margin", 0.0)
+    c_tx_options_f = params.get("c_tx_options_f", [])  # sorted list in Farads
+    c_rx_options_f = params.get("c_rx_options_f", [])  # sorted list in Farads
+
     acc_keys = [
         "tx_turns", "tx_width", "tx_od_mm",
         "rx_od_mm", "rx_turns", "rx_width",
@@ -286,7 +317,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
         "L_tx", "L_rx", "M",
         "R_tx", "R_rx", "DCR_tx", "DCR_rx",
         "tx_id_mm", "rx_id_mm",
-        "eta_sys", "D_vmin",
+        "eta_sys", "D_vmin", "c_tx_nf", "c_rx_nf",
     ]
     accs = {k: [] for k in acc_keys}
 
@@ -313,7 +344,10 @@ def _nn_sweep(params, log_cb, cancel_flag):
         tx_t_min   = np.minimum(np.full(bs, tx_turns_min, dtype=np.int32), tx_t_max)
         tx_turns_s = rng.integers(tx_t_min, tx_t_max + 1).astype(np.float32)
 
-        rx_od_s    = rng.uniform(rx_id_min + 2.0, rx_od_max, size=bs).astype(np.float32)
+        rx_od_hi_s = np.minimum(tx_od_s + 5.0, rx_od_max)
+        rx_od_lo_s = np.full(bs, rx_id_min + 2.0, dtype=np.float32)
+        u_rx       = rng.random(size=bs).astype(np.float32)
+        rx_od_s    = (rx_od_lo_s + u_rx * np.maximum(rx_od_hi_s - rx_od_lo_s, 0.0)).astype(np.float32)
         rx_width_s = rng.uniform(rx_width_min, rx_width_max, size=bs).astype(np.float32)
         rx_t_max   = np.maximum(
             np.floor((rx_od_s + _SPACING_MM - rx_width_s - rx_id_min)
@@ -395,6 +429,48 @@ def _nn_sweep(params, log_cb, cancel_flag):
             V_min, V_max, P_target, D_min,
         )
 
+        # ── ZVS cap auto-selection ──────────────────────────────────────────
+        # For above-resonance (inductive) operation: f_drive_min must exceed
+        # f0 by at least zvs_margin. We find the smallest available C that
+        # satisfies this for each predicted L_tx.  Candidates with no valid C
+        # have their eta zeroed so they fall out of ranking naturally.
+        c_tx_nf_s = np.zeros(bs_v, dtype=np.float32)
+        if dither_amp_hz > 0.0 and c_tx_options_f:
+            f_min_drv = freq_ref_hz - dither_amp_hz
+            f0_max    = f_min_drv / (1.0 + zvs_margin)   # f0 must be <= this
+            L_tx_si   = np.maximum(Y[:, 0].astype(np.float64) * 1e-6, 1e-18)
+            # minimum C to achieve f0 <= f0_max: C = 1/(4π²·f0_max²·L)
+            C_needed  = 1.0 / (4.0 * math.pi ** 2 * f0_max ** 2 * L_tx_si)
+            zvs_ok    = np.zeros(bs_v, dtype=bool)
+            for c_val in sorted(c_tx_options_f):           # ascending → pick smallest that works
+                can_use    = (np.float64(c_val) >= C_needed) & ~zvs_ok
+                c_tx_nf_s  = np.where(can_use,
+                                      np.float32(c_val * 1e9),
+                                      c_tx_nf_s)
+                zvs_ok    |= can_use
+            eta_sys = np.where(zvs_ok, eta_sys, np.float32(0.0))
+            # To enable double-cap (parallel) TX selection later, extend the
+            # loop above to also try pairwise sums of c_tx_options_f before
+            # zeroing infeasible candidates.
+        # ───────────────────────────────────────────────────────────────────
+
+        # ── RX cap selection (series resonance) ─────────────────────────────
+        # Pick the single available cap closest to C_ideal = 1/(4π²·f²·L_rx).
+        # This is a recording step only — it does not affect eta ranking.
+        # To enable double-cap RX selection later, extend the loop below to
+        # also try pairwise sums of c_rx_options_f and keep the best match.
+        c_rx_nf_s = np.zeros(bs_v, dtype=np.float32)
+        if c_rx_options_f:
+            L_rx_si    = np.maximum(Y[:, 1].astype(np.float64) * 1e-6, 1e-18)
+            C_rx_ideal = 1.0 / (4.0 * math.pi ** 2 * freq_ref_hz ** 2 * L_rx_si)
+            best_dist  = np.full(bs_v, np.inf, dtype=np.float64)
+            for c_val in c_rx_options_f:
+                dist   = np.abs(np.float64(c_val) - C_rx_ideal)
+                better = dist < best_dist
+                c_rx_nf_s  = np.where(better, np.float32(c_val * 1e9), c_rx_nf_s)
+                best_dist  = np.minimum(best_dist, dist)
+        # ───────────────────────────────────────────────────────────────────
+
         accs["tx_turns"].append(tx_turns_s)
         accs["tx_width"].append(tx_width_s)
         accs["tx_od_mm"].append(tx_od_s)
@@ -414,6 +490,8 @@ def _nn_sweep(params, log_cb, cancel_flag):
         accs["rx_id_mm"].append(rx_id_s)
         accs["eta_sys"].append(eta_sys)
         accs["D_vmin"].append(D_vmin)
+        accs["c_tx_nf"].append(c_tx_nf_s)
+        accs["c_rx_nf"].append(c_rx_nf_s)
 
     concat = {k: np.concatenate(v) for k, v in accs.items()}
     concat["_topologies"]  = np.array(topologies)
@@ -450,15 +528,18 @@ def _top_k(result, topologies, k=12):
         seen.add(key)
         gc = float(result["gc_dia_mm"][i])
         winners.append({
-            "tx_turns":   tx_t,
-            "tx_width":   float(result["tx_width"][i]),
-            "tx_od_mm":   float(result["tx_od_mm"][i]),
-            "rx_turns":   rx_t,
-            "rx_width":   float(result["rx_width"][i]),
-            "rx_od_mm":   float(result["rx_od_mm"][i]),
+            "tx_turns":    tx_t,
+            "tx_width":    float(result["tx_width"][i]),
+            "tx_od_mm":    float(result["tx_od_mm"][i]),
+            "rx_turns":    rx_t,
+            "rx_width":    float(result["rx_width"][i]),
+            "rx_od_mm":    float(result["rx_od_mm"][i]),
             "rx_topology": topo,
-            "gc_dia_mm":  gc,
-            "eta_sys":    float(eta[i]),
+            "gc_dia_mm":   gc,
+            "eta_sys":     float(eta[i]),
+            "L_tx_uH":     float(result["L_tx"][i]),
+            "c_tx_nf":     float(result["c_tx_nf"][i]),
+            "c_rx_nf":     float(result["c_rx_nf"][i]),
         })
         if len(winners) >= k:
             break
@@ -472,7 +553,7 @@ def _top_k(result, topologies, k=12):
 def _build_sim_params(winners, domain, timeout_sec):
     from parallel_sim import SimParams
     glb = domain.get("global", {})
-    freq_range = glb.get("freq_hz", [110000.0, 135000.0])
+    freq_range = glb.get("freq_hz", [340000.0, 380000.0])
     freq_hz  = 0.5 * (freq_range[0] + freq_range[1])
     pcb_gap  = glb.get("pcb_gap_mm", [2.4, 2.8])
     pcb_gap_mm = 0.5 * (pcb_gap[0] + pcb_gap[1]) if isinstance(pcb_gap, list) else float(pcb_gap)
@@ -535,7 +616,7 @@ def _append_to_refined(sim_results, winners, refined_path, domain, log_cb):
         data = {"meta": {}, "results": []}
 
     existing_uuids = {r.get("uuid") for r in data["results"] if r.get("uuid")}
-    freq_range = domain.get("global", {}).get("freq_hz", [110000.0, 135000.0])
+    freq_range = domain.get("global", {}).get("freq_hz", [340000.0, 380000.0])
     freq_hz    = 0.5 * (freq_range[0] + freq_range[1])
     added      = 0
 
@@ -546,7 +627,6 @@ def _append_to_refined(sim_results, winners, refined_path, domain, log_cb):
         uid = str(uuid.uuid4())
         row = {
             "uuid":              uid,
-            "ok":                True,
             "tx_turns":          w["tx_turns"],
             "tx_width":          w["tx_width"],
             "tx_trace_width_mm": w["tx_width"],
@@ -681,12 +761,27 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                 log_cb("  No feasible combinations found — stopping.")
                 break
 
-            top1 = winners[0]
+            top1  = winners[0]
+            _c    = top1.get("c_tx_nf", 0.0)
+            _c_rx = top1.get("c_rx_nf", 0.0)
+            _L    = top1.get("L_tx_uH", 0.0)
+            _dith = params.get("dither_amp_hz", 0.0)
+            if _c > 0.0 and _L > 1e-6 and _dith > 0.0:
+                _f0 = 1.0 / (2.0 * math.pi * math.sqrt(
+                    max(_L * 1e-6 * _c * 1e-9, 1e-30)))
+                _f_min = (params["freq_min_hz"] + params["freq_max_hz"]) / 2.0 - _dith
+                _ratio = _f_min / _f0
+                _rx_str = f"  C_rx={_c_rx:.0f}nF" if _c_rx > 0.0 else ""
+                _zvs_str = (f"  |  C_tx={_c:.0f}nF{_rx_str}  L_tx={_L:.1f}µH  "
+                            f"f0={_f0/1e3:.1f}kHz  ZVS×{_ratio:.2f}")
+            else:
+                _zvs_str = f"  |  L_tx={_L:.1f}µH" if _L > 0 else ""
             log_cb(f"\nTop winner: TX {top1['tx_od_mm']:.1f}mm {top1['tx_turns']}t "
                    f"w={top1['tx_width']:.2f}  |  "
                    f"RX {top1['rx_od_mm']:.1f}mm {top1['rx_turns']}t "
                    f"w={top1['rx_width']:.2f} {top1['rx_topology']}  "
-                   f"η={top1['eta_sys']*100:.1f}%  D={top1.get('D_vmin',1)*100:.0f}%")
+                   f"η={top1['eta_sys']*100:.1f}%  D={top1.get('D_vmin',1)*100:.0f}%"
+                   f"{_zvs_str}")
             log_cb(f"  Top {len(winners)} sent to FastHenry.")
 
             # Check convergence: same winner 3 times in a row
@@ -794,29 +889,31 @@ class NNOptimisationTab(ttk.Frame):
         # ── TX / RX narrowing ────────────────────────────────────────────────
         tx_f = ttk.LabelFrame(col_l, text="Narrow Down Domain — TX")
         tx_f.pack(fill="x", pady=(0, 6))
-        self._tx_od_max = self._row(tx_f, "OD max (mm):", "53.0")
-        self._tx_id_min = self._row(tx_f, "ID min (mm):", "35.0")
+        self._tx_od_max = self._row(tx_f, "OD max (mm):", DEFAULT_TX_OD_MAX)
+        self._tx_id_min = self._row(tx_f, "ID min (mm):", DEFAULT_TX_ID_MIN)
         self._bind_cap(self._tx_od_max, "tx", "od_max_mm")
         self._bind_cap(self._tx_id_min, "tx", "id_min_mm", is_min=True)
+        self._bind_od_id_guard(self._tx_od_max, self._tx_id_min)
 
         rx_f = ttk.LabelFrame(col_l, text="Narrow Down Domain — RX")
         rx_f.pack(fill="x", pady=(0, 6))
-        self._rx_od_max = self._row(rx_f, "OD max (mm):", "53.0")
-        self._rx_id_min = self._row(rx_f, "ID min (mm):", "35.0")
+        self._rx_od_max = self._row(rx_f, "OD max (mm):", DEFAULT_RX_OD_MAX)
+        self._rx_id_min = self._row(rx_f, "ID min (mm):", DEFAULT_RX_ID_MIN)
         self._bind_cap(self._rx_od_max, "rx", "od_max_mm")
         self._bind_cap(self._rx_id_min, "rx", "id_min_mm", is_min=True)
+        self._bind_od_id_guard(self._rx_od_max, self._rx_id_min)
 
         # ── Ground circle ────────────────────────────────────────────────────
         gc_f = ttk.LabelFrame(col_l, text="Ground Circle")
         gc_f.pack(fill="x", pady=(0, 6))
-        self._gc_enabled = tk.BooleanVar(value=False)
+        self._gc_enabled = tk.BooleanVar(value=DEFAULT_GC_ENABLED)
         ttk.Checkbutton(gc_f, text="Enable Ground Circle (fixed diameter)",
                         variable=self._gc_enabled,
                         command=self._on_gc_toggle).pack(anchor="w", padx=6, pady=(4, 2))
         gc_row = ttk.Frame(gc_f)
         gc_row.pack(fill="x", padx=6, pady=(0, 4))
         ttk.Label(gc_row, text="GC diameter (mm):", width=22, anchor="w").pack(side="left")
-        self._gc_dia = tk.StringVar(value="20.0")
+        self._gc_dia = tk.StringVar(value=DEFAULT_GC_DIA)
         self._gc_dia_entry = ttk.Entry(gc_row, textvariable=self._gc_dia, width=8)
         self._gc_dia_entry.pack(side="left")
         self._on_gc_toggle()
@@ -839,31 +936,40 @@ class NNOptimisationTab(ttk.Frame):
         # ── Evaluation parameters ─────────────────────────────────────────────
         ev_f = ttk.LabelFrame(col_r, text="Evaluation Parameters")
         ev_f.pack(fill="x", pady=(0, 6))
-        self._p_target_mw = self._row(ev_f, "Target RX power (mW):", "50")
-        self._v_min       = self._row(ev_f, "TX V_min (V):", "3.2")
-        self._v_max       = self._row(ev_f, "TX V_max (V):", "4.4")
-        self._d_min_pct   = self._row(ev_f, "Min duty cycle (%):", "")
+        self._p_target_mw = self._row(ev_f, "Target RX power (mW):", DEFAULT_P_TARGET_MW)
+        self._v_min       = self._row(ev_f, "TX V_min (V):", DEFAULT_V_MIN)
+        self._v_max       = self._row(ev_f, "TX V_max (V):", DEFAULT_V_MAX)
+        self._d_min_pct   = self._row(ev_f, "Min duty cycle (%):", DEFAULT_D_MIN_PCT)
         ttk.Label(ev_f, text="Blank = no minimum duty floor.",
                   foreground="gray", font=("TkDefaultFont", 8)
                   ).pack(anchor="w", padx=6, pady=(0, 2))
-        self._rx_max_caps = self._row(ev_f, "RX caps (1 or 2):", "2")
+        self._dither_amp_khz = self._row(ev_f, "Dither amplitude (kHz):", DEFAULT_DITHER_AMP_KHZ)
+        self._zvs_margin_pct = self._row(ev_f, "ZVS margin (%):", DEFAULT_ZVS_MARGIN_PCT)
+        _cap_str = ", ".join(f"{c:g}" for c in E_VALUES_NF) + " nF"
+        ttk.Label(ev_f,
+                  text=f"Caps from E-value list: {_cap_str}. "
+                       "TX: ZVS gate (f_drive_min > f₀·(1+margin)). "
+                       "RX: closest to series resonance. 0 dither = ZVS disabled.",
+                  foreground="gray", font=("TkDefaultFont", 8),
+                  wraplength=340, justify="left"
+                  ).pack(anchor="w", padx=6, pady=(0, 4))
 
         # ── Iteration & sweep settings ────────────────────────────────────────
         it_f = ttk.LabelFrame(col_r, text="Optimisation Settings")
         it_f.pack(fill="x", pady=(0, 6))
-        self._n_combos  = self._row(it_f, "Combinations / iter (M):", "10")
-        self._max_iters = self._row(it_f, "Max iterations:", "20")
-        self._top_k     = self._row(it_f, "Top-K for FastHenry:", "12")
-        self._fh_workers   = self._row(it_f, "FH workers:", "6")
-        self._fh_timeout   = self._row(it_f, "FH timeout (s):", "360")
+        self._n_combos  = self._row(it_f, "Combinations / iter (M):", DEFAULT_N_COMBOS_M)
+        self._max_iters = self._row(it_f, "Max iterations:", DEFAULT_MAX_ITERS)
+        self._top_k     = self._row(it_f, "Top-K for FastHenry:", DEFAULT_TOP_K)
+        self._fh_workers   = self._row(it_f, "FH workers:", DEFAULT_FH_WORKERS)
+        self._fh_timeout   = self._row(it_f, "FH timeout (s):", DEFAULT_FH_TIMEOUT_S)
 
         # ── Training hyperparams ──────────────────────────────────────────────
         tr_f = ttk.LabelFrame(col_r, text="Retrain Hyperparameters")
         tr_f.pack(fill="x", pady=(0, 6))
-        self._tr_epochs    = self._row(tr_f, "Epochs:", "300")
-        self._tr_batch     = self._row(tr_f, "Batch size:", "512")
-        self._tr_lr        = self._row(tr_f, "LR:", "0.0005")
-        self._tr_val_split = self._row(tr_f, "Val split:", "0.15")
+        self._tr_epochs    = self._row(tr_f, "Epochs:", DEFAULT_TR_EPOCHS)
+        self._tr_batch     = self._row(tr_f, "Batch size:", DEFAULT_TR_BATCH)
+        self._tr_lr        = self._row(tr_f, "LR:", DEFAULT_TR_LR)
+        self._tr_val_split = self._row(tr_f, "Val split:", DEFAULT_TR_VAL_SPLIT)
 
         # ── Control / progress / log ──────────────────────────────────────────
         run_lf = ttk.LabelFrame(col_r, text="Optimisation Control")
@@ -923,6 +1029,29 @@ class NNOptimisationTab(ttk.Frame):
             if abs(clamped - v) > 1e-9:
                 var.set(f"{clamped:.1f}")
         var.trace_add("write", _cap)
+
+    def _bind_od_id_guard(self, od_var, id_var):
+        """Ensure OD > ID: clamp whichever field was just edited."""
+        def _guard_od(*_):
+            try:
+                od = float(od_var.get())
+                id_ = float(id_var.get())
+            except ValueError:
+                return
+            if od <= id_:
+                od_var.set(f"{id_ + 1.0:.1f}")
+
+        def _guard_id(*_):
+            try:
+                od = float(od_var.get())
+                id_ = float(id_var.get())
+            except ValueError:
+                return
+            if id_ >= od:
+                id_var.set(f"{od - 1.0:.1f}")
+
+        od_var.trace_add("write", _guard_od)
+        id_var.trace_add("write", _guard_id)
 
     @staticmethod
     def _short_path(p):
@@ -1080,7 +1209,7 @@ class NNOptimisationTab(ttk.Frame):
         dom_rx_w      = rx.get("trace_width_mm", [0.2, 1.2])
         dom_tx_turns  = tx.get("turns", [3, 99])
         dom_rx_turns  = rx.get("turns", [3, 99])
-        dom_freq      = glb.get("freq_hz", [110000.0, 135000.0])
+        dom_freq      = glb.get("freq_hz", [340000.0, 380000.0])
         rx_topos      = rx.get("allowed_topologies") or ["parallel", "series", "parallel_pairs_ser"]
 
         tx_od_max = min(flt(self._tx_od_max, "TX OD max", lo=10.0), dom_tx_od_max)
@@ -1101,7 +1230,26 @@ class NNOptimisationTab(ttk.Frame):
         v_max      = flt(self._v_max, "V_max", lo=v_min)
         d_min_pct  = flt(self._d_min_pct, "Min duty %", lo=0.0, allow_empty=True)
         d_min      = d_min_pct / 100.0
-        rx_caps    = max(1, min(2, int(flt(self._rx_max_caps, "RX caps", lo=1, hi=2))))
+
+        def _parse_cap_list(var, name):
+            opts = []
+            for _s in var.get().strip().split(","):
+                _s = _s.strip()
+                if _s:
+                    try:
+                        _v = float(_s)
+                        if _v > 0:
+                            opts.append(_v * 1e-9)
+                    except ValueError:
+                        pass
+            if not opts:
+                raise ValueError(f"{name} must be a comma-separated list in nF (e.g. '100, 200').")
+            return sorted(opts)
+
+        c_tx_options_f = _parse_cap_list(self._tx_caps_nf, "TX cap options")
+        c_rx_options_f = _parse_cap_list(self._rx_caps_nf, "RX cap options")
+        dither_amp_hz  = flt(self._dither_amp_khz, "Dither amplitude", lo=0.0) * 1e3
+        zvs_margin     = flt(self._zvs_margin_pct, "ZVS margin",       lo=0.0, hi=50.0) / 100.0
 
         n_combos  = int(flt(self._n_combos, "Combinations (M)", lo=0.001) * 1_000_000)
         max_iters = int(flt(self._max_iters, "Max iterations", lo=1))
@@ -1133,7 +1281,11 @@ class NNOptimisationTab(ttk.Frame):
             freq_min_hz=dom_freq[0], freq_max_hz=dom_freq[1],
             gc_enabled=gc_enabled, gc_dia_mm=gc_dia_mm,
             p_target_w=p_target_w, v_min=v_min, v_max=v_max,
-            d_min=d_min, rx_max_caps=rx_caps,
+            d_min=d_min,
+            c_tx_options_f=c_tx_options_f,
+            c_rx_options_f=c_rx_options_f,
+            dither_amp_hz=dither_amp_hz,
+            zvs_margin=zvs_margin,
             n_combos=n_combos, max_iters=max_iters, top_k=top_k,
             fh_workers=fh_workers, fh_timeout=fh_timeout,
             train_params=dict(epochs=epochs, batch=batch,

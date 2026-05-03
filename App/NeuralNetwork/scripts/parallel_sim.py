@@ -88,9 +88,9 @@ class SimParams:
  
     # --- Global / sim params ---
     pcb_gap_mm:    float = 2.6
-    freq_hz:       float = 130_000.0
-    fmin_hz:       float = 110_000.0
-    fmax_hz:       float = 140_000.0
+    freq_hz:       float = 360_000.0
+    fmin_hz:       float = 340_000.0
+    fmax_hz:       float = 380_000.0
     freq_ndec:     int   = 1
     resolution_mm: float = 1.0
     timeout_sec:   float = 240.0   # 4 minutes — 2-port sims are heavier
@@ -313,9 +313,8 @@ def run_single_sim(p: SimParams) -> dict:
     """
     Complete 2-port FastHenry simulation for one TX+RX parameter point.
 
-    Returns a dict with at minimum:
-      {"ok": True,  "tag": p.tag, ...result fields...}
-      {"ok": False, "tag": p.tag, "error": "<reason>"}
+    Returns a dict with result fields on success, or {"error": "<reason>"}
+    on failure.
 
     Never raises — all exceptions are caught so a ProcessPoolExecutor
     worker never crashes the pool.

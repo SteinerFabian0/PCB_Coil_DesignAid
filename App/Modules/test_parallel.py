@@ -107,7 +107,7 @@ def main():
         secs = r.get("elapsed_sec", "?")
         pids_seen.add(pid)
 
-        if r["ok"]:
+        if "error" not in r:
             print(f"{tag:<22} {pid:>6}  {secs:>7.1f}s  "
                   f"L={r['L_uH']:.3f} uH  "
                   f"R_ac={r['R_ac_ohm']:.4f} Ω  "

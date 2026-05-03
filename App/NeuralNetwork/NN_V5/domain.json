@@ -1,0 +1,114 @@
+{
+  "tx": {
+    "layers_selected": [
+      true,
+      true,
+      true,
+      false
+    ],
+    "od_max_mm": 55.0,
+    "id_min_mm": 35.0,
+    "trace_width_mm": [
+      0.2,
+      1.2
+    ],
+    "trace_spacing_mm": [
+      0.16,
+      0.16
+    ],
+    "turns": [
+      6,
+      18
+    ],
+    "outer_cu_oz": [
+      1.0,
+      1.0
+    ],
+    "inner_cu_oz": [
+      0.5,
+      1.0
+    ],
+    "outer_gap_mm": [
+      0.2,
+      0.2
+    ],
+    "inner_gap_mm": [
+      1.0,
+      1.0
+    ],
+    "nhinc": 1,
+    "nwinc": 3,
+    "port_outside_allowed": true,
+    "port_inside_allowed": false,
+    "allowed_topologies": [
+      "parallel",
+      "series"
+    ]
+  },
+  "rx": {
+    "layers_selected": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "od_max_mm": 55.0,
+    "id_min_mm": 35.0,
+    "trace_width_mm": [
+      0.2,
+      1.2
+    ],
+    "trace_spacing_mm": [
+      0.16,
+      0.16
+    ],
+    "turns": [
+      4,
+      25
+    ],
+    "outer_cu_oz": [
+      1.0,
+      1.0
+    ],
+    "inner_cu_oz": [
+      0.5,
+      0.5
+    ],
+    "outer_gap_mm": [
+      0.2,
+      0.2
+    ],
+    "inner_gap_mm": [
+      0.6,
+      0.6
+    ],
+    "nhinc": 1,
+    "nwinc": 3,
+    "port_outside_allowed": false,
+    "port_inside_allowed": true,
+    "allowed_topologies": [
+      "parallel",
+      "series",
+      "parallel_pairs_ser"
+    ]
+  },
+  "global": {
+    "pcb_gap_mm": [
+      2.4,
+      2.8
+    ],
+    "resolution_mm": 1.5,
+    "freq_hz": [
+      350000.0,
+      370000.0
+    ],
+    "freq_step_hz": 5000.0
+  },
+  "n_total": 12000,
+  "n_valid": 12000,
+  "seed": 42,
+  "config_hash": "b30c0b0f087b",
+  "ground_circle_enabled": true,
+  "ground_circle_min_mm": 18.0,
+  "ground_circle_max_mm": 24.0
+}

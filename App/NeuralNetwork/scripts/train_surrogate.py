@@ -86,7 +86,7 @@ def load_data(path: str) -> pd.DataFrame:
     with open(path, "r") as f:
         raw = json.load(f)
 
-    records = [r for r in raw["results"] if r.get("ok")]
+    records = raw["results"]
     df = pd.DataFrame(records)
     print(f"Loaded {len(df)} successful simulation records from {path}")
     return df

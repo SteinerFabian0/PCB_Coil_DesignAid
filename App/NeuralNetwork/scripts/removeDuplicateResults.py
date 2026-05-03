@@ -16,11 +16,7 @@ def clean_data(input_file, output_file):
     # Process results
     for entry in data['results']:
         tag = entry.get('tag')
-        is_ok = entry.get('ok')
-
-        # Condition 1: "ok" must be exactly True
-        # Condition 2: "tag" must not have been seen before
-        if is_ok is True and tag not in seen_tags:
+        if tag not in seen_tags:
             cleaned_results.append(entry)
             seen_tags.add(tag)
     
@@ -38,7 +34,7 @@ def clean_data(input_file, output_file):
     print(f"------------------")
     print(f"Original entries:  {original_count}")
     print(f"Valid & Unique:    {len(cleaned_results)}")
-    print(f"Total Removed:     {removed_count} (duplicates or ok=false)")
+    print(f"Total Removed:     {removed_count} (duplicates)")
     print(f"Cleaned file:      {output_file}")
 
 # --- Run ---

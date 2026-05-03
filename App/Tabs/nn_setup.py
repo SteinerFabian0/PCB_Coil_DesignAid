@@ -835,20 +835,17 @@ class AutomationTab(ttk.Frame):
                 d = json.load(f)
         except Exception:
             return
-        n_ok    = 0
         covered = set()
         for r in d.get("results", []):
             uid = r.get("uuid")
             if uid:
                 covered.add(uid)
-                if r.get("ok"):
-                    n_ok += 1
         self._sweep_covered_uuids = covered
-        self._sweep_n_ok = n_ok
+        self._sweep_n_ok = len(covered)
         pct = f"{100*len(covered)//n_total}%" if n_total else "—"
         if hasattr(self, "_sstat_done"):
             self._sstat_done.set(f"Done: {len(covered)}/{n_total}  ({pct})")
-            self._sstat_ok.set(f"OK: {n_ok}")
+            self._sstat_ok.set(f"OK: {len(covered)}")
         self._redraw_sweep_bar()
 
     def _redraw_sweep_bar(self):

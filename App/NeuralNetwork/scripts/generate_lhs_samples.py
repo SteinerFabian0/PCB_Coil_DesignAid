@@ -87,7 +87,7 @@ DEFAULT_DOMAIN = {
     "global": {
         "pcb_gap_mm":    [2.6, 2.6],
         "resolution_mm": 1.2,
-        "freq_hz":       [100_000.0, 150_000.0],
+        "freq_hz":       [340_000.0, 380_000.0],
         "freq_step_hz":  5000.0,
     },
     "n_total": 20_000,
@@ -261,9 +261,9 @@ def _decode(u_row, cfg):
     tx_oz_i  = quantize_oz(u_row[7], *tx["inner_cu_oz"])
 
     rx_w     = round(_scale(u_row[9],  *rx["trace_width_mm"]), 4)
-    # RX OD must be <= TX OD and >= TX OD - 4 mm
+    # RX OD: allow up to 5 mm larger than TX OD, still bounded by domain od_max
     rx_od_lo = max(rx["id_min_mm"] + 2.0, tx_od - 4.0)
-    rx_od_hi = min(rx["od_max_mm"], tx_od)
+    rx_od_hi = min(rx["od_max_mm"], tx_od + 5.0)
     if rx_od_hi < rx_od_lo:
         rx_od_hi = rx_od_lo
     rx_od    = round(_scale(u_row[10], rx_od_lo, rx_od_hi), 4)
