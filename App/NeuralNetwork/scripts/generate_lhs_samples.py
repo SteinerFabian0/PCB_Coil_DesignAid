@@ -466,46 +466,6 @@ def write_samples_file(samples: list, cfg: dict, out_path: str,
 
 
 # ---------------------------------------------------------------------------
-# Global results metadata
-# ---------------------------------------------------------------------------
-
-def _load_global_results(path: str) -> dict:
-    if not os.path.exists(path):
-        return {"meta": {"n_lhs_batches": 0, "lhs_batches": {}}, "results": []}
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return {"meta": {"n_lhs_batches": 0, "lhs_batches": {}}, "results": []}
-
-
-def _next_batch_number(global_path: str) -> int:
-    data = _load_global_results(global_path)
-    n_batches = data.get("meta", {}).get("n_lhs_batches", 0)
-    return n_batches + 1
-
-
-def _update_global_batch_metadata(global_path: str, batch_num: int,
-                                  batch_file: str, n_samples: int,
-                                  domain_file: str = "") -> None:
-    data = _load_global_results(global_path)
-    meta = data.setdefault("meta", {})
-    lhs_batches = meta.setdefault("lhs_batches", {})
-
-    lhs_batches[str(batch_num)] = {
-        "file":        batch_file,
-        "domain_file": domain_file,
-        "n_samples":   n_samples,
-    }
-    meta["n_lhs_batches"] = max(meta.get("n_lhs_batches", 0), batch_num)
-
-    tmp = global_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2, default=str)
-    os.replace(tmp, global_path)
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

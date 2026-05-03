@@ -16,7 +16,6 @@ Domain bounds are read from the selected model's domain.json.
 User inputs on the left narrow the domain further.
 """
 
-import copy
 import json
 import math
 import os
@@ -44,85 +43,60 @@ import parametric_coil as pc
 from cap_combinator import E_VALUES_NF
 
 
-# ── Fallback domain ───────────────────────────────────────────────────────────
-_FALLBACK_DOMAIN = {
-    "tx": {
-        "od_max_mm": 55.0, "id_min_mm": 35.0,
-        "trace_width_mm": [0.2, 1.6], "turns": [6, 18],
-        "allowed_topologies": ["parallel", "series"],
-    },
-    "rx": {
-        "od_max_mm": 55.0, "id_min_mm": 35.0,
-        "trace_width_mm": [0.2, 1.2], "turns": [4, 25],
-        "allowed_topologies": ["parallel", "series", "parallel_pairs_ser"],
-    },
-    "global": {"freq_hz": [340000.0, 380000.0]},
-    "ground_circle_enabled": True,
-    "ground_circle_min_mm": 18.0,
-    "ground_circle_max_mm": 24.0,
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UI Defaults  ← tweak these to change the tab's initial values
 # ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_TX_OD_MAX      = "55.0"   # mm
-DEFAULT_TX_ID_MIN      = "35.0"   # mm
-DEFAULT_RX_OD_MAX      = "55.0"   # mm
-DEFAULT_RX_ID_MIN      = "35.0"   # mm
 DEFAULT_GC_ENABLED     = True
-DEFAULT_GC_DIA         = "20.0"   # mm
-DEFAULT_P_TARGET_MW    = "50"     # mW
+DEFAULT_P_TARGET_MW    = "40"     # mW
 DEFAULT_V_MIN          = "3.2"    # V
 DEFAULT_V_MAX          = "4.4"    # V
 DEFAULT_D_MIN_PCT      = ""       # blank = no floor
-DEFAULT_DITHER_AMP_KHZ = "10.0"           # frequency dither amplitude (kHz)
-DEFAULT_ZVS_MARGIN_PCT = "15.0"           # f_drive_min must be this % above f0_tx
-DEFAULT_N_COMBOS_M     = "20"     # millions
-DEFAULT_MAX_ITERS      = "20"
-DEFAULT_TOP_K          = "12"
-DEFAULT_FH_WORKERS     = "12"
+DEFAULT_DITHER_AMP_KHZ = "8.0"    # frequency dither amplitude (kHz)
+DEFAULT_ZVS_MARGIN_PCT = "15.0"   # f_drive_min must be this % above f0_tx
+DEFAULT_N_COMBOS_M     = "80"     # millions
+DEFAULT_MAX_ITERS      = "10"
+DEFAULT_TOP_K          = "30"
+DEFAULT_FH_WORKERS     = "15"
 DEFAULT_FH_TIMEOUT_S   = "360"
-DEFAULT_TR_EPOCHS      = "300"
-DEFAULT_TR_BATCH       = "512"
-DEFAULT_TR_LR          = "0.0005"
-DEFAULT_TR_VAL_SPLIT   = "0.15"
+DEFAULT_TR_EPOCHS    = "300"
+DEFAULT_TR_BATCH     = "256"
+DEFAULT_TR_LR        = "0.0005"
+DEFAULT_TR_VAL_SPLIT = "0.2"
+
+# Fixed-stackup defaults for one optimisation run (user-editable in the tab).
+# 0 oz = layer inactive. Re-run the optimiser for other stackups / pcb gaps.
+DEFAULT_PCB_GAP_MM     = "2.4"
+DEFAULT_TX_LAYER_OZ    = ["1.0", "1.0", "1.0", "0"]
+DEFAULT_RX_LAYER_OZ    = ["1.0", "0.5", "0.5", "1.0"]
+
+# Resolution at which sampled combinations are snapped to physical grid.
+# Spurious sub-resolution variation contaminates the surrogate's training
+# distribution and the FastHenry refinement budget. Match the values you
+# can actually realise on a PCB.
+_GRID_TURNS_STEP    = 1
+_GRID_OD_MM_STEP    = 0.2     # all diameters
+_GRID_WIDTH_MM_STEP = 0.01    # trace width
+_GRID_FREQ_HZ_STEP  = 1000.0
+_GRID_OZ_STEP       = 0.5
 
 # ── Physical constants ────────────────────────────────────────────────────────
 BATCH_SIZE   = 500_000
 _SPACING_MM  = 0.16
-_OZ_MM       = 0.035
+_OZ_MM       = 0.035                    # 1 oz copper thickness in mm
 _RHO_30C     = 1.724e-8 * (1 + 0.00393 * 10)
 
-_TX_N_LAYERS = 3
-_TX_H_M      = _OZ_MM * 1e-3
-
-_RX_H_OZ     = [1.0, 0.5, 0.5, 1.0]
-_RX_H_M      = [h * _OZ_MM * 1e-3 for h in _RX_H_OZ]
-_RX_HSUM_PAR = sum(_RX_H_M)
-_RX_HSUM_A   = _RX_H_M[0] + _RX_H_M[1]
-_RX_HSUM_B   = _RX_H_M[2] + _RX_H_M[3]
-_RX_HINV_SER = sum(1.0 / h for h in _RX_H_M)
-
-_TOPO_OH_IDX = {"parallel": 0, "parallel_pairs_ser": 1, "series": 2}
+# Stable topology vocabulary — must match TOPOLOGY_VOCAB in train_surrogate.py
+TOPOLOGY_VOCAB = ["parallel", "series", "parallel_pairs_ser"]
 
 _V_DIODE = 0.35
 _V_DROP  = 2.0 * _V_DIODE
 
-_TRAIN_SCRIPT = os.path.join(_NN_SCRIPTS, "train_surrogate.py")
+# RX-side rail constraints (post-rectifier, on storage cap)
+_V_ZENER_DC       = 6.8   # zener clamp on RX cap → power above this is wasted
+_V_MIN_INDUCED_DC = 4.0   # required cap voltage at V_min, D=1 (LDO headroom)
 
-# ── SimParams stackup defaults (must match training data) ─────────────────────
-_TX_LAYERS_DEFAULT = [
-    {"active": True,  "copper_oz": 1.0},
-    {"active": True,  "copper_oz": 1.0},
-    {"active": True,  "copper_oz": 1.0},
-    {"active": False, "copper_oz": 1.0},
-]
-_RX_LAYERS_DEFAULT = [
-    {"active": True, "copper_oz": 1.0},
-    {"active": True, "copper_oz": 0.5},
-    {"active": True, "copper_oz": 0.5},
-    {"active": True, "copper_oz": 1.0},
-]
+_TRAIN_SCRIPT = os.path.join(_NN_SCRIPTS, "train_surrogate.py")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,8 +110,8 @@ def _load_domain(model_dir: str) -> dict:
             with open(path) as f:
                 return json.load(f)
         except Exception:
-            pass
-    return copy.deepcopy(_FALLBACK_DOMAIN)
+            return None
+    return None
 
 
 def _spiral_length_m(od_mm, w_mm, turns):
@@ -197,10 +171,38 @@ def _load_nn(model_dir):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _score_batch(L_tx, L_rx, M, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
-                 freq_ref_hz, freq_hz, V_min, V_max, P_target_w, D_min):
+                 C_tx, C_rx,
+                 freq_ref_hz, freq_hz, f_drive_min_hz, f_drive_max_hz,
+                 V_min, V_max, P_target_w, D_min,
+                 zvs_margin, V_min_induced_dc, V_zener_dc):
     """
-    Returns (eta_sys, feasible) arrays.  eta_sys is system efficiency (link×rect)
-    at worst-case V_min.  feasible = True where combo can deliver P_target.
+    Returns (eta_sys, feasible, D_vmin, V_dc_min, f0_tx_hz, f0_rx_hz, f_op_lo_hz).
+
+    Control model:
+      • At heavy load (V_min) the controller drives near f0_tx, just enough above
+        to maintain ZVS — small *operational* margin, not the full safety margin.
+        Gates and ranking use matched-load values at this op point.
+      • At light load (V_max) the controller can detune to f_drive_max to throttle.
+        TX-tank power gain G(f) = 1 / (1 + (Q_tx · (f/f0 - f0/f))²) reduces P,
+        giving the system room to back off without violating duty floor.
+
+    The user-set zvs_margin is treated as a *feasibility safety buffer* — the
+    combo must support ZVS across the full sweep with that margin — but the
+    heavy-load steady-state op point is assumed close to matched-load.
+
+    Hard gates:
+      • ZVS:       f_drive_min ≥ f0_tx · (1 + zvs_margin)
+      • P_min:     P_matched(V_min) ≥ P_target
+      • P_max:     P_matched(V_max) · G_min_tx · D_min ≤ P_target
+                   (light-load throttle via detuning + duty)
+      • V_floor:   V_pk_matched(V_min) − V_drop ≥ V_min_induced_dc
+
+    eta_sys (ranking metric, at heavy-load matched-load):
+      eta_link · eta_rect_matched · zener_clip(V_dc_min) · detune_rx(f_drive_min)
+
+    The zener clip term penalises designs whose natural V_dc exceeds the
+    6.8 V TVS rail — that excess is dumped to ground as heat, not useful
+    power, and has to be reflected in the ranking.
     """
     omega   = 2.0 * math.pi * freq_hz
     skin_sc = math.sqrt(freq_hz / freq_ref_hz)
@@ -208,6 +210,8 @@ def _score_batch(L_tx, L_rx, M, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
     L_tx = np.maximum(L_tx.astype(np.float64) * 1e-6, 1e-9)
     L_rx = np.maximum(L_rx.astype(np.float64) * 1e-6, 1e-9)
     M    = np.maximum(M.astype(np.float64)    * 1e-6, 0.0)
+    C_tx = np.maximum(np.asarray(C_tx, dtype=np.float64), 1e-15)
+    C_rx = np.maximum(np.asarray(C_rx, dtype=np.float64), 1e-15)
 
     R_tx_ac = DCR_tx.astype(np.float64) + np.maximum(
         0.0, R_tx_nn.astype(np.float64) - DCR_tx.astype(np.float64)) * skin_sc
@@ -223,47 +227,163 @@ def _score_batch(L_tx, L_rx, M, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
     eta_link = U * U / np.maximum((1.0 + sq) ** 2, 1e-18)
     Z_tx_opt = np.maximum(R_tx_ac * sq, 1e-12)
 
+    # ── Resonances (per-row, given the sampled C_tx, C_rx) ────────────────
+    f0_tx = 1.0 / (2.0 * math.pi * np.sqrt(L_tx * C_tx))
+    f0_rx = 1.0 / (2.0 * math.pi * np.sqrt(L_rx * C_rx))
+
+    # ── ZVS feasibility (safety-margin gate) ──────────────────────────────
+    zvs_ok  = f_drive_min_hz >= f0_tx * (1.0 + zvs_margin)
+
+    # ── Light-load detune for throttling (drive at top of sweep) ──────────
+    f_op_hi = f_drive_max_hz
+    x_hi    = f_op_hi / f0_tx - f0_tx / f_op_hi
+    G_tx_min = 1.0 / (1.0 + (Q_tx * x_hi) ** 2)   # min gain at light load
+
+    # Heavy-load reporting frequency = bottom of sweep (where controller
+    # operates for max gain). Used for RX detune calc and diagnostics.
+    f_op_lo = np.full_like(f0_tx, f_drive_min_hz)
+
     V_rms_min = V_min * math.sqrt(2.0) / math.pi
     V_rms_max = V_max * math.sqrt(2.0) / math.pi
 
-    P_rx_min = eta_link * (V_rms_min ** 2) / Z_tx_opt
-    P_rx_max = eta_link * (V_rms_max ** 2) / Z_tx_opt
+    # Matched-load reference (heavy-load assumption).
+    P_rx_min_m = eta_link * (V_rms_min ** 2) / Z_tx_opt
+    P_rx_max_m = eta_link * (V_rms_max ** 2) / Z_tx_opt
 
     R_ratio = np.sqrt(np.maximum(R_rx_ac / np.maximum(R_tx_ac, 1e-12), 0.0))
 
-    def _eta_rect(V_rms):
-        V_load_pk = (U * V_rms * R_ratio
-                     / np.maximum(1.0 + sq, 1e-12) * math.sqrt(2.0))
-        return np.where(V_load_pk > _V_DROP,
-                        (V_load_pk - _V_DROP) / np.maximum(V_load_pk, 1e-12), 0.0)
+    def _v_pk_matched(V_rms):
+        return (U * V_rms * R_ratio
+                / np.maximum(1.0 + sq, 1e-12) * math.sqrt(2.0))
 
-    eta_rect_min = _eta_rect(V_rms_min)
-    eta_sys      = eta_link * eta_rect_min
-    P_dc_min     = P_rx_min * eta_rect_min
-    P_dc_max     = P_rx_max * _eta_rect(V_rms_max)
+    V_pk_min_m = _v_pk_matched(V_rms_min)        # heavy load, matched
+    V_pk_max_m = _v_pk_matched(V_rms_max)        # light load, matched
+    V_pk_max_op = V_pk_max_m * np.sqrt(G_tx_min)  # light load with detune throttle
 
-    D_vmin = np.where(P_dc_min > 1e-18, P_target_w / P_dc_min, np.inf)
+    V_dc_min_m  = np.maximum(V_pk_min_m  - _V_DROP, 0.0)
+    V_dc_max_op = np.maximum(V_pk_max_op - _V_DROP, 0.0)
 
+    eta_rect_min = np.where(V_pk_min_m > _V_DROP,
+                            V_dc_min_m / np.maximum(V_pk_min_m, 1e-12), 0.0)
+    eta_rect_max = np.where(V_pk_max_op > _V_DROP,
+                            V_dc_max_op / np.maximum(V_pk_max_op, 1e-12), 0.0)
+
+    P_dc_min   = P_rx_min_m * eta_rect_min                # max at V_min (matched)
+    P_dc_max_op = P_rx_max_m * G_tx_min * eta_rect_max    # min at V_max (detuned)
+
+    # ── Zener clamp (6.8 V TVS to ground on RX cap) ──────────────────────
+    # When the natural rectified V_dc exceeds V_zener, the TVS shunts the
+    # excess current to ground at V=V_zener.  The cap voltage is held at
+    # V_zener, so:
+    #   • useful DC power into the load = V_zener · I_dc_natural
+    #     ≈ P_dc_natural · (V_zener / V_dc_natural)   (current-source-like)
+    #   • the (1 − V_zener / V_dc_natural) fraction is wasted as heat in
+    #     the TVS — that has to flow into the system efficiency.
+    # This applies at BOTH the heavy- and light-load op points.  Without
+    # this, designs that produce huge V_dc (e.g. 16 V into a 6.8 V rail)
+    # were ranked as if all that voltage were useful.
+    zener_clip_min = np.where(V_dc_min_m  > V_zener_dc,
+                              V_zener_dc / np.maximum(V_dc_min_m,  1e-12), 1.0)
+    zener_clip_max = np.where(V_dc_max_op > V_zener_dc,
+                              V_zener_dc / np.maximum(V_dc_max_op, 1e-12), 1.0)
+
+    # Effective DC power delivered to the load after the zener clamp.
+    P_dc_min_eff    = P_dc_min    * zener_clip_min
+    P_dc_max_op_eff = P_dc_max_op * zener_clip_max
+
+    # D_vmin and feasibility gates use the *post-clamp* deliverable power:
+    # if the clamp is the only thing that lets the design be "in spec",
+    # we still have to supply the load below the clamp, so the
+    # P_dc that matters is the clamped value.
+    D_vmin = np.where(P_dc_min_eff > 1e-18, P_target_w / P_dc_min_eff, np.inf)
+
+    # ── Hard gates ────────────────────────────────────────────────────────
+    pmin_ok = P_dc_min_eff >= P_target_w
     if D_min > 0.0:
-        feasible = (P_dc_min * D_min >= P_target_w)
+        pmax_ok = P_dc_max_op_eff * D_min <= P_target_w
     else:
-        feasible = (D_vmin <= 1.0)
-    feasible &= (R_tx_ac > 0) & (R_rx_ac > 0) & (M > 0)
+        pmax_ok = np.ones_like(P_dc_min, dtype=bool)
+    # V_floor uses the clamped cap voltage (whichever is lower).
+    V_dc_min_eff = np.minimum(V_dc_min_m, V_zener_dc)
+    vfloor_ok = V_dc_min_eff >= V_min_induced_dc
 
-    return eta_sys.astype(np.float32), feasible, D_vmin.astype(np.float32)
+    feasible = (zvs_ok & pmin_ok & pmax_ok & vfloor_ok
+                & (R_tx_ac > 0) & (R_rx_ac > 0) & (M > 0))
+
+    # ── RX detune at the heavy-load drive frequency ──────────────────────
+    f0_rx_safe = np.maximum(f0_rx, 1.0)
+    x_rx       = f_op_lo / f0_rx_safe - f0_rx_safe / f_op_lo
+    detune_rx  = 1.0 / (1.0 + (Q_rx * x_rx) ** 2)
+
+    # System efficiency at the heavy-load op point (this is the ranking
+    # metric — high V_dc designs get docked the same as low-V designs).
+    eta_sys = eta_link * eta_rect_min * zener_clip_min * detune_rx
+
+    return (eta_sys.astype(np.float32),
+            feasible,
+            D_vmin.astype(np.float32),
+            V_dc_min_eff.astype(np.float32),
+            f0_tx.astype(np.float32),
+            f0_rx.astype(np.float32),
+            f_op_lo.astype(np.float32))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Single-iteration NN sweep → returns sorted list of dicts (best first)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _snap(x, step):
+    """Snap continuous values to a physical grid (vectorised)."""
+    return np.round(x / step) * step
+
+
+def _dcr_ohm(length_m, width_mm, h_total_m):
+    """DC resistance of a planar conductor of given length, width, total height."""
+    return _RHO_30C * length_m / np.maximum(width_mm * 1e-3 * h_total_m, 1e-15)
+
+
+def _rx_h_total_for_topology(topology: str, h_per_layer_m: list) -> float:
+    """
+    Effective copper-thickness factor for a per-topology RX DCR estimate.
+
+    Mirrors the original constants:
+      parallel            : sum of h
+      series              : 1 / sum(1/h)
+      parallel_pairs_ser  : 1 / (1/(h0+h1) + 1/(h2+h3))    (two parallel pairs in series)
+    Inactive layers (h == 0) are excluded.
+    """
+    h_active = [h for h in h_per_layer_m if h > 0]
+    if not h_active:
+        return 1e-9
+    if topology == "parallel":
+        return float(sum(h_active))
+    if topology == "series":
+        return 1.0 / sum(1.0 / h for h in h_active)
+    # parallel_pairs_ser: requires 4 active layers grouped (0,1) || (2,3)
+    if len(h_per_layer_m) == 4 and all(h > 0 for h in h_per_layer_m):
+        a = h_per_layer_m[0] + h_per_layer_m[1]
+        b = h_per_layer_m[2] + h_per_layer_m[3]
+        return (a * b) / (a + b)
+    # Fallback to parallel.
+    return float(sum(h_active))
+
+
 def _nn_sweep(params, log_cb, cancel_flag):
     """
     Sample N combinations, evaluate via NN, score with physics kernel.
-    Returns list of result dicts sorted by eta_sys descending.
+    Returns dict of accumulator arrays for downstream ranking.
+
+    All sampled geometry / frequency values are snapped to the physical grid
+    before NN evaluation so the surrogate, the FastHenry refinement step,
+    and the saved refined entries all agree on the same realisable values.
     """
     model_dir    = params["model_dir"]
     model, x_scaler, y_scaler, feat_cols, torch, device = _load_nn(model_dir)
+
+    if not feat_cols:
+        raise RuntimeError(
+            "Surrogate scaler has no feature_names_in_; retrain with the new "
+            "trainer so the inference path can match the training schema.")
 
     tx_od_max    = params["tx_od_max"]
     tx_id_min    = params["tx_id_min"]
@@ -271,53 +391,98 @@ def _nn_sweep(params, log_cb, cancel_flag):
     tx_width_max = params["tx_width_max"]
     tx_turns_min = params["tx_turns_min"]
 
-    rx_od_max    = min(params["rx_od_max"], tx_od_max + 5.0)
+    rx_od_max    = params["rx_od_max"]
     rx_id_min    = params["rx_id_min"]
     rx_width_min = params["rx_width_min"]
     rx_width_max = params["rx_width_max"]
     rx_turns_min = params["rx_turns_min"]
 
-    topologies  = params["topologies"]
-    n_topos     = len(topologies)
+    tx_topologies = params["tx_topologies"]
+    rx_topologies = params["rx_topologies"]
+    n_tx_topos    = len(tx_topologies)
+    n_rx_topos    = len(rx_topologies)
 
     gc_enabled  = params["gc_enabled"]
-    gc_dia_mm   = params["gc_dia_mm"]
+    gc_dia_mm   = round(_snap(params["gc_dia_mm"], _GRID_OD_MM_STEP), 4)
 
     freq_min_hz = params["freq_min_hz"]
     freq_max_hz = params["freq_max_hz"]
-    freq_ref_hz = 0.5 * (freq_min_hz + freq_max_hz)
+    freq_ref_hz = round(_snap(0.5 * (freq_min_hz + freq_max_hz),
+                              _GRID_FREQ_HZ_STEP), 1)
 
     V_min      = params["v_min"]
     V_max      = params["v_max"]
     P_target   = params["p_target_w"]
     D_min      = params["d_min"]
 
-    N   = params["n_combos"]
+    # Run-fixed stackup constants (also used as NN inputs).
+    pcb_gap_mm     = float(params["pcb_gap_mm"])
+    tx_oz_layers   = list(params["tx_oz_per_layer"])
+    rx_oz_layers   = list(params["rx_oz_per_layer"])
+    tx_layers_full = list(params["tx_layers"])
+    rx_layers_full = list(params["rx_layers"])
 
-    _base    = ["tx_turns", "tx_width", "tx_od_mm",
-                "rx_od_mm", "rx_turns", "rx_width", "freq_hz"]
-    _topo_oh = ["topo_parallel", "topo_parallel_pairs_ser", "topo_series"]
-    _gc_col  = "ground_circle_dia_mm"
-    all_cols = feat_cols if feat_cols else (_base + sorted(_topo_oh))
-    has_gc   = (_gc_col in all_cols)
+    # Pull port_inside choices from domain (boolean field; sample if both allowed).
+    domain = params.get("domain", {}) or {}
+    tx_dom = domain.get("tx", {})
+    rx_dom = domain.get("rx", {})
+    def _port_choices(side_dom):
+        opts = []
+        if side_dom.get("port_outside_allowed", True): opts.append(False)
+        if side_dom.get("port_inside_allowed",  False): opts.append(True)
+        return opts or [False]
+    tx_port_choices = _port_choices(tx_dom)
+    rx_port_choices = _port_choices(rx_dom)
 
-    log_cb(f"  NN features: {all_cols}")
-    log_cb(f"  Topologies: {topologies}")
+    # Per-side per-layer copper thickness in metres (zero where inactive).
+    tx_h_layers_m = [oz * _OZ_MM * 1e-3 for oz in tx_oz_layers]
+    rx_h_layers_m = [oz * _OZ_MM * 1e-3 for oz in rx_oz_layers]
+    tx_h_total_m  = sum(h for h in tx_h_layers_m if h > 0) or 1e-9
 
-    # Accumulators
+    # Per-RX-topology effective copper height for DCR.
+    rx_h_eff_per_topo = {
+        t: _rx_h_total_for_topology(t, rx_h_layers_m) for t in rx_topologies
+    }
+
+    log_cb(f"  NN features ({len(feat_cols)}): {feat_cols}")
+    log_cb(f"  TX topologies: {tx_topologies}  |  RX topologies: {rx_topologies}")
+    log_cb(f"  Fixed: pcb_gap={pcb_gap_mm:.2f}mm  "
+           f"TX oz={tx_oz_layers}  RX oz={rx_oz_layers}")
+
+    N              = params["n_combos"]
     dither_amp_hz  = params.get("dither_amp_hz", 0.0)
     zvs_margin     = params.get("zvs_margin", 0.0)
-    c_tx_options_f = params.get("c_tx_options_f", [])  # sorted list in Farads
-    c_rx_options_f = params.get("c_rx_options_f", [])  # sorted list in Farads
+    c_tx_options_f = params.get("c_tx_options_f", [])
+    c_rx_options_f = params.get("c_rx_options_f", [])
+
+    if not c_tx_options_f or not c_rx_options_f:
+        raise ValueError("Cap option lists must be non-empty for stratified sampling.")
+
+    ctx_arr      = np.array(c_tx_options_f, dtype=np.float64)
+    crx_arr      = np.array(c_rx_options_f, dtype=np.float64)
+    n_caps_tx    = ctx_arr.size
+    n_caps_rx    = crx_arr.size
+    n_pairs      = n_caps_tx * n_caps_rx
+    ctx_pair_arr = np.tile(ctx_arr, n_caps_rx)
+    crx_pair_arr = np.repeat(crx_arr, n_caps_tx)
+
+    f_drive_min_hz = max(freq_min_hz - dither_amp_hz, 1.0)
+    f_drive_max_hz = freq_max_hz + dither_amp_hz
+
+    log_cb(f"  Cap pairs per geometry: {n_caps_tx} TX × {n_caps_rx} RX = {n_pairs}")
+    log_cb(f"  Drive sweep: {f_drive_min_hz/1e3:.1f}–{f_drive_max_hz/1e3:.1f} kHz "
+           f"(ZVS margin {zvs_margin*100:.0f}%)")
 
     acc_keys = [
         "tx_turns", "tx_width", "tx_od_mm",
         "rx_od_mm", "rx_turns", "rx_width",
-        "rx_topo", "gc_dia_mm",
+        "tx_topo", "rx_topo", "tx_port_inside", "rx_port_inside",
+        "gc_dia_mm",
         "L_tx", "L_rx", "M",
         "R_tx", "R_rx", "DCR_tx", "DCR_rx",
         "tx_id_mm", "rx_id_mm",
-        "eta_sys", "D_vmin", "c_tx_nf", "c_rx_nf",
+        "eta_sys", "D_vmin", "V_dc_min", "f0_tx_hz", "f0_rx_hz", "f_op_lo_hz",
+        "c_tx_nf", "c_rx_nf",
     ]
     accs = {k: [] for k in acc_keys}
 
@@ -326,17 +491,25 @@ def _nn_sweep(params, log_cb, cancel_flag):
     b     = 0
     rng   = np.random.default_rng(params.get("rng_seed", 42))
 
+    # Pre-compute scaler stats so we can validate that every feature column is
+    # actually populated by row_map (catches the silent-zero-fill bug).
+    feat_cols_set = set(feat_cols)
+    geom_per_batch = max(1, BATCH_SIZE // n_pairs)
+
     while n_ok < N:
         if cancel_flag.is_set():
             return None
         b += 1
         if b % 20 == 1:
-            log_cb(f"    batch {b}: {n_ok:,}/{N:,} valid, {n_rej:,} rejected")
+            log_cb(f"    batch {b}: {n_ok:,}/{N:,} combos, {n_rej:,} rejected")
 
-        bs = BATCH_SIZE
+        bs = geom_per_batch
 
-        tx_od_s    = rng.uniform(tx_id_min + 2.0, tx_od_max, size=bs).astype(np.float32)
-        tx_width_s = rng.uniform(tx_width_min, tx_width_max, size=bs).astype(np.float32)
+        # ── Sample geometry, then snap to physical grid ───────────────────
+        tx_od_s    = _snap(rng.uniform(tx_id_min + 2.0, tx_od_max, size=bs),
+                           _GRID_OD_MM_STEP).astype(np.float32)
+        tx_width_s = _snap(rng.uniform(tx_width_min, tx_width_max, size=bs),
+                           _GRID_WIDTH_MM_STEP).astype(np.float32)
         tx_t_max   = np.maximum(
             np.floor((tx_od_s + _SPACING_MM - tx_width_s - tx_id_min)
                      / (2.0 * (tx_width_s + _SPACING_MM))).astype(np.int32),
@@ -344,11 +517,12 @@ def _nn_sweep(params, log_cb, cancel_flag):
         tx_t_min   = np.minimum(np.full(bs, tx_turns_min, dtype=np.int32), tx_t_max)
         tx_turns_s = rng.integers(tx_t_min, tx_t_max + 1).astype(np.float32)
 
-        rx_od_hi_s = np.minimum(tx_od_s + 5.0, rx_od_max)
         rx_od_lo_s = np.full(bs, rx_id_min + 2.0, dtype=np.float32)
         u_rx       = rng.random(size=bs).astype(np.float32)
-        rx_od_s    = (rx_od_lo_s + u_rx * np.maximum(rx_od_hi_s - rx_od_lo_s, 0.0)).astype(np.float32)
-        rx_width_s = rng.uniform(rx_width_min, rx_width_max, size=bs).astype(np.float32)
+        rx_od_s    = _snap(rx_od_lo_s + u_rx * np.maximum(rx_od_max - rx_od_lo_s, 0.0),
+                           _GRID_OD_MM_STEP).astype(np.float32)
+        rx_width_s = _snap(rng.uniform(rx_width_min, rx_width_max, size=bs),
+                           _GRID_WIDTH_MM_STEP).astype(np.float32)
         rx_t_max   = np.maximum(
             np.floor((rx_od_s + _SPACING_MM - rx_width_s - rx_id_min)
                      / (2.0 * (rx_width_s + _SPACING_MM))).astype(np.int32),
@@ -356,150 +530,179 @@ def _nn_sweep(params, log_cb, cancel_flag):
         rx_t_min   = np.minimum(np.full(bs, rx_turns_min, dtype=np.int32), rx_t_max)
         rx_turns_s = rng.integers(rx_t_min, rx_t_max + 1).astype(np.float32)
 
-        topo_idx_s = rng.integers(0, n_topos, size=bs)
+        tx_topo_idx_s = rng.integers(0, n_tx_topos, size=bs)
+        rx_topo_idx_s = rng.integers(0, n_rx_topos, size=bs)
+
+        tx_port_idx_s = rng.integers(0, len(tx_port_choices), size=bs)
+        rx_port_idx_s = rng.integers(0, len(rx_port_choices), size=bs)
 
         gc_s = (np.full(bs, gc_dia_mm, dtype=np.float32)
-                if gc_enabled and has_gc
+                if gc_enabled
                 else np.zeros(bs, dtype=np.float32))
 
         tx_id_s = _inner_diameter_mm(tx_od_s, tx_width_s, tx_turns_s)
         rx_id_s = _inner_diameter_mm(rx_od_s, rx_width_s, rx_turns_s)
         id_ok   = (tx_id_s >= tx_id_min) & (rx_id_s >= rx_id_min)
-        n_rej  += int((~id_ok).sum())
-        n_ok   += int(id_ok.sum())
+        n_rej  += int((~id_ok).sum()) * n_pairs
         if not id_ok.any():
             continue
 
         tx_turns_s = tx_turns_s[id_ok]; tx_od_s    = tx_od_s[id_ok]
         tx_width_s = tx_width_s[id_ok]; rx_od_s    = rx_od_s[id_ok]
         rx_turns_s = rx_turns_s[id_ok]; rx_width_s = rx_width_s[id_ok]
-        topo_idx_s = topo_idx_s[id_ok]; gc_s       = gc_s[id_ok]
+        tx_topo_idx_s = tx_topo_idx_s[id_ok]; rx_topo_idx_s = rx_topo_idx_s[id_ok]
+        tx_port_idx_s = tx_port_idx_s[id_ok]; rx_port_idx_s = rx_port_idx_s[id_ok]
+        gc_s       = gc_s[id_ok]
         tx_id_s    = tx_id_s[id_ok];    rx_id_s    = rx_id_s[id_ok]
         bs_v = int(id_ok.sum())
 
-        topo_oh = np.zeros((bs_v, 3), dtype=np.float32)
-        for ti, tname in enumerate(topologies):
-            col = _TOPO_OH_IDX.get(tname, ti)
-            topo_oh[topo_idx_s == ti, col] = 1.0
+        tx_port_in_s = np.array([float(tx_port_choices[i]) for i in tx_port_idx_s],
+                                dtype=np.float32)
+        rx_port_in_s = np.array([float(rx_port_choices[i]) for i in rx_port_idx_s],
+                                dtype=np.float32)
 
+        # One-hot per fixed TOPOLOGY_VOCAB order so column names line up with
+        # the trainer regardless of which subset the domain allows here.
+        tx_topo_oh = {f"tx_topo_{name}": np.zeros(bs_v, dtype=np.float32)
+                      for name in TOPOLOGY_VOCAB}
+        rx_topo_oh = {f"rx_topo_{name}": np.zeros(bs_v, dtype=np.float32)
+                      for name in TOPOLOGY_VOCAB}
+        for ti, tname in enumerate(tx_topologies):
+            mask = (tx_topo_idx_s == ti)
+            if mask.any():
+                tx_topo_oh[f"tx_topo_{tname}"][mask] = 1.0
+        for ti, tname in enumerate(rx_topologies):
+            mask = (rx_topo_idx_s == ti)
+            if mask.any():
+                rx_topo_oh[f"rx_topo_{tname}"][mask] = 1.0
+
+        # ── DCR (TX uses lumped active-layer height; RX is per-topology) ──
         tx_len_m  = _spiral_length_m(tx_od_s, tx_width_s, tx_turns_s)
-        DCR_tx_np = (_RHO_30C * tx_len_m
-                     / (tx_width_s * 1e-3 * _TX_H_M * _TX_N_LAYERS)).astype(np.float32)
+        DCR_tx_np = _dcr_ohm(tx_len_m, tx_width_s, tx_h_total_m).astype(np.float32)
 
-        rx_len_m   = _spiral_length_m(rx_od_s, rx_width_s, rx_turns_s)
-        rx_w_m     = rx_width_s * 1e-3
-        DCR_rx_par = _RHO_30C * rx_len_m / (rx_w_m * _RX_HSUM_PAR)
-        DCR_rx_ser = _RHO_30C * rx_len_m * _RX_HINV_SER / rx_w_m
-        DCR_rx_pps = _RHO_30C * rx_len_m * (1.0 / _RX_HSUM_A + 1.0 / _RX_HSUM_B) / rx_w_m
-        DCR_rx_np  = np.empty(bs_v, dtype=np.float32)
-        for ti, tname in enumerate(topologies):
-            m = (topo_idx_s == ti)
-            if not m.any(): continue
-            if tname == "parallel":
-                DCR_rx_np[m] = DCR_rx_par[m]
-            elif tname == "series":
-                DCR_rx_np[m] = DCR_rx_ser[m]
-            else:
-                DCR_rx_np[m] = DCR_rx_pps[m]
+        rx_len_m  = _spiral_length_m(rx_od_s, rx_width_s, rx_turns_s)
+        DCR_rx_np = np.empty(bs_v, dtype=np.float32)
+        for ti, tname in enumerate(rx_topologies):
+            m = (rx_topo_idx_s == ti)
+            if not m.any():
+                continue
+            h_eff = rx_h_eff_per_topo[tname]
+            DCR_rx_np[m] = _dcr_ohm(rx_len_m[m], rx_width_s[m], h_eff)
 
+        # ── Build feature row map covering EVERY trainer column ───────────
+        # Run-fixed scalars become full-length vectors for stacking.
         row_map = {
-            "tx_turns":                tx_turns_s,
-            "tx_width":                tx_width_s,
-            "tx_od_mm":                tx_od_s,
-            "rx_od_mm":                rx_od_s,
-            "rx_turns":                rx_turns_s,
-            "rx_width":                rx_width_s,
-            "freq_hz":                 np.full(bs_v, freq_ref_hz, dtype=np.float32),
-            "topo_parallel":           topo_oh[:, 0],
-            "topo_parallel_pairs_ser": topo_oh[:, 1],
-            "topo_series":             topo_oh[:, 2],
-            "ground_circle_dia_mm":    gc_s,
+            # TX geometry
+            "tx_turns":       tx_turns_s,
+            "tx_width":       tx_width_s,
+            "tx_od_mm":       tx_od_s,
+            "tx_spacing_mm":  np.full(bs_v, _SPACING_MM,                dtype=np.float32),
+            "tx_outer_gap_mm": np.full(bs_v, float(tx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
+                                       dtype=np.float32),
+            "tx_inner_gap_mm": np.full(bs_v, float(tx_dom.get("inner_gap_mm", [1.0, 1.0])[0]),
+                                       dtype=np.float32),
+            # RX geometry
+            "rx_turns":       rx_turns_s,
+            "rx_width":       rx_width_s,
+            "rx_od_mm":       rx_od_s,
+            "rx_spacing_mm":  np.full(bs_v, _SPACING_MM,                dtype=np.float32),
+            "rx_outer_gap_mm": np.full(bs_v, float(rx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
+                                       dtype=np.float32),
+            "rx_inner_gap_mm": np.full(bs_v, float(rx_dom.get("inner_gap_mm", [0.6, 0.6])[0]),
+                                       dtype=np.float32),
+            # Global
+            "freq_hz":             np.full(bs_v, freq_ref_hz,  dtype=np.float32),
+            "pcb_gap_mm":          np.full(bs_v, pcb_gap_mm,   dtype=np.float32),
+            "ground_circle_dia_mm": gc_s,
+            # Booleans
+            "tx_port_inside": tx_port_in_s,
+            "rx_port_inside": rx_port_in_s,
         }
-        X    = np.column_stack([row_map.get(c, np.zeros(bs_v, dtype=np.float32))
-                                for c in all_cols]).astype(np.float32)
+        for i in range(4):
+            row_map[f"tx_layer{i+1}_oz"] = np.full(bs_v, tx_oz_layers[i], dtype=np.float32)
+            row_map[f"rx_layer{i+1}_oz"] = np.full(bs_v, rx_oz_layers[i], dtype=np.float32)
+        row_map.update(tx_topo_oh)
+        row_map.update(rx_topo_oh)
+
+        # Validate up front that no scaler column gets a silent zero-fill.
+        missing = [c for c in feat_cols if c not in row_map]
+        if missing:
+            raise RuntimeError(
+                "Trained scaler expects feature columns the optimiser does not "
+                f"produce: {missing}. Retrain the model with the new trainer "
+                "or extend row_map to populate these columns explicitly.")
+
+        X    = np.column_stack([row_map[c] for c in feat_cols]).astype(np.float32)
         X_sc = x_scaler.transform(X).astype(np.float32)
         with torch.no_grad():
             Y_sc = model(torch.tensor(X_sc, device=device))
         Y = y_scaler.inverse_transform(Y_sc.cpu().numpy())
 
-        eta_sys, feasible, D_vmin = _score_batch(
-            Y[:, 0], Y[:, 1], Y[:, 2], Y[:, 3], Y[:, 4],
-            DCR_tx_np, DCR_rx_np,
-            freq_ref_hz, freq_ref_hz,
+        # ── Stratified expansion: each geometry × every (C_tx, C_rx) pair ──
+        n_combos_batch = bs_v * n_pairs
+
+        L_tx_full   = np.repeat(Y[:, 0], n_pairs).astype(np.float32)
+        L_rx_full   = np.repeat(Y[:, 1], n_pairs).astype(np.float32)
+        M_full      = np.repeat(Y[:, 2], n_pairs).astype(np.float32)
+        R_tx_full   = np.repeat(Y[:, 3], n_pairs).astype(np.float32)
+        R_rx_full   = np.repeat(Y[:, 4], n_pairs).astype(np.float32)
+        DCR_tx_full = np.repeat(DCR_tx_np, n_pairs)
+        DCR_rx_full = np.repeat(DCR_rx_np, n_pairs)
+
+        ctx_full = np.tile(ctx_pair_arr, bs_v)
+        crx_full = np.tile(crx_pair_arr, bs_v)
+
+        eta_sys, feasible, D_vmin, V_dc_min, f0_tx_arr, f0_rx_arr, f_op_lo_arr = _score_batch(
+            L_tx_full, L_rx_full, M_full, R_tx_full, R_rx_full,
+            DCR_tx_full, DCR_rx_full,
+            ctx_full, crx_full,
+            freq_ref_hz, freq_ref_hz, f_drive_min_hz, f_drive_max_hz,
             V_min, V_max, P_target, D_min,
+            zvs_margin, _V_MIN_INDUCED_DC, _V_ZENER_DC,
         )
+        eta_sys = np.where(feasible, eta_sys, np.float32(0.0))
 
-        # ── ZVS cap auto-selection ──────────────────────────────────────────
-        # For above-resonance (inductive) operation: f_drive_min must exceed
-        # f0 by at least zvs_margin. We find the smallest available C that
-        # satisfies this for each predicted L_tx.  Candidates with no valid C
-        # have their eta zeroed so they fall out of ranking naturally.
-        c_tx_nf_s = np.zeros(bs_v, dtype=np.float32)
-        if dither_amp_hz > 0.0 and c_tx_options_f:
-            f_min_drv = freq_ref_hz - dither_amp_hz
-            f0_max    = f_min_drv / (1.0 + zvs_margin)   # f0 must be <= this
-            L_tx_si   = np.maximum(Y[:, 0].astype(np.float64) * 1e-6, 1e-18)
-            # minimum C to achieve f0 <= f0_max: C = 1/(4π²·f0_max²·L)
-            C_needed  = 1.0 / (4.0 * math.pi ** 2 * f0_max ** 2 * L_tx_si)
-            zvs_ok    = np.zeros(bs_v, dtype=bool)
-            for c_val in sorted(c_tx_options_f):           # ascending → pick smallest that works
-                can_use    = (np.float64(c_val) >= C_needed) & ~zvs_ok
-                c_tx_nf_s  = np.where(can_use,
-                                      np.float32(c_val * 1e9),
-                                      c_tx_nf_s)
-                zvs_ok    |= can_use
-            eta_sys = np.where(zvs_ok, eta_sys, np.float32(0.0))
-            # To enable double-cap (parallel) TX selection later, extend the
-            # loop above to also try pairwise sums of c_tx_options_f before
-            # zeroing infeasible candidates.
-        # ───────────────────────────────────────────────────────────────────
+        n_ok += n_combos_batch
 
-        # ── RX cap selection (series resonance) ─────────────────────────────
-        # Pick the single available cap closest to C_ideal = 1/(4π²·f²·L_rx).
-        # This is a recording step only — it does not affect eta ranking.
-        # To enable double-cap RX selection later, extend the loop below to
-        # also try pairwise sums of c_rx_options_f and keep the best match.
-        c_rx_nf_s = np.zeros(bs_v, dtype=np.float32)
-        if c_rx_options_f:
-            L_rx_si    = np.maximum(Y[:, 1].astype(np.float64) * 1e-6, 1e-18)
-            C_rx_ideal = 1.0 / (4.0 * math.pi ** 2 * freq_ref_hz ** 2 * L_rx_si)
-            best_dist  = np.full(bs_v, np.inf, dtype=np.float64)
-            for c_val in c_rx_options_f:
-                dist   = np.abs(np.float64(c_val) - C_rx_ideal)
-                better = dist < best_dist
-                c_rx_nf_s  = np.where(better, np.float32(c_val * 1e9), c_rx_nf_s)
-                best_dist  = np.minimum(best_dist, dist)
-        # ───────────────────────────────────────────────────────────────────
-
-        accs["tx_turns"].append(tx_turns_s)
-        accs["tx_width"].append(tx_width_s)
-        accs["tx_od_mm"].append(tx_od_s)
-        accs["rx_od_mm"].append(rx_od_s)
-        accs["rx_turns"].append(rx_turns_s)
-        accs["rx_width"].append(rx_width_s)
-        accs["rx_topo"].append(topo_idx_s.astype(np.uint8))
-        accs["gc_dia_mm"].append(gc_s)
-        accs["L_tx"].append(Y[:, 0].astype(np.float32))
-        accs["L_rx"].append(Y[:, 1].astype(np.float32))
-        accs["M"].append(Y[:, 2].astype(np.float32))
-        accs["R_tx"].append(Y[:, 3].astype(np.float32))
-        accs["R_rx"].append(Y[:, 4].astype(np.float32))
-        accs["DCR_tx"].append(DCR_tx_np)
-        accs["DCR_rx"].append(DCR_rx_np)
-        accs["tx_id_mm"].append(tx_id_s)
-        accs["rx_id_mm"].append(rx_id_s)
+        accs["tx_turns"].append(np.repeat(tx_turns_s, n_pairs))
+        accs["tx_width"].append(np.repeat(tx_width_s, n_pairs))
+        accs["tx_od_mm"].append(np.repeat(tx_od_s, n_pairs))
+        accs["rx_od_mm"].append(np.repeat(rx_od_s, n_pairs))
+        accs["rx_turns"].append(np.repeat(rx_turns_s, n_pairs))
+        accs["rx_width"].append(np.repeat(rx_width_s, n_pairs))
+        accs["tx_topo"].append(np.repeat(tx_topo_idx_s.astype(np.uint8), n_pairs))
+        accs["rx_topo"].append(np.repeat(rx_topo_idx_s.astype(np.uint8), n_pairs))
+        accs["tx_port_inside"].append(np.repeat(tx_port_in_s, n_pairs))
+        accs["rx_port_inside"].append(np.repeat(rx_port_in_s, n_pairs))
+        accs["gc_dia_mm"].append(np.repeat(gc_s, n_pairs))
+        accs["L_tx"].append(L_tx_full)
+        accs["L_rx"].append(L_rx_full)
+        accs["M"].append(M_full)
+        accs["R_tx"].append(R_tx_full)
+        accs["R_rx"].append(R_rx_full)
+        accs["DCR_tx"].append(DCR_tx_full)
+        accs["DCR_rx"].append(DCR_rx_full)
+        accs["tx_id_mm"].append(np.repeat(tx_id_s, n_pairs))
+        accs["rx_id_mm"].append(np.repeat(rx_id_s, n_pairs))
         accs["eta_sys"].append(eta_sys)
         accs["D_vmin"].append(D_vmin)
-        accs["c_tx_nf"].append(c_tx_nf_s)
-        accs["c_rx_nf"].append(c_rx_nf_s)
+        accs["V_dc_min"].append(V_dc_min)
+        accs["f0_tx_hz"].append(f0_tx_arr)
+        accs["f0_rx_hz"].append(f0_rx_arr)
+        accs["f_op_lo_hz"].append(f_op_lo_arr)
+        accs["c_tx_nf"].append((ctx_full * 1e9).astype(np.float32))
+        accs["c_rx_nf"].append((crx_full * 1e9).astype(np.float32))
 
     concat = {k: np.concatenate(v) for k, v in accs.items()}
-    concat["_topologies"]  = np.array(topologies)
-    concat["_freq_ref_hz"] = np.float64(freq_ref_hz)
-    concat["_freq_min_hz"] = np.float64(freq_min_hz)
-    concat["_freq_max_hz"] = np.float64(freq_max_hz)
+    concat["_tx_topologies"] = np.array(tx_topologies)
+    concat["_rx_topologies"] = np.array(rx_topologies)
+    concat["_freq_ref_hz"]   = np.float64(freq_ref_hz)
+    concat["_freq_min_hz"]   = np.float64(freq_min_hz)
+    concat["_freq_max_hz"]   = np.float64(freq_max_hz)
 
-    log_cb(f"  Sweep done: {n_ok:,} valid ({n_rej:,} rejected)")
+    n_feasible = int(np.count_nonzero(concat["eta_sys"]))
+    log_cb(f"  Sweep done: {n_ok:,} combos scored "
+           f"({n_feasible:,} feasible, {n_rej:,} geometry-rejected)")
     return concat
 
 
@@ -507,39 +710,61 @@ def _nn_sweep(params, log_cb, cancel_flag):
 # Pick top-K unique configurations from sweep result
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _top_k(result, topologies, k=12):
+def _top_k(result, tx_topologies, rx_topologies, k=12):
+    """
+    Pick top-K unique configurations from sweep results.
+
+    Dedup key includes both topologies and port_inside booleans, since these
+    materially affect FastHenry results and the surrogate sees them as inputs.
+    """
     eta   = result["eta_sys"]
     order = np.argsort(eta)[::-1]
 
     winners = []
     seen    = set()
     for i in order:
+        if eta[i] <= 0.0:
+            break
         tx_t  = int(result["tx_turns"][i])
         tx_od = round(float(result["tx_od_mm"][i]), 1)
         tx_w  = round(float(result["tx_width"][i]), 2)
         rx_t  = int(result["rx_turns"][i])
         rx_od = round(float(result["rx_od_mm"][i]), 1)
         rx_w  = round(float(result["rx_width"][i]), 2)
-        t_idx = int(result["rx_topo"][i])
-        topo  = topologies[t_idx] if t_idx < len(topologies) else "parallel"
-        key   = (tx_t, tx_od, tx_w, rx_t, rx_od, rx_w, topo)
+        tx_t_idx = int(result["tx_topo"][i])
+        rx_t_idx = int(result["rx_topo"][i])
+        tx_topo  = tx_topologies[tx_t_idx] if tx_t_idx < len(tx_topologies) else "parallel"
+        rx_topo  = rx_topologies[rx_t_idx] if rx_t_idx < len(rx_topologies) else "parallel"
+        tx_port  = bool(result["tx_port_inside"][i])
+        rx_port  = bool(result["rx_port_inside"][i])
+        gc       = round(float(result["gc_dia_mm"][i]), 1)
+        key = (tx_t, tx_od, tx_w, rx_t, rx_od, rx_w,
+               tx_topo, rx_topo, tx_port, rx_port, gc)
         if key in seen:
             continue
         seen.add(key)
-        gc = float(result["gc_dia_mm"][i])
         winners.append({
-            "tx_turns":    tx_t,
-            "tx_width":    float(result["tx_width"][i]),
-            "tx_od_mm":    float(result["tx_od_mm"][i]),
-            "rx_turns":    rx_t,
-            "rx_width":    float(result["rx_width"][i]),
-            "rx_od_mm":    float(result["rx_od_mm"][i]),
-            "rx_topology": topo,
-            "gc_dia_mm":   gc,
-            "eta_sys":     float(eta[i]),
-            "L_tx_uH":     float(result["L_tx"][i]),
-            "c_tx_nf":     float(result["c_tx_nf"][i]),
-            "c_rx_nf":     float(result["c_rx_nf"][i]),
+            "tx_turns":       tx_t,
+            "tx_width":       float(result["tx_width"][i]),
+            "tx_od_mm":       float(result["tx_od_mm"][i]),
+            "tx_topology":    tx_topo,
+            "tx_port_inside": tx_port,
+            "rx_turns":       rx_t,
+            "rx_width":       float(result["rx_width"][i]),
+            "rx_od_mm":       float(result["rx_od_mm"][i]),
+            "rx_topology":    rx_topo,
+            "rx_port_inside": rx_port,
+            "gc_dia_mm":      float(result["gc_dia_mm"][i]),
+            "eta_sys":        float(eta[i]),
+            "L_tx_uH":        float(result["L_tx"][i]),
+            "L_rx_uH":        float(result["L_rx"][i]),
+            "c_tx_nf":        float(result["c_tx_nf"][i]),
+            "c_rx_nf":        float(result["c_rx_nf"][i]),
+            "D_vmin":         float(result["D_vmin"][i]),
+            "V_dc_min":       float(result["V_dc_min"][i]),
+            "f0_tx_hz":       float(result["f0_tx_hz"][i]),
+            "f0_rx_hz":       float(result["f0_rx_hz"][i]),
+            "f_op_lo_hz":     float(result["f_op_lo_hz"][i]),
         })
         if len(winners) >= k:
             break
@@ -550,39 +775,53 @@ def _top_k(result, topologies, k=12):
 # Build SimParams list for FastHenry batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_sim_params(winners, domain, timeout_sec):
+def _build_sim_params(winners, params, timeout_sec):
+    """
+    Build FastHenry SimParams from winning combos.
+
+    pcb_gap_mm and per-layer copper stackup come from the run's fixed config
+    (the user picks them once per optimisation run); gaps come from domain
+    (constant per training set); other geometry / topology / port_inside
+    fields come from the winning combination so each FastHenry sim is run
+    on the exact configuration the surrogate scored.
+    """
     from parallel_sim import SimParams
-    glb = domain.get("global", {})
+
+    domain     = params["domain"]
+    glb        = domain.get("global", {})
     freq_range = glb.get("freq_hz", [340000.0, 380000.0])
-    freq_hz  = 0.5 * (freq_range[0] + freq_range[1])
-    pcb_gap  = glb.get("pcb_gap_mm", [2.4, 2.8])
-    pcb_gap_mm = 0.5 * (pcb_gap[0] + pcb_gap[1]) if isinstance(pcb_gap, list) else float(pcb_gap)
+    freq_hz    = 0.5 * (freq_range[0] + freq_range[1])
+    freq_hz    = round(_snap(freq_hz, _GRID_FREQ_HZ_STEP), 1)
 
     tx_d = domain.get("tx", {})
     rx_d = domain.get("rx", {})
 
+    pcb_gap_mm = float(params["pcb_gap_mm"])
+    tx_layers  = list(params["tx_layers"])
+    rx_layers  = list(params["rx_layers"])
+
     params_list = []
     for w in winners:
         p = SimParams(
-            tx_turns          = w["tx_turns"],
-            tx_trace_width_mm = w["tx_width"],
-            tx_od_mm          = w["tx_od_mm"],
-            tx_spacing_mm     = 0.16,
+            tx_turns          = int(w["tx_turns"]),
+            tx_trace_width_mm = round(float(w["tx_width"]), 4),
+            tx_od_mm          = round(float(w["tx_od_mm"]), 4),
+            tx_spacing_mm     = _SPACING_MM,
             tx_outer_gap_mm   = float(tx_d.get("outer_gap_mm", [0.2, 0.2])[0]),
             tx_inner_gap_mm   = float(tx_d.get("inner_gap_mm", [1.0, 1.0])[0]),
-            tx_topology       = "parallel",
-            tx_layers         = list(_TX_LAYERS_DEFAULT),
-            tx_port_inside    = bool(tx_d.get("port_inside_allowed", False)),
+            tx_topology       = w["tx_topology"],
+            tx_layers         = tx_layers,
+            tx_port_inside    = bool(w["tx_port_inside"]),
 
-            rx_turns          = w["rx_turns"],
-            rx_trace_width_mm = w["rx_width"],
-            rx_od_mm          = w["rx_od_mm"],
-            rx_spacing_mm     = 0.16,
-            rx_outer_gap_mm   = float(rx_d.get("outer_gap_mm", [0.21, 0.21])[0]),
+            rx_turns          = int(w["rx_turns"]),
+            rx_trace_width_mm = round(float(w["rx_width"]), 4),
+            rx_od_mm          = round(float(w["rx_od_mm"]), 4),
+            rx_spacing_mm     = _SPACING_MM,
+            rx_outer_gap_mm   = float(rx_d.get("outer_gap_mm", [0.2, 0.2])[0]),
             rx_inner_gap_mm   = float(rx_d.get("inner_gap_mm", [0.6, 0.6])[0]),
             rx_topology       = w["rx_topology"],
-            rx_layers         = list(_RX_LAYERS_DEFAULT),
-            rx_port_inside    = bool(rx_d.get("port_inside_allowed", True)),
+            rx_layers         = rx_layers,
+            rx_port_inside    = bool(w["rx_port_inside"]),
 
             tx_nhinc          = int(tx_d.get("nhinc", 1)),
             tx_nwinc          = int(tx_d.get("nwinc", 3)),
@@ -591,11 +830,11 @@ def _build_sim_params(winners, domain, timeout_sec):
 
             pcb_gap_mm        = pcb_gap_mm,
             freq_hz           = freq_hz,
-            fmin_hz           = freq_range[0],
-            fmax_hz           = freq_range[1],
+            fmin_hz           = freq_hz,
+            fmax_hz           = freq_hz,
             resolution_mm     = float(glb.get("resolution_mm", 1.5)),
             timeout_sec       = timeout_sec,
-            ground_circle_dia_mm = w.get("gc_dia_mm", 0.0),
+            ground_circle_dia_mm = round(float(w.get("gc_dia_mm", 0.0)), 1),
         )
         params_list.append(p)
     return params_list
@@ -605,7 +844,15 @@ def _build_sim_params(winners, domain, timeout_sec):
 # Append sim results to refined_results.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _append_to_refined(sim_results, winners, refined_path, domain, log_cb):
+def _append_to_refined(sim_results, winners, refined_path, log_cb):
+    """
+    Append OK FastHenry rows to refined_results.json.
+
+    Each row passes through the simulator's full geometry / electrical echo
+    plus a fresh uuid and hasGroundCircle flag. The schema is structurally
+    identical to a results.json entry — same fields, same rounding, no
+    duplicate {tx,rx}_trace_width_mm keys.
+    """
     if os.path.exists(refined_path):
         try:
             with open(refined_path) as f:
@@ -616,44 +863,25 @@ def _append_to_refined(sim_results, winners, refined_path, domain, log_cb):
         data = {"meta": {}, "results": []}
 
     existing_uuids = {r.get("uuid") for r in data["results"] if r.get("uuid")}
-    freq_range = domain.get("global", {}).get("freq_hz", [340000.0, 380000.0])
-    freq_hz    = 0.5 * (freq_range[0] + freq_range[1])
-    added      = 0
+    added = 0
 
-    for i, (sr, w) in enumerate(zip(sim_results, winners)):
+    for i, (sr, _w) in enumerate(zip(sim_results, winners)):
         if sr is None or "error" in sr:
             log_cb(f"    sim {i+1}: FAIL — {(sr or {}).get('error','?')}")
             continue
-        uid = str(uuid.uuid4())
-        row = {
-            "uuid":              uid,
-            "tx_turns":          w["tx_turns"],
-            "tx_width":          w["tx_width"],
-            "tx_trace_width_mm": w["tx_width"],
-            "tx_od_mm":          w["tx_od_mm"],
-            "tx_spacing_mm":     0.16,
-            "tx_topology":       "parallel",
-            "rx_turns":          w["rx_turns"],
-            "rx_width":          w["rx_width"],
-            "rx_trace_width_mm": w["rx_width"],
-            "rx_od_mm":          w["rx_od_mm"],
-            "rx_spacing_mm":     0.16,
-            "rx_topology":       w["rx_topology"],
-            "ground_circle_dia_mm": w.get("gc_dia_mm", 0.0),
-            "freq_hz":           sr.get("freq_hz", freq_hz),
-            "L_tx_uH":           sr.get("L_tx_uH", 0.0),
-            "L_rx_uH":           sr.get("L_rx_uH", 0.0),
-            "M_uH":              sr.get("M_uH", 0.0),
-            "R_tx_ac":           sr.get("R_tx_ac", 0.0),
-            "R_rx_ac":           sr.get("R_rx_ac", 0.0),
-            "k":                 sr.get("k", 0.0),
-            "elapsed_sec":       sr.get("elapsed_sec", 0.0),
-        }
-        if uid not in existing_uuids:
+
+        row = dict(sr)  # passthrough: freq_hz, L_*, R_*, Q_*, M, k, geometry,
+                        # layers, port_inside, pcb_gap_mm, ground_circle_dia_mm,
+                        # pid, elapsed_sec — all already rounded by the sim.
+        row["uuid"]             = str(uuid.uuid4())
+        row["hasGroundCircle"]  = bool(round(float(sr.get("ground_circle_dia_mm", 0.0)), 3) > 0.0)
+
+        if row["uuid"] not in existing_uuids:
             data["results"].append(row)
-            existing_uuids.add(uid)
+            existing_uuids.add(row["uuid"])
             added += 1
         log_cb(f"    sim {i+1}: OK  L_tx={sr.get('L_tx_uH',0):.2f}µH  "
+               f"L_rx={sr.get('L_rx_uH',0):.2f}µH  "
                f"M={sr.get('M_uH',0):.3f}µH  k={sr.get('k',0):.4f}")
 
     data["meta"]["n_results"] = len(data["results"])
@@ -713,7 +941,6 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
         fh_workers    = params["fh_workers"]
         fh_timeout    = params["fh_timeout"]
         train_params  = params["train_params"]
-        domain        = params["domain"]
 
         # Step 1 — ensure refined_results.json exists (copy from results.json)
         results_path  = os.path.join(model_dir, "results.json")
@@ -729,9 +956,10 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                 with open(refined_path, "w") as f:
                     json.dump({"meta": {}, "results": []}, f)
 
-        topologies = params["topologies"]
-        prev_winners = []
-        win_streak   = 0
+        tx_topologies = params["tx_topologies"]
+        rx_topologies = params["rx_topologies"]
+        prev_winners  = []
+        win_streak    = 0
 
         for iteration in range(1, max_iters + 1):
             if cancel_flag.is_set():
@@ -756,32 +984,31 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                 return
 
             # --- Pick top-K ---
-            winners = _top_k(sweep_result, topologies, k=top_k)
+            winners = _top_k(sweep_result, tx_topologies, rx_topologies, k=top_k)
             if not winners:
                 log_cb("  No feasible combinations found — stopping.")
                 break
 
-            top1  = winners[0]
-            _c    = top1.get("c_tx_nf", 0.0)
-            _c_rx = top1.get("c_rx_nf", 0.0)
-            _L    = top1.get("L_tx_uH", 0.0)
-            _dith = params.get("dither_amp_hz", 0.0)
-            if _c > 0.0 and _L > 1e-6 and _dith > 0.0:
-                _f0 = 1.0 / (2.0 * math.pi * math.sqrt(
-                    max(_L * 1e-6 * _c * 1e-9, 1e-30)))
-                _f_min = (params["freq_min_hz"] + params["freq_max_hz"]) / 2.0 - _dith
-                _ratio = _f_min / _f0
-                _rx_str = f"  C_rx={_c_rx:.0f}nF" if _c_rx > 0.0 else ""
-                _zvs_str = (f"  |  C_tx={_c:.0f}nF{_rx_str}  L_tx={_L:.1f}µH  "
-                            f"f0={_f0/1e3:.1f}kHz  ZVS×{_ratio:.2f}")
-            else:
-                _zvs_str = f"  |  L_tx={_L:.1f}µH" if _L > 0 else ""
+            top1     = winners[0]
+            _f0_tx    = top1.get("f0_tx_hz", 0.0)
+            _f0_rx    = top1.get("f0_rx_hz", 0.0)
+            _f_op_lo  = top1.get("f_op_lo_hz", 0.0)
+            _zvs_x    = (_f_op_lo / _f0_tx) if _f0_tx > 0 else 0.0
+            _rx_off   = ((_f0_rx - _f_op_lo) / 1e3) if (_f0_rx > 0 and _f_op_lo > 0) else 0.0
             log_cb(f"\nTop winner: TX {top1['tx_od_mm']:.1f}mm {top1['tx_turns']}t "
                    f"w={top1['tx_width']:.2f}  |  "
                    f"RX {top1['rx_od_mm']:.1f}mm {top1['rx_turns']}t "
-                   f"w={top1['rx_width']:.2f} {top1['rx_topology']}  "
-                   f"η={top1['eta_sys']*100:.1f}%  D={top1.get('D_vmin',1)*100:.0f}%"
-                   f"{_zvs_str}")
+                   f"w={top1['rx_width']:.2f} {top1['rx_topology']}")
+            log_cb(f"  η={top1['eta_sys']*100:.1f}%  "
+                   f"D@Vmin={min(top1.get('D_vmin', 1.0), 1.0)*100:.0f}%  "
+                   f"V_dc(Vmin,D=1)={top1.get('V_dc_min', 0.0):.2f}V")
+            log_cb(f"  L_tx={top1.get('L_tx_uH',0):.2f}µH  "
+                   f"L_rx={top1.get('L_rx_uH',0):.2f}µH  "
+                   f"C_tx={top1.get('c_tx_nf',0):.1f}nF  "
+                   f"C_rx={top1.get('c_rx_nf',0):.1f}nF")
+            log_cb(f"  f0_tx={_f0_tx/1e3:.1f}kHz  f_op_lo={_f_op_lo/1e3:.1f}kHz "
+                   f"(ZVS×{_zvs_x:.2f})  |  "
+                   f"f0_rx={_f0_rx/1e3:.1f}kHz  Δf_rx={_rx_off:+.1f}kHz")
             log_cb(f"  Top {len(winners)} sent to FastHenry.")
 
             # Check convergence: same winner 3 times in a row
@@ -797,7 +1024,7 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
 
             # --- FastHenry ---
             log_cb(f"\nPhase 2: FastHenry ({len(winners)} sims, {fh_workers} workers)…")
-            sim_params_list = _build_sim_params(winners, domain, fh_timeout)
+            sim_params_list = _build_sim_params(winners, params, fh_timeout)
 
             from parallel_sim import run_batch as _run_batch
             sim_counter = [0]
@@ -817,7 +1044,7 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
 
             # --- Append to refined ---
             log_cb("\nPhase 3: Appending to refined_results.json…")
-            _append_to_refined(sim_results, winners, refined_path, domain, log_cb)
+            _append_to_refined(sim_results, winners, refined_path, log_cb)
 
             # --- Retrain ---
             log_cb("\nPhase 4: Retraining model…")
@@ -861,7 +1088,7 @@ class NNOptimisationTab(ttk.Frame):
         self._running     = False
         self._results         = {}
         self._last_run_params = {}
-        self._domain          = copy.deepcopy(_FALLBACK_DOMAIN)
+        self._domain          = None
         self._build()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -882,26 +1109,21 @@ class NNOptimisationTab(ttk.Frame):
         dom_f = ttk.LabelFrame(col_l, text="Active Domain")
         dom_f.pack(fill="x", pady=(0, 6))
         self._domain_info_var = tk.StringVar(value="No model loaded.")
-        ttk.Label(dom_f, textvariable=self._domain_info_var,
-                  foreground="#1a6fcc", font=("Consolas", 8),
-                  wraplength=340, justify="left").pack(anchor="w", padx=6, pady=(4, 4))
+        self._domain_info_lbl = ttk.Label(dom_f, textvariable=self._domain_info_var,
+                                          foreground="#1a6fcc", font=("Consolas", 8),
+                                          wraplength=340, justify="left")
+        self._domain_info_lbl.pack(anchor="w", padx=6, pady=(4, 4))
 
         # ── TX / RX narrowing ────────────────────────────────────────────────
         tx_f = ttk.LabelFrame(col_l, text="Narrow Down Domain — TX")
         tx_f.pack(fill="x", pady=(0, 6))
-        self._tx_od_max = self._row(tx_f, "OD max (mm):", DEFAULT_TX_OD_MAX)
-        self._tx_id_min = self._row(tx_f, "ID min (mm):", DEFAULT_TX_ID_MIN)
-        self._bind_cap(self._tx_od_max, "tx", "od_max_mm")
-        self._bind_cap(self._tx_id_min, "tx", "id_min_mm", is_min=True)
-        self._bind_od_id_guard(self._tx_od_max, self._tx_id_min)
+        self._tx_od_max = self._row(tx_f, "OD max (mm):", "")
+        self._tx_id_min = self._row(tx_f, "ID min (mm):", "")
 
         rx_f = ttk.LabelFrame(col_l, text="Narrow Down Domain — RX")
         rx_f.pack(fill="x", pady=(0, 6))
-        self._rx_od_max = self._row(rx_f, "OD max (mm):", DEFAULT_RX_OD_MAX)
-        self._rx_id_min = self._row(rx_f, "ID min (mm):", DEFAULT_RX_ID_MIN)
-        self._bind_cap(self._rx_od_max, "rx", "od_max_mm")
-        self._bind_cap(self._rx_id_min, "rx", "id_min_mm", is_min=True)
-        self._bind_od_id_guard(self._rx_od_max, self._rx_id_min)
+        self._rx_od_max = self._row(rx_f, "OD max (mm):", "")
+        self._rx_id_min = self._row(rx_f, "ID min (mm):", "")
 
         # ── Ground circle ────────────────────────────────────────────────────
         gc_f = ttk.LabelFrame(col_l, text="Ground Circle")
@@ -913,10 +1135,39 @@ class NNOptimisationTab(ttk.Frame):
         gc_row = ttk.Frame(gc_f)
         gc_row.pack(fill="x", padx=6, pady=(0, 4))
         ttk.Label(gc_row, text="GC diameter (mm):", width=22, anchor="w").pack(side="left")
-        self._gc_dia = tk.StringVar(value=DEFAULT_GC_DIA)
+        self._gc_dia = tk.StringVar(value="")
         self._gc_dia_entry = ttk.Entry(gc_row, textvariable=self._gc_dia, width=8)
         self._gc_dia_entry.pack(side="left")
         self._on_gc_toggle()
+
+        # ── Fixed stackup & PCB gap for this run ─────────────────────────────
+        st_f = ttk.LabelFrame(col_l, text="PCB Gap & Layer Stackup (fixed for run)")
+        st_f.pack(fill="x", pady=(0, 6))
+
+        gap_row = ttk.Frame(st_f); gap_row.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(gap_row, text="PCB gap (mm):", width=22, anchor="w").pack(side="left")
+        self._pcb_gap_mm = tk.StringVar(value=DEFAULT_PCB_GAP_MM)
+        ttk.Entry(gap_row, textvariable=self._pcb_gap_mm, width=8).pack(side="left")
+
+        ttk.Label(st_f, text="Copper oz per layer (0 = layer inactive):",
+                  foreground="gray", font=("TkDefaultFont", 8)
+                  ).pack(anchor="w", padx=6, pady=(4, 2))
+
+        self._tx_oz_vars = []
+        tx_row = ttk.Frame(st_f); tx_row.pack(fill="x", padx=6, pady=2)
+        ttk.Label(tx_row, text="TX  L1 / L2 / L3 / L4:", width=22, anchor="w").pack(side="left")
+        for i in range(4):
+            v = tk.StringVar(value=DEFAULT_TX_LAYER_OZ[i])
+            self._tx_oz_vars.append(v)
+            ttk.Entry(tx_row, textvariable=v, width=5).pack(side="left", padx=1)
+
+        self._rx_oz_vars = []
+        rx_row = ttk.Frame(st_f); rx_row.pack(fill="x", padx=6, pady=2)
+        ttk.Label(rx_row, text="RX  L1 / L2 / L3 / L4:", width=22, anchor="w").pack(side="left")
+        for i in range(4):
+            v = tk.StringVar(value=DEFAULT_RX_LAYER_OZ[i])
+            self._rx_oz_vars.append(v)
+            ttk.Entry(rx_row, textvariable=v, width=5).pack(side="left", padx=1)
 
         # ── NN model folder (from NN Setup tab) ───────────────────────────────
         nn_f = ttk.LabelFrame(col_l, text="NN Model")
@@ -929,7 +1180,20 @@ class NNOptimisationTab(ttk.Frame):
                   wraplength=340, justify="left").pack(side="left", padx=6)
 
         ttk.Button(col_l, text="Next Tab →  (NN Analysis)",
-                   command=self._on_next_tab_click).pack(fill="x")
+                   command=self._on_next_tab_click).pack(fill="x", pady=(0, 6))
+
+        log_lf = ttk.LabelFrame(col_l, text="Log")
+        log_lf.pack(fill="both", expand=True)
+        log_lf.rowconfigure(0, weight=1)
+        log_lf.columnconfigure(0, weight=1)
+        self._log_text = tk.Text(log_lf, state="disabled",
+                                 font=("Consolas", 9), wrap="word",
+                                 background="#f8f8f8")
+        log_sb = ttk.Scrollbar(log_lf, orient="vertical",
+                                command=self._log_text.yview)
+        self._log_text.configure(yscrollcommand=log_sb.set)
+        log_sb.grid(row=0, column=1, sticky="ns", pady=4)
+        self._log_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
 
         # ── RIGHT COLUMN ──────────────────────────────────────────────────────
 
@@ -943,12 +1207,19 @@ class NNOptimisationTab(ttk.Frame):
         ttk.Label(ev_f, text="Blank = no minimum duty floor.",
                   foreground="gray", font=("TkDefaultFont", 8)
                   ).pack(anchor="w", padx=6, pady=(0, 2))
-        self._dither_amp_khz = self._row(ev_f, "Dither amplitude (kHz):", DEFAULT_DITHER_AMP_KHZ)
+        self._dither_amp_khz = self._row(ev_f, "Dither amplitude ±(kHz):", DEFAULT_DITHER_AMP_KHZ)
         self._zvs_margin_pct = self._row(ev_f, "ZVS margin (%):", DEFAULT_ZVS_MARGIN_PCT)
-        _cap_str = ", ".join(f"{c:g}" for c in E_VALUES_NF) + " nF"
+        _cap_default = ", ".join(f"{c:g}" for c in E_VALUES_NF)
+        for _cap_label, _cap_attr in [("TX caps (nF):", "_tx_caps_nf"),
+                                       ("RX caps (nF):", "_rx_caps_nf")]:
+            _cap_row = ttk.Frame(ev_f)
+            _cap_row.pack(fill="x", padx=6, pady=3)
+            ttk.Label(_cap_row, text=_cap_label, width=24, anchor="w").pack(side="left")
+            _cap_var = tk.StringVar(value=_cap_default)
+            setattr(self, _cap_attr, _cap_var)
+            ttk.Entry(_cap_row, textvariable=_cap_var).pack(side="left", padx=4, fill="x", expand=True)
         ttk.Label(ev_f,
-                  text=f"Caps from E-value list: {_cap_str}. "
-                       "TX: ZVS gate (f_drive_min > f₀·(1+margin)). "
+                  text="TX: ZVS gate (f_drive_min > f₀·(1+margin)). "
                        "RX: closest to series resonance. 0 dither = ZVS disabled.",
                   foreground="gray", font=("TkDefaultFont", 8),
                   wraplength=340, justify="left"
@@ -992,18 +1263,6 @@ class NNOptimisationTab(ttk.Frame):
                   foreground="gray", wraplength=600, justify="left"
                   ).pack(fill="x", padx=6, pady=(0, 6))
 
-        log_lf = ttk.LabelFrame(col_r, text="Log")
-        log_lf.pack(fill="both", expand=True)
-        log_lf.rowconfigure(0, weight=1)
-        log_lf.columnconfigure(0, weight=1)
-        self._log_text = tk.Text(log_lf, state="disabled",
-                                 font=("Consolas", 9), wrap="word",
-                                 background="#f8f8f8")
-        log_sb = ttk.Scrollbar(log_lf, orient="vertical",
-                                command=self._log_text.yview)
-        self._log_text.configure(yscrollcommand=log_sb.set)
-        log_sb.grid(row=0, column=1, sticky="ns", pady=4)
-        self._log_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
 
     # ── Widget helpers ────────────────────────────────────────────────────────
 
@@ -1067,21 +1326,33 @@ class NNOptimisationTab(ttk.Frame):
     def load_domain_from_model(self, model_dir: str):
         domain = _load_domain(model_dir)
         self._domain = domain
+        self._model_label_var.set(self._short_path(model_dir))
+
+        if domain is None:
+            self._domain_info_var.set(
+                "ERROR: domain.json missing or corrupt — model is unusable.")
+            self._domain_info_lbl.configure(foreground="red")
+            for v in (self._tx_od_max, self._tx_id_min,
+                      self._rx_od_max, self._rx_id_min, self._gc_dia):
+                v.set("")
+            return
+
+        self._domain_info_lbl.configure(foreground="#1a6fcc")
 
         tx  = domain.get("tx", {})
         rx  = domain.get("rx", {})
         glb = domain.get("global", {})
 
-        self._tx_od_max.set(f"{tx.get('od_max_mm', 53.0):.1f}")
-        self._tx_id_min.set(f"{tx.get('id_min_mm', 35.0):.1f}")
-        self._rx_od_max.set(f"{rx.get('od_max_mm', 53.0):.1f}")
-        self._rx_id_min.set(f"{rx.get('id_min_mm', 35.0):.1f}")
+        self._tx_od_max.set(f"{tx.get('od_max_mm'):.1f}")
+        self._tx_id_min.set(f"{tx.get('id_min_mm'):.1f}")
+        self._rx_od_max.set(f"{rx.get('od_max_mm'):.1f}")
+        self._rx_id_min.set(f"{rx.get('id_min_mm'):.1f}")
 
         gc_en  = domain.get("ground_circle_enabled", False)
         gc_min = domain.get("ground_circle_min_mm", 18.0)
         gc_max = domain.get("ground_circle_max_mm", 24.0)
-        mid_gc = 0.5 * (gc_min + gc_max)
-        self._gc_dia.set(f"{mid_gc:.1f}")
+        gc_def = 20.0 if gc_min <= 20.0 <= gc_max else gc_min
+        self._gc_dia.set(f"{gc_def:.1f}")
         self._gc_enabled.set(gc_en)
         self._on_gc_toggle()
 
@@ -1099,7 +1370,6 @@ class NNOptimisationTab(ttk.Frame):
             + (f"  |  GC: {gc_min}–{gc_max} mm" if gc_en else "")
         )
         self._domain_info_var.set(info)
-        self._model_label_var.set(self._short_path(model_dir))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Event handlers
@@ -1197,6 +1467,10 @@ class NNOptimisationTab(ttk.Frame):
                 raise ValueError(f"'{name}' must be ≤ {hi}.")
             return v
 
+        if self._domain is None:
+            raise ValueError(
+                "No domain loaded.\n\nSelect a valid model folder in the NN Setup tab.")
+
         tx  = self._domain.get("tx", {})
         rx  = self._domain.get("rx", {})
         glb = self._domain.get("global", {})
@@ -1251,6 +1525,33 @@ class NNOptimisationTab(ttk.Frame):
         dither_amp_hz  = flt(self._dither_amp_khz, "Dither amplitude", lo=0.0) * 1e3
         zvs_margin     = flt(self._zvs_margin_pct, "ZVS margin",       lo=0.0, hi=50.0) / 100.0
 
+        # PCB gap + per-layer copper-oz stackup (fixed for this run; the
+        # surrogate still receives them as inputs so it stays consistent
+        # with the training data).
+        pcb_gap_mm = flt(self._pcb_gap_mm, "PCB gap", lo=0.1, hi=10.0)
+        # Snap to 0.5 oz; 0 oz means inactive layer.
+        def _parse_oz(var, name):
+            try:
+                v = float(var.get().strip())
+            except ValueError:
+                raise ValueError(f"'{name}' must be a number (0, 0.5, 1.0, ...).")
+            if v < 0:
+                raise ValueError(f"'{name}' cannot be negative.")
+            v_snap = round(v / _GRID_OZ_STEP) * _GRID_OZ_STEP
+            return round(v_snap, 4)
+
+        tx_oz_per_layer = [_parse_oz(self._tx_oz_vars[i], f"TX L{i+1}") for i in range(4)]
+        rx_oz_per_layer = [_parse_oz(self._rx_oz_vars[i], f"RX L{i+1}") for i in range(4)]
+        if not any(o > 0 for o in tx_oz_per_layer):
+            raise ValueError("At least one TX layer must be active (oz > 0).")
+        if not any(o > 0 for o in rx_oz_per_layer):
+            raise ValueError("At least one RX layer must be active (oz > 0).")
+
+        tx_layers = [{"active": (o > 0), "copper_oz": (o if o > 0 else 1.0)}
+                     for o in tx_oz_per_layer]
+        rx_layers = [{"active": (o > 0), "copper_oz": (o if o > 0 else 1.0)}
+                     for o in rx_oz_per_layer]
+
         n_combos  = int(flt(self._n_combos, "Combinations (M)", lo=0.001) * 1_000_000)
         max_iters = int(flt(self._max_iters, "Max iterations", lo=1))
         top_k     = int(flt(self._top_k, "Top-K", lo=1, hi=50))
@@ -1269,6 +1570,8 @@ class NNOptimisationTab(ttk.Frame):
                 "Select a folder in the NN Setup tab.")
         self._model_label_var.set(self._short_path(model_dir))
 
+        tx_topos_dom = tx.get("allowed_topologies") or ["parallel", "series", "parallel_pairs_ser"]
+
         return dict(
             model_dir=model_dir,
             tx_od_max=tx_od_max, tx_id_min=tx_id_min,
@@ -1277,7 +1580,8 @@ class NNOptimisationTab(ttk.Frame):
             rx_od_max=rx_od_max, rx_id_min=rx_id_min,
             rx_width_min=dom_rx_w[0], rx_width_max=dom_rx_w[1],
             rx_turns_min=dom_rx_turns[0],
-            topologies=rx_topos,
+            tx_topologies=tx_topos_dom,
+            rx_topologies=rx_topos,
             freq_min_hz=dom_freq[0], freq_max_hz=dom_freq[1],
             gc_enabled=gc_enabled, gc_dia_mm=gc_dia_mm,
             p_target_w=p_target_w, v_min=v_min, v_max=v_max,
@@ -1288,6 +1592,12 @@ class NNOptimisationTab(ttk.Frame):
             zvs_margin=zvs_margin,
             n_combos=n_combos, max_iters=max_iters, top_k=top_k,
             fh_workers=fh_workers, fh_timeout=fh_timeout,
+            # Fixed-stackup constants for this run
+            pcb_gap_mm=pcb_gap_mm,
+            tx_layers=tx_layers,
+            rx_layers=rx_layers,
+            tx_oz_per_layer=tx_oz_per_layer,
+            rx_oz_per_layer=rx_oz_per_layer,
             train_params=dict(epochs=epochs, batch=batch,
                               lr=lr, val_split=val_split),
             domain=self._domain,

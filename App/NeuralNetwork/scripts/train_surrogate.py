@@ -1,14 +1,18 @@
 """
 Surrogate Neural Network for PCB Coil Parameter Prediction.
 
-Trains a feed-forward MLP that maps physical coil parameters -> electrical characteristics,
-replacing slow FastHenry simulations during optimization.
+Trains a feed-forward MLP that maps physical coil parameters -> electrical
+characteristics, replacing slow FastHenry simulations during optimisation.
 
-Inputs include the raw geometry columns plus analytical features
-(Wheeler inductance, wire length, ln N^2, mean radius, fill factor, inner
-diameter) that are added during the append step.  Topology is one-hot
-encoded for both TX and RX.
- 
+Inputs are raw geometry / stackup fields read directly from each simulation
+record. No analytical "derived" features (Wheeler, fill factor, ln N², ...) —
+those proved redundant with the geometry inputs and were a source of
+train/inference distribution mismatch when the optimiser zero-filled them.
+
+Per-side stackup is encoded as 4 floats: copper_oz when the layer is active,
+0 when inactive. Topology is one-hot encoded for both TX and RX. Boolean
+port_inside is encoded as 0/1.
+
 Outputs : L_tx_uH, L_rx_uH, M_uH, R_tx_ac, R_rx_ac
 """
 
@@ -31,53 +35,48 @@ from torch.utils.data import DataLoader, TensorDataset
 
 _HERE      = os.path.dirname(os.path.abspath(__file__))
 _NN_DIR    = os.path.dirname(_HERE)
-_SIMDATA   = os.path.join(_NN_DIR, "..", "SimulationData")
 
-# Prefer the new global_results.json; fall back to legacy sweep_results.json
-DATA_PATH  = os.environ.get(
-    "SURROGATE_DATA",
-    os.path.join(_SIMDATA, "global_results.json"),
-)
-if not os.path.exists(DATA_PATH):
-    _legacy = os.path.join(_SIMDATA, "sweep_results.json")
-    if os.path.exists(_legacy):
-        DATA_PATH = _legacy
-
-# Output directory — set SURROGATE_OUTPUT_DIR from the GUI to the selected model folder.
-OUTPUT_DIR = os.environ.get("SURROGATE_OUTPUT_DIR", os.path.join(_NN_DIR, "NN_V2"))
+DATA_PATH  = os.environ.get("SURROGATE_DATA", os.path.join(_NN_DIR, "NN_V5", "results.json"))
+OUTPUT_DIR = os.environ.get("SURROGATE_OUTPUT_DIR", os.path.join(_NN_DIR, "NN_V5"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Hyperparameters — overridable via environment variables (set by the GUI)
-EPOCHS      = int(os.environ.get("SURROGATE_EPOCHS",     "800"))
+EPOCHS      = int(os.environ.get("SURROGATE_EPOCHS",     "600"))
 BATCH_SIZE  = int(os.environ.get("SURROGATE_BATCH_SIZE", "128"))
 LR          = float(os.environ.get("SURROGATE_LR",       "1e-3"))
-VAL_SPLIT   = float(os.environ.get("SURROGATE_VAL_SPLIT","0.20"))
+VAL_SPLIT   = float(os.environ.get("SURROGATE_VAL_SPLIT", "0.20"))
 RANDOM_SEED = 42
-PRINT_EVERY = max(1, EPOCHS // 16)
- 
-# Raw geometry columns pulled directly from each result row.
-BASE_INPUT_COLS = [
+PRINT_EVERY = max(1, EPOCHS // 20)
+
+# Numeric input columns — every entry must be linearly independent of the
+# rest and present (or derivable) in each simulation record. Constant columns
+# are tolerated: StandardScaler reduces them to zero post-transform, and the
+# inference path passes the same constant value so scaling agrees.
+NUMERIC_INPUT_COLS = [
+    # TX geometry
     "tx_turns", "tx_width", "tx_od_mm",
-    "rx_od_mm", "rx_turns", "rx_width",
-    "freq_hz",
-    "tx_spacing_mm", "rx_spacing_mm",
-    "tx_outer_gap_mm", "tx_inner_gap_mm",
-    "rx_outer_gap_mm", "rx_inner_gap_mm",
-    "ground_circle_dia_mm",
+    "tx_spacing_mm", "tx_outer_gap_mm", "tx_inner_gap_mm",
+    # RX geometry
+    "rx_turns", "rx_width", "rx_od_mm",
+    "rx_spacing_mm", "rx_outer_gap_mm", "rx_inner_gap_mm",
+    # Global
+    "freq_hz", "pcb_gap_mm", "ground_circle_dia_mm",
+    # Booleans (encoded as 0/1)
+    "tx_port_inside", "rx_port_inside",
+    # Per-layer copper oz, zero when inactive (4 layers per side)
+    "tx_layer1_oz", "tx_layer2_oz", "tx_layer3_oz", "tx_layer4_oz",
+    "rx_layer1_oz", "rx_layer2_oz", "rx_layer3_oz", "rx_layer4_oz",
 ]
- 
-# Analytical features added during append step (one set each for TX and RX).
-_FEATURE_SUFFIX = [
-    "wire_length_mm", "wheeler_uh", "ln_n_sq",
-    "mean_radius_mm", "fill_factor", "inner_diameter_mm",
-]
-DERIVED_INPUT_COLS = [f"{side}_{k}" for side in ("tx", "rx") for k in _FEATURE_SUFFIX]
 
 OUTPUT_COLS = ["L_tx_uH", "L_rx_uH", "M_uH", "R_tx_ac", "R_rx_ac"]
 
 TX_TOPOLOGY_COL = "tx_topology"
 RX_TOPOLOGY_COL = "rx_topology"
- 
+
+# Fixed topology vocabulary so the one-hot column set is stable across
+# datasets that happen not to contain every category.
+TOPOLOGY_VOCAB = ["parallel", "series", "parallel_pairs_ser"]
+
+
 # ---------------------------------------------------------------------------
 # 1. Load data
 # ---------------------------------------------------------------------------
@@ -88,7 +87,7 @@ def load_data(path: str) -> pd.DataFrame:
 
     records = raw["results"]
     df = pd.DataFrame(records)
-    print(f"Loaded {len(df)} successful simulation records from {path}")
+    print(f"Loaded {len(df)} simulation records from {path}")
     return df
 
 
@@ -96,29 +95,56 @@ def load_data(path: str) -> pd.DataFrame:
 # 2. Pre-process
 # ---------------------------------------------------------------------------
 
-def _ensure_columns(df: pd.DataFrame, cols, default=0.0) -> None:
-    for c in cols:
-        if c not in df.columns:
-            df[c] = default
+def _explode_layers(df: pd.DataFrame, side: str) -> None:
+    """Turn the per-row tx_layers / rx_layers list into 4 numeric columns
+    `{side}_layer{i}_oz` — copper_oz when active, else 0."""
+    col = f"{side}_layers"
+    for i in range(4):
+        out_col = f"{side}_layer{i+1}_oz"
+        if col in df.columns:
+            def _get(layers, idx=i):
+                if not isinstance(layers, list) or len(layers) <= idx:
+                    return 0.0
+                slot = layers[idx]
+                if not isinstance(slot, dict):
+                    return 0.0
+                return float(slot.get("copper_oz", 0.0)) if slot.get("active") else 0.0
+            df[out_col] = df[col].apply(_get)
         else:
-            df[c] = df[c].fillna(default)
- 
+            df[out_col] = 0.0
+
+
+def _one_hot_topology(df: pd.DataFrame, col: str, prefix: str) -> pd.DataFrame:
+    """One-hot encode against TOPOLOGY_VOCAB so columns are stable across runs."""
+    if col not in df.columns:
+        df[col] = TOPOLOGY_VOCAB[0]
+    cat = pd.Categorical(df[col].fillna(TOPOLOGY_VOCAB[0]),
+                         categories=TOPOLOGY_VOCAB)
+    out = pd.get_dummies(cat, prefix=prefix)
+    out.index = df.index
+    return out
+
 
 def preprocess(df: pd.DataFrame):
-    # Tolerate legacy datasets that may lack some columns
-    _ensure_columns(df, BASE_INPUT_COLS + DERIVED_INPUT_COLS, default=0.0)
-    if TX_TOPOLOGY_COL not in df.columns:
-        df[TX_TOPOLOGY_COL] = "parallel"
-    if RX_TOPOLOGY_COL not in df.columns:
-        df[RX_TOPOLOGY_COL] = "parallel"
- 
-    tx_dummies = pd.get_dummies(df[TX_TOPOLOGY_COL], prefix="tx_topo")
-    rx_dummies = pd.get_dummies(df[RX_TOPOLOGY_COL], prefix="rx_topo")
- 
-    X = pd.concat(
-        [df[BASE_INPUT_COLS + DERIVED_INPUT_COLS], tx_dummies, rx_dummies],
-        axis=1,
-    ).astype(float)
+    _explode_layers(df, "tx")
+    _explode_layers(df, "rx")
+
+    for c in ("tx_port_inside", "rx_port_inside"):
+        if c in df.columns:
+            df[c] = df[c].fillna(False).astype(bool).astype(float)
+        else:
+            df[c] = 0.0
+
+    for c in NUMERIC_INPUT_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+        else:
+            df[c] = df[c].fillna(0.0).astype(float)
+
+    tx_oh = _one_hot_topology(df, TX_TOPOLOGY_COL, "tx_topo")
+    rx_oh = _one_hot_topology(df, RX_TOPOLOGY_COL, "rx_topo")
+
+    X = pd.concat([df[NUMERIC_INPUT_COLS], tx_oh, rx_oh], axis=1).astype(float)
     y = df[OUTPUT_COLS].astype(float)
 
     print(f"Input features  : {list(X.columns)}  ({X.shape[1]} total)")
@@ -137,12 +163,8 @@ def preprocess(df: pd.DataFrame):
 
     print(f"Train: {len(X_train_s)}  |  Val: {len(X_val_s)}")
 
-    return (
-        X_train_s, X_val_s,
-        y_train_s, y_val_s,
-        x_scaler, y_scaler,
-        X.shape[1],
-    )
+    return (X_train_s, X_val_s, y_train_s, y_val_s,
+            x_scaler, y_scaler, X.shape[1])
 
 
 # ---------------------------------------------------------------------------
@@ -184,16 +206,15 @@ def train(model, train_loader, val_loader, device):
     criterion = nn.MSELoss()
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=40
+        optimizer, mode="min", factor=0.1, patience=30
     )
 
     train_losses, val_losses = [], []
-    best_val_loss  = float("inf")
-    best_state     = None
-    best_epoch     = 0
+    best_val_loss = float("inf")
+    best_state    = None
+    best_epoch    = 0
 
     for epoch in range(1, EPOCHS + 1):
-        # --- train ---
         model.train()
         running = 0.0
         for xb, yb in train_loader:
@@ -206,7 +227,6 @@ def train(model, train_loader, val_loader, device):
             running += loss.item() * len(xb)
         train_loss = running / len(train_loader.dataset)
 
-        # --- validate ---
         model.eval()
         with torch.no_grad():
             running = 0.0
@@ -238,16 +258,15 @@ def train(model, train_loader, val_loader, device):
 # ---------------------------------------------------------------------------
 
 def save_artifacts(model, x_scaler, y_scaler, train_losses, val_losses):
-    model_path   = os.path.join(OUTPUT_DIR, "surrogate_model.pth")
+    model_path    = os.path.join(OUTPUT_DIR, "surrogate_model.pth")
     x_scaler_path = os.path.join(OUTPUT_DIR, "x_scaler.pkl")
     y_scaler_path = os.path.join(OUTPUT_DIR, "y_scaler.pkl")
-    plot_path    = os.path.join(OUTPUT_DIR, "loss_curve.png")
+    plot_path     = os.path.join(OUTPUT_DIR, "loss_curve.png")
 
     torch.save(model.state_dict(), model_path)
     joblib.dump(x_scaler, x_scaler_path)
     joblib.dump(y_scaler, y_scaler_path)
 
-    # Loss curve
     plt.figure(figsize=(9, 5))
     plt.plot(train_losses, label="Train MSE", linewidth=1.5)
     plt.plot(val_losses,   label="Val MSE",   linewidth=1.5)
@@ -276,10 +295,8 @@ def main():
 
     df = load_data(DATA_PATH)
 
-    (X_train, X_val,
-     y_train, y_val,
-     x_scaler, y_scaler,
-     n_inputs) = preprocess(df)
+    (X_train, X_val, y_train, y_val,
+     x_scaler, y_scaler, n_inputs) = preprocess(df)
 
     model = CoilSurrogateNN(n_in=n_inputs).to(device)
     total_params = sum(p.numel() for p in model.parameters())
@@ -288,7 +305,7 @@ def main():
     train_loader = make_loader(X_train, y_train, BATCH_SIZE, shuffle=True)
     val_loader   = make_loader(X_val,   y_val,   BATCH_SIZE, shuffle=False)
 
-    print(f"Training for {EPOCHS} epochs, batch size {BATCH_SIZE}, lr={LR}\n")
+    print(f"Training {EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}\n")
     train_losses, val_losses = train(model, train_loader, val_loader, device)
 
     final_train = train_losses[-1]

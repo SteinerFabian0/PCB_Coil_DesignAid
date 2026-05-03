@@ -128,11 +128,11 @@ RX_PORT_INSIDE_DEFAULT  = True;   RX_PORT_OUTSIDE_DEFAULT = False
 
 RESOLUTION_MM  = "1.5";  NHINC = "1"; NWINC = "3"
 PCB_GAP_LO     = "2.4";  PCB_GAP_HI = "2.8"
-FREQ_MIN_HZ    = "110000"; FREQ_MAX_HZ = "135000"
-TOTAL_SAMPLES  = "6000"
+FREQ_MIN_HZ    = "350000"; FREQ_MAX_HZ = "370000"
+TOTAL_SAMPLES  = "8000"
 
 SWEEP_WORKERS  = "15"; SWEEP_TIMEOUT_S = "360"; SWEEP_CKPT_EVERY = "45"
-NN_EPOCHS      = "250"; NN_BATCH = "512"; NN_LR = "0.0005"; NN_VAL_SPLIT = "0.15"
+NN_EPOCHS = "300"; NN_BATCH = "256"; NN_LR = "0.0005"; NN_VAL_SPLIT = "0.2"
 
 
 # ---------------------------------------------------------------------------
@@ -632,7 +632,7 @@ class AutomationTab(ttk.Frame):
                   font=("Consolas", 8)).pack(side="left")
         ttk.Button(log_hdr, text="Clear", command=self._clear_train_log).pack(side="right")
 
-        self._train_log = tk.Text(nn_frm, height=14, state="disabled",
+        self._train_log = tk.Text(nn_frm, height=28, state="disabled",
                                   wrap="word", font=("Consolas", 8),
                                   bg="#1e1e1e", fg="#d4d4d4",
                                   insertbackground="white", relief="flat", bd=0)

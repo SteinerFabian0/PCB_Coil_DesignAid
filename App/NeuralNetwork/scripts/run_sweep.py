@@ -115,18 +115,6 @@ def _load_existing(path: str) -> dict:
     return out
 
 
-def _load_global_uuids(global_path: str) -> set:
-    """Return the set of UUIDs already present in global_results.json."""
-    if not os.path.exists(global_path):
-        return set()
-    try:
-        with open(global_path) as f:
-            data = json.load(f)
-    except Exception:
-        return set()
-    return {r["uuid"] for r in data.get("results", []) if r.get("uuid")}
-
-
 def _flush(out_path: str, meta: dict, results: dict) -> None:
     payload = {"meta": meta, "results": list(results.values())}
     tmp = out_path + ".tmp"

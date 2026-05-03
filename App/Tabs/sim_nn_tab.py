@@ -43,6 +43,9 @@ TOPOLOGY_CHOICES = [
     ("1p2 -|- 3p4",   "parallel_pairs_ser"),
 ]
 
+# Stable topology vocabulary — must match TOPOLOGY_VOCAB in train_surrogate.py
+TOPOLOGY_VOCAB = ["parallel", "series", "parallel_pairs_ser"]
+
 # NN output order must match train_surrogate.py OUTPUT_COLS
 # ["L_tx_uH", "L_rx_uH", "M_uH", "R_tx_ac", "R_rx_ac"]
 OUT_L_TX  = 0
@@ -50,6 +53,16 @@ OUT_L_RX  = 1
 OUT_M     = 2
 OUT_R_TX  = 3
 OUT_R_RX  = 4
+
+# Defaults for the new input fields (mirror NN Optimisation defaults).
+DEFAULT_PCB_GAP_MM   = "2.4"
+DEFAULT_TX_OUTER_GAP = "0.2"
+DEFAULT_TX_INNER_GAP = "1.0"
+DEFAULT_RX_OUTER_GAP = "0.2"
+DEFAULT_RX_INNER_GAP = "0.6"
+DEFAULT_SPACING_MM   = "0.16"
+DEFAULT_TX_LAYER_OZ  = ["1.0", "1.0", "1.0", "0"]
+DEFAULT_RX_LAYER_OZ  = ["1.0", "0.5", "0.5", "1.0"]
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +195,13 @@ class SimNNTab(ttk.Frame):
         self._range_label_freq.pack(side="left", padx=6)
         self._freq_var.trace_add("write", lambda *_: self._on_input_change())
 
+        ttk.Label(fr, text="   PCB gap (mm):").pack(side="left", padx=(20, 2))
+        self._pcb_gap_var = tk.StringVar(value=DEFAULT_PCB_GAP_MM)
+        pcb_gap_entry = ttk.Entry(fr, textvariable=self._pcb_gap_var, width=8)
+        pcb_gap_entry.pack(side="left", padx=2)
+        self._field_widgets["pcb_gap_mm"] = pcb_gap_entry
+        self._pcb_gap_var.trace_add("write", lambda *_: self._on_input_change())
+
         # ---- TX / RX split -----------------------------------------------
         split = ttk.Frame(body)
         split.pack(fill="x", padx=8, pady=4)
@@ -198,6 +218,35 @@ class SimNNTab(ttk.Frame):
         self._tx_od_var    = self._input_row(tx_frm, "TX OD (mm):",         "53.0",  "tx_od_mm")
         self._tx_turns_var = self._input_row(tx_frm, "TX Turns:",            "9",     "tx_turns")
         self._tx_width_var = self._input_row(tx_frm, "TX Trace width (mm):", "0.4",   "tx_width")
+        self._tx_spacing_var   = self._input_row(tx_frm, "TX Spacing (mm):",  DEFAULT_SPACING_MM,   "tx_spacing_mm")
+        self._tx_outer_gap_var = self._input_row(tx_frm, "TX Outer gap (mm):", DEFAULT_TX_OUTER_GAP, "tx_outer_gap_mm")
+        self._tx_inner_gap_var = self._input_row(tx_frm, "TX Inner gap (mm):", DEFAULT_TX_INNER_GAP, "tx_inner_gap_mm")
+        # TX topology
+        tx_topo_row = ttk.Frame(tx_frm); tx_topo_row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(tx_topo_row, text="TX Topology:", width=24, anchor="w").pack(side="left")
+        self._tx_topo_var = tk.StringVar(value="parallel")
+        self._tx_topo_combo = ttk.Combobox(
+            tx_topo_row, textvariable=self._tx_topo_var,
+            values=[v for _, v in TOPOLOGY_CHOICES], width=20, state="readonly")
+        self._tx_topo_combo.pack(side="left", padx=2)
+        self._tx_topo_var.trace_add("write", lambda *_: self._on_input_change())
+        # TX port inside
+        tx_port_row = ttk.Frame(tx_frm); tx_port_row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(tx_port_row, text="TX Port inside:", width=24, anchor="w").pack(side="left")
+        self._tx_port_inside_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tx_port_row, variable=self._tx_port_inside_var,
+                        command=self._on_input_change).pack(side="left")
+        # TX layer copper oz (4 layers)
+        tx_lyr_frm = ttk.LabelFrame(tx_frm, text="TX Copper oz per layer (0 = inactive)")
+        tx_lyr_frm.pack(fill="x", padx=4, pady=(4, 2))
+        self._tx_oz_vars = []
+        for i, default in enumerate(DEFAULT_TX_LAYER_OZ):
+            r = ttk.Frame(tx_lyr_frm); r.pack(fill="x", padx=4, pady=1)
+            ttk.Label(r, text=f"L{i+1}:", width=4).pack(side="left")
+            v = tk.StringVar(value=default)
+            ttk.Entry(r, textvariable=v, width=6).pack(side="left", padx=2)
+            v.trace_add("write", lambda *_: self._on_input_change())
+            self._tx_oz_vars.append(v)
         # TX cap — manual user input with Find Cap Combo button
         cap_row = ttk.Frame(tx_frm); cap_row.pack(fill="x", padx=4, pady=2)
         ttk.Label(cap_row, text="C_TX (nF):", width=24, anchor="w").pack(side="left")
@@ -217,6 +266,9 @@ class SimNNTab(ttk.Frame):
         self._rx_od_var    = self._input_row(rx_frm, "RX OD (mm):",         "50.0",  "rx_od_mm")
         self._rx_turns_var = self._input_row(rx_frm, "RX Turns:",            "10",    "rx_turns")
         self._rx_width_var = self._input_row(rx_frm, "RX Trace width (mm):", "0.4",   "rx_width")
+        self._rx_spacing_var   = self._input_row(rx_frm, "RX Spacing (mm):",  DEFAULT_SPACING_MM,   "rx_spacing_mm")
+        self._rx_outer_gap_var = self._input_row(rx_frm, "RX Outer gap (mm):", DEFAULT_RX_OUTER_GAP, "rx_outer_gap_mm")
+        self._rx_inner_gap_var = self._input_row(rx_frm, "RX Inner gap (mm):", DEFAULT_RX_INNER_GAP, "rx_inner_gap_mm")
         # RX topology
         topo_row = ttk.Frame(rx_frm); topo_row.pack(fill="x", padx=4, pady=2)
         ttk.Label(topo_row, text="RX Topology:", width=24, anchor="w").pack(side="left")
@@ -227,6 +279,23 @@ class SimNNTab(ttk.Frame):
         self._topo_range_label = ttk.Label(topo_row, text="", foreground="#808080")
         self._topo_range_label.pack(side="left", padx=6)
         self._topo_var.trace_add("write", lambda *_: self._on_input_change())
+        # RX port inside
+        rx_port_row = ttk.Frame(rx_frm); rx_port_row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(rx_port_row, text="RX Port inside:", width=24, anchor="w").pack(side="left")
+        self._rx_port_inside_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rx_port_row, variable=self._rx_port_inside_var,
+                        command=self._on_input_change).pack(side="left")
+        # RX layer copper oz
+        rx_lyr_frm = ttk.LabelFrame(rx_frm, text="RX Copper oz per layer (0 = inactive)")
+        rx_lyr_frm.pack(fill="x", padx=4, pady=(4, 2))
+        self._rx_oz_vars = []
+        for i, default in enumerate(DEFAULT_RX_LAYER_OZ):
+            r = ttk.Frame(rx_lyr_frm); r.pack(fill="x", padx=4, pady=1)
+            ttk.Label(r, text=f"L{i+1}:", width=4).pack(side="left")
+            v = tk.StringVar(value=default)
+            ttk.Entry(r, textvariable=v, width=6).pack(side="left", padx=2)
+            v.trace_add("write", lambda *_: self._on_input_change())
+            self._rx_oz_vars.append(v)
         # RX cap — auto-computed (read-only display)
         rx_cap_row = ttk.Frame(rx_frm); rx_cap_row.pack(fill="x", padx=4, pady=2)
         ttk.Label(rx_cap_row, text="C_RX (nF) [auto]:", width=24, anchor="w").pack(side="left")
@@ -622,27 +691,66 @@ class SimNNTab(ttk.Frame):
             self.after(0, lambda: self._on_run_error(f"Cannot load NN model:\n{e}"))
             return
 
-        # Build input vector matching train_surrogate.py INPUT_COLS + one-hot topology
-        base_cols = ["tx_turns", "tx_width", "tx_od_mm",
-                     "rx_od_mm", "rx_turns", "rx_width", "freq_hz"]
-        all_topos = ["parallel", "parallel_pairs_ser", "series"]
-        one_hot = {f"topo_{t}": (1.0 if topo == t else 0.0) for t in all_topos}
+        if not feat_cols:
+            self.after(0, lambda: self._on_run_error(
+                "Surrogate scaler has no feature_names_in_; retrain with the new "
+                "trainer so the inference path can match the training schema."))
+            return
 
-        row = {k: vals[k] for k in base_cols}
-        row.update(one_hot)
-        row["ground_circle_dia_mm"] = gc_dia
+        # Pull the rest of the trainer-required inputs from the UI.
+        try:
+            extras = {
+                "tx_spacing_mm":   float(self._tx_spacing_var.get()),
+                "tx_outer_gap_mm": float(self._tx_outer_gap_var.get()),
+                "tx_inner_gap_mm": float(self._tx_inner_gap_var.get()),
+                "rx_spacing_mm":   float(self._rx_spacing_var.get()),
+                "rx_outer_gap_mm": float(self._rx_outer_gap_var.get()),
+                "rx_inner_gap_mm": float(self._rx_inner_gap_var.get()),
+                "pcb_gap_mm":      float(self._pcb_gap_var.get()),
+            }
+            tx_oz = [float(v.get()) for v in self._tx_oz_vars]
+            rx_oz = [float(v.get()) for v in self._rx_oz_vars]
+        except ValueError:
+            self.after(0, lambda: self._on_run_error(
+                "All numeric inputs (spacings, gaps, copper oz, pcb gap) must be valid numbers."))
+            return
 
-        if feat_cols is not None:
-            try:
-                x_vec = np.array([[row.get(c, 0.0) for c in feat_cols]], dtype=np.float32)
-            except KeyError as e:
-                self.after(0, lambda: self._on_run_error(
-                    f"Feature mismatch — retrain model?\nMissing: {e}"))
-                return
-        else:
-            cols = base_cols + sorted(one_hot.keys())
-            x_vec = np.array([[row[c] for c in cols]], dtype=np.float32)
+        tx_topo = self._tx_topo_var.get() or "parallel"
+        rx_topo = topo or "parallel"
 
+        # Build a row that populates every column the trainer's scaler expects.
+        # Topology one-hots use the stable TOPOLOGY_VOCAB order.
+        row = {
+            "tx_turns":  vals["tx_turns"],
+            "tx_width":  vals["tx_width"],
+            "tx_od_mm":  vals["tx_od_mm"],
+            "rx_turns":  vals["rx_turns"],
+            "rx_width":  vals["rx_width"],
+            "rx_od_mm":  vals["rx_od_mm"],
+            "freq_hz":   vals["freq_hz"],
+            "ground_circle_dia_mm": gc_dia,
+            "tx_port_inside": float(bool(self._tx_port_inside_var.get())),
+            "rx_port_inside": float(bool(self._rx_port_inside_var.get())),
+        }
+        row.update(extras)
+        for i in range(4):
+            row[f"tx_layer{i+1}_oz"] = tx_oz[i]
+            row[f"rx_layer{i+1}_oz"] = rx_oz[i]
+        for t in TOPOLOGY_VOCAB:
+            row[f"tx_topo_{t}"] = 1.0 if tx_topo == t else 0.0
+            row[f"rx_topo_{t}"] = 1.0 if rx_topo == t else 0.0
+
+        # Hard-fail on schema mismatch — silent zero-fill caused the inference
+        # distribution to drift from the training distribution.
+        missing = [c for c in feat_cols if c not in row]
+        if missing:
+            self.after(0, lambda: self._on_run_error(
+                "Trained scaler expects feature columns that are not produced "
+                "by this tab. Retrain or extend the input form. "
+                f"Missing: {missing}"))
+            return
+
+        x_vec = np.array([[row[c] for c in feat_cols]], dtype=np.float32)
         x_scaled = x_scaler.transform(x_vec).astype(np.float32)
         with torch.no_grad():
             y_scaled = model(torch.tensor(x_scaled)).numpy()
