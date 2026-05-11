@@ -7,6 +7,10 @@ The tab shows one of four panels depending on folder contents:
   SAMPLES → Sweep controls + progress
   RESULTS → Training controls + log
   TRAINED → Training plot + auto-redirect to next tab
+
+Fixed (not configurable here, never NN inputs):
+  TX: series, port outside, L1+L2, 1oz/0.5oz
+  RX: parallel_pairs_ser or series (user selects), port inside, all 4 layers, 1oz/0.5oz
 """
 
 import json
@@ -33,11 +37,11 @@ for _p in (_NN_DIR, _MODULES_DIR):
         sys.path.insert(0, _p)
 
 POLL_MS      = 600
-FOLDER_POLL  = 3000  # ms between folder-state re-checks
+FOLDER_POLL  = 3000
 
-_GUI_SCALE   = float(os.environ.get("COIL_GUI_SCALE", "1.0"))
-_SIDE_WIDTH  = int(260 * _GUI_SCALE)
-_LAYER_LABELS = ["L1 (outer)", "L2 (inner)", "L3 (inner)", "L4 (outer)"]
+_GUI_SCALE  = float(os.environ.get("COIL_GUI_SCALE", "1.0"))
+_SIDE_WIDTH = int(324 * _GUI_SCALE)
+
 
 # ---------------------------------------------------------------------------
 # Folder-state detection
@@ -50,11 +54,10 @@ def _model_path(folder):     return os.path.join(folder, "surrogate_model.pth")
 def _loss_plot_path(folder): return os.path.join(folder, "loss_curve.png")
 def _stop_flag(folder):      return os.path.join(folder, "STOP_SWEEP")
 
-# States
-ST_EMPTY    = "empty"
-ST_SAMPLES  = "samples"
-ST_RESULTS  = "results"
-ST_TRAINED  = "trained"
+ST_EMPTY   = "empty"
+ST_SAMPLES = "samples"
+ST_RESULTS = "results"
+ST_TRAINED = "trained"
 
 
 def _folder_state(folder: str) -> str:
@@ -70,7 +73,6 @@ def _folder_state(folder: str) -> str:
 
 
 def _results_complete(folder: str) -> bool:
-    """True if results.json has at least as many processed rows as samples."""
     sp = _samples_path(folder)
     rp = _results_path(folder)
     if not os.path.exists(sp) or not os.path.exists(rp):
@@ -80,7 +82,7 @@ def _results_complete(folder: str) -> bool:
             n_samples = json.load(f).get("meta", {}).get("n_samples", 0)
         with open(rp) as f:
             d = json.load(f)
-        n_done = sum(1 for r in d.get("results", []) if r.get("uuid"))
+        n_done = len(d.get("results", []))
         return n_samples > 0 and n_done >= n_samples
     except Exception:
         return False
@@ -95,40 +97,37 @@ def _n_samples(folder: str) -> int:
 
 
 def _n_ok_results(folder: str) -> int:
-    """Count processed result rows (entries with a uuid are successful simulations)."""
     try:
         with open(_results_path(folder)) as f:
             d = json.load(f)
-        return sum(1 for r in d.get("results", []) if r.get("uuid"))
+        return len(d.get("results", []))
     except Exception:
         return 0
 
 
 # ---------------------------------------------------------------------------
-# Default config values
+# Default domain values
 # ---------------------------------------------------------------------------
 
-TX_LAYERS_DEFAULT       = [True, True, True, False]
-TX_OUTER_OZ_LO          = "1.0";  TX_OUTER_OZ_HI = "1.0"
-TX_INNER_OZ_LO          = "0.5";  TX_INNER_OZ_HI = "1.0"
-TX_OUTER_GAP_LO         = "0.2";  TX_OUTER_GAP_HI = "0.2"
-TX_INNER_GAP_LO         = "1.0";  TX_INNER_GAP_HI = "1.0"
-TX_ID_MIN               = "35.0"; TX_OD_MAX = "56.0"
-TX_SPACING_LO           = "0.16"; TX_SPACING_HI = "0.16"
-TX_PORT_INSIDE_DEFAULT  = False;  TX_PORT_OUTSIDE_DEFAULT = True
+# TX — geometry DOF only (copper/topology/port/layers are fixed)
+TX_OD_LO        = "50.0";  TX_OD_HI        = "54.0"
+TX_ID_MIN       = "39.0"
+TX_W_LO         = "0.2";   TX_W_HI         = "1.2"
+TX_SPACING      = "0.16"
+TX_TURNS_LO     = "6";     TX_TURNS_HI     = "18"
 
-RX_LAYERS_DEFAULT       = [True, True, True, True]
-RX_OUTER_OZ_LO          = "1.0";  RX_OUTER_OZ_HI = "1.0"
-RX_INNER_OZ_LO          = "0.5";  RX_INNER_OZ_HI = "0.5"
-RX_OUTER_GAP_LO         = "0.2";  RX_OUTER_GAP_HI = "0.2"
-RX_INNER_GAP_LO         = "0.6";  RX_INNER_GAP_HI = "0.6"
-RX_ID_MIN               = "35.0"; RX_OD_MAX = "55.0"
-RX_SPACING_LO           = "0.16"; RX_SPACING_HI = "0.16"
-RX_PORT_INSIDE_DEFAULT  = True;   RX_PORT_OUTSIDE_DEFAULT = False
+# RX
+RX_OD_LO        = "50.0";  RX_OD_HI        = "54.0"
+RX_ID_MIN       = "35.0"
+RX_W_LO         = "0.2";   RX_W_HI         = "1.2"
+RX_SPACING      = "0.16"
+RX_TURNS_LO     = "4";     RX_TURNS_HI     = "25"
+RX_GROUND_DISC  = "20.0"   # Ø of passive copper disc on both RX inner layers
 
-RESOLUTION_MM  = "1.5";  NHINC = "1"; NWINC = "3"
-PCB_GAP_LO     = "2.4";  PCB_GAP_HI = "2.8"
-FREQ_MIN_HZ    = "350000"; FREQ_MAX_HZ = "370000"
+# Shared
+RESOLUTION_MM  = "1.2"
+PCB_GAP_LO     = "2.6";    PCB_GAP_HI     = "2.6"
+FREQ_MIN_KHZ   = "280";    FREQ_MAX_KHZ   = "350"
 TOTAL_SAMPLES  = "8000"
 
 SWEEP_WORKERS  = "15"; SWEEP_TIMEOUT_S = "360"; SWEEP_CKPT_EVERY = "45"
@@ -136,16 +135,26 @@ NN_EPOCHS = "300"; NN_BATCH = "256"; NN_LR = "0.0005"; NN_VAL_SPLIT = "0.2"
 
 
 # ---------------------------------------------------------------------------
-# Helper widgets
+# Widget helpers
 # ---------------------------------------------------------------------------
 
-def _range_row(parent, label, lo_var, hi_var, label_width=14, entry_width=6, pady=2):
+def _range_row(parent, label, lo_var, hi_var, label_width=16, entry_width=6, pady=2):
     r = ttk.Frame(parent)
     r.pack(fill="x", padx=6, pady=pady)
     ttk.Label(r, text=label, width=label_width, anchor="w").pack(side="left")
     ttk.Entry(r, textvariable=lo_var, width=entry_width).pack(side="left", padx=(4, 2))
     ttk.Label(r, text="–", foreground="gray").pack(side="left")
     ttk.Entry(r, textvariable=hi_var, width=entry_width).pack(side="left", padx=(2, 0))
+    return r
+
+
+def _fixed_row(parent, label, value_str, label_width=16):
+    r = ttk.Frame(parent)
+    r.pack(fill="x", padx=6, pady=1)
+    ttk.Label(r, text=label, width=label_width, anchor="w",
+              foreground="gray").pack(side="left")
+    ttk.Label(r, text=value_str, foreground="#808080",
+              font=("TkDefaultFont", 8, "italic")).pack(side="left")
     return r
 
 
@@ -159,9 +168,9 @@ class AutomationTab(ttk.Frame):
         super().__init__(parent, **kw)
         self.app = app
 
-        self._folder       = tk.StringVar()
-        self._state        = None
-        self._log_queue    = queue.Queue()
+        self._folder    = tk.StringVar()
+        self._state     = None
+        self._log_queue = queue.Queue()
         self._train_log_queue = queue.Queue()
 
         self._gen_thread   = None
@@ -170,9 +179,9 @@ class AutomationTab(ttk.Frame):
         self._train_proc   = None
         self._train_thread = None
 
-        self._n_total_samples    = 0
+        self._n_total_samples     = 0
         self._sweep_covered_uuids = set()
-        self._sweep_n_ok         = 0
+        self._sweep_n_ok          = 0
 
         self._build_header()
         self._content_frame = ttk.Frame(self)
@@ -180,25 +189,23 @@ class AutomationTab(ttk.Frame):
 
         self._current_panel  = None
         self._folder_poll_id = None
-        self._last_folder    = None  # track folder changes independently of state
+        self._last_folder    = None
 
         self._do_state_check()
         self.after(POLL_MS, self._poll)
 
     # ------------------------------------------------------------------ header
+
     def _build_header(self):
         hdr = ttk.Frame(self)
         hdr.pack(fill="x", padx=8, pady=(6, 2))
-
         ttk.Label(hdr, text="Model folder:").pack(side="left")
         self._folder_entry = ttk.Entry(hdr, textvariable=self._folder, width=50)
         self._folder_entry.pack(side="left", padx=(4, 4), fill="x", expand=True)
         ttk.Button(hdr, text="Browse…", command=self._browse_folder).pack(side="left")
-        ttk.Button(hdr, text="New…", command=self._new_folder).pack(side="left", padx=(4, 0))
-
+        ttk.Button(hdr, text="New…",    command=self._new_folder).pack(side="left", padx=(4, 0))
         self._folder.trace_add("write", lambda *_: self.after(100, self._on_folder_changed))
 
-        # Restore saved folder from savestate
         if self.app is not None:
             saved = self.app.load_nn_setup_folder()
             if saved and os.path.isdir(saved):
@@ -222,25 +229,18 @@ class AutomationTab(ttk.Frame):
             self._folder.set(path)
 
     # ---------------------------------------------------------------- state machine
+
     def _on_folder_changed(self):
-        """Called when the folder entry changes — always force a rebuild."""
         folder = self._folder.get()
         self._last_folder = folder
-        new_st = _folder_state(folder)
-        self._state = new_st
+        self._state = _folder_state(folder)
         self._rebuild_content()
         self._schedule_folder_poll()
-        # Persist folder selection
         if self.app is not None:
             self.app.persist_nn_setup_folder(folder)
-        # Show/hide NN Optimisation tab based on whether a model exists
-        if self.app is not None:
-            has_model = (bool(folder) and
-                         os.path.exists(os.path.join(folder, "surrogate_model.pth")))
+            has_model = bool(folder) and os.path.exists(_model_path(folder))
             if hasattr(self.app, "set_nn_optim_tab_visible"):
                 self.app.set_nn_optim_tab_visible(has_model)
-        # Notify NN Optimisation tab so it can load the domain from the new folder
-        if self.app is not None and folder:
             auto_nn = getattr(self.app, "nn_optim_tab", None)
             if auto_nn is not None and hasattr(auto_nn, "load_domain_from_model"):
                 try:
@@ -254,17 +254,15 @@ class AutomationTab(ttk.Frame):
         self._folder_poll_id = self.after(FOLDER_POLL, self._do_state_check)
 
     def _do_state_check(self):
-        folder  = self._folder.get()
-        new_st  = _folder_state(folder)
+        folder = self._folder.get()
+        new_st = _folder_state(folder)
         folder_changed = (folder != self._last_folder)
         self._last_folder = folder
         if new_st != self._state or folder_changed:
             self._state = new_st
             self._rebuild_content()
-            # Keep NN Optimisation tab visibility in sync with model presence
             if self.app is not None and hasattr(self.app, "set_nn_optim_tab_visible"):
-                has_model = (bool(folder) and
-                             os.path.exists(os.path.join(folder, "surrogate_model.pth")))
+                has_model = bool(folder) and os.path.exists(_model_path(folder))
                 self.app.set_nn_optim_tab_visible(has_model)
         self._schedule_folder_poll()
 
@@ -272,7 +270,6 @@ class AutomationTab(ttk.Frame):
         for w in self._content_frame.winfo_children():
             w.destroy()
         self._current_panel = self._state
-
         if self._state == ST_EMPTY:
             self._build_panel_empty(self._content_frame)
         elif self._state == ST_SAMPLES:
@@ -283,7 +280,6 @@ class AutomationTab(ttk.Frame):
             self._build_panel_trained(self._content_frame)
 
     def get_model_folder(self) -> str:
-        """Return the currently selected model folder path (may be empty string)."""
         return self._folder.get()
 
     def _go_next_tab(self):
@@ -297,8 +293,10 @@ class AutomationTab(ttk.Frame):
             pass
 
     # ================================================================ PANEL: EMPTY
+
     def _build_panel_empty(self, parent):
-        ttk.Label(parent, text="Folder is empty — configure and generate LHS samples.",
+        ttk.Label(parent,
+                  text="Folder is empty — configure and generate LHS samples.",
                   foreground="gray").pack(anchor="w", padx=10, pady=(8, 4))
 
         cols = ttk.Frame(parent)
@@ -317,92 +315,119 @@ class AutomationTab(ttk.Frame):
         right = ttk.Frame(cols)
         right.pack(side="left", fill="both", expand=True, anchor="n")
 
-        self._tx = self._build_side(tx_frm, "tx")
-        self._rx = self._build_side(rx_frm, "rx")
+        self._build_tx_side(tx_frm)
+        self._build_rx_side(rx_frm)
         self._build_right_column(right)
 
-    def _build_side(self, parent, side: str) -> dict:
-        v = {}
-        _layers_def = TX_LAYERS_DEFAULT if side == "tx" else RX_LAYERS_DEFAULT
-        _oo_lo  = TX_OUTER_OZ_LO  if side == "tx" else RX_OUTER_OZ_LO
-        _oo_hi  = TX_OUTER_OZ_HI  if side == "tx" else RX_OUTER_OZ_HI
-        _io_lo  = TX_INNER_OZ_LO  if side == "tx" else RX_INNER_OZ_LO
-        _io_hi  = TX_INNER_OZ_HI  if side == "tx" else RX_INNER_OZ_HI
-        _og_lo  = TX_OUTER_GAP_LO if side == "tx" else RX_OUTER_GAP_LO
-        _og_hi  = TX_OUTER_GAP_HI if side == "tx" else RX_OUTER_GAP_HI
-        _ig_lo  = TX_INNER_GAP_LO if side == "tx" else RX_INNER_GAP_LO
-        _ig_hi  = TX_INNER_GAP_HI if side == "tx" else RX_INNER_GAP_HI
-        _id_min = TX_ID_MIN        if side == "tx" else RX_ID_MIN
-        _od_max = TX_OD_MAX        if side == "tx" else RX_OD_MAX
-        _sp_lo  = TX_SPACING_LO   if side == "tx" else RX_SPACING_LO
-        _sp_hi  = TX_SPACING_HI   if side == "tx" else RX_SPACING_HI
-        _p_in   = TX_PORT_INSIDE_DEFAULT  if side == "tx" else RX_PORT_INSIDE_DEFAULT
-        _p_out  = TX_PORT_OUTSIDE_DEFAULT if side == "tx" else RX_PORT_OUTSIDE_DEFAULT
+        # Restore saved inputs, then wire up auto-save on every change.
+        if self.app is not None:
+            self._restore_empty_inputs(self.app.load_nn_setup_inputs())
+        self._attach_empty_input_traces()
 
-        lyr_frm = ttk.LabelFrame(parent, text="Active Layers")
-        lyr_frm.pack(fill="x", padx=4, pady=(4, 2))
-        v["layers"] = []
-        for i, lbl in enumerate(_LAYER_LABELS):
-            bv = tk.BooleanVar(value=_layers_def[i])
-            ttk.Checkbutton(lyr_frm, text=lbl, variable=bv).pack(anchor="w", padx=6)
-            v["layers"].append(bv)
+    def _build_tx_side(self, parent):
+        # Fixed configuration notice
+        info = ttk.LabelFrame(parent, text="Fixed (hardcoded)")
+        info.pack(fill="x", padx=4, pady=(4, 2))
+        _fixed_row(info, "Topology:",    "series, port outside")
+        _fixed_row(info, "Layers:",      "L1 + L2 active")
+        _fixed_row(info, "Copper:",      "L1=1oz  L2=0.5oz")
+        _fixed_row(info, "L1–L2 gap:",   "0.2104 mm (7628×1 prepreg)")
+        _fixed_row(info, "L3 ground:",   "fixed pour (see ground_plane.py)")
 
-        cu_frm = ttk.LabelFrame(parent, text="Copper Weight (oz)")
-        cu_frm.pack(fill="x", padx=4, pady=2)
-        v["outer_oz_lo"] = tk.StringVar(value=_oo_lo)
-        v["outer_oz_hi"] = tk.StringVar(value=_oo_hi)
-        v["inner_oz_lo"] = tk.StringVar(value=_io_lo)
-        v["inner_oz_hi"] = tk.StringVar(value=_io_hi)
-        _range_row(cu_frm, "Outer layers:", v["outer_oz_lo"], v["outer_oz_hi"])
-        _range_row(cu_frm, "Inner layers:", v["inner_oz_lo"], v["inner_oz_hi"])
+        # Geometry DOF
+        geo = ttk.LabelFrame(parent, text="Geometry (sampled)")
+        geo.pack(fill="x", padx=4, pady=2)
 
-        stk_frm = ttk.LabelFrame(parent, text="Stackup Spacing (mm)")
-        stk_frm.pack(fill="x", padx=4, pady=2)
-        v["outer_gap_lo"] = tk.StringVar(value=_og_lo)
-        v["outer_gap_hi"] = tk.StringVar(value=_og_hi)
-        v["inner_gap_lo"] = tk.StringVar(value=_ig_lo)
-        v["inner_gap_hi"] = tk.StringVar(value=_ig_hi)
-        _range_row(stk_frm, "Outer gap:", v["outer_gap_lo"], v["outer_gap_hi"])
-        _range_row(stk_frm, "Inner gap:", v["inner_gap_lo"], v["inner_gap_hi"])
+        self._tx_od_lo_var = tk.StringVar(value=TX_OD_LO)
+        self._tx_od_hi_var = tk.StringVar(value=TX_OD_HI)
+        _range_row(geo, "OD range (mm):", self._tx_od_lo_var, self._tx_od_hi_var)
 
-        geo_frm = ttk.LabelFrame(parent, text="Geometry")
-        geo_frm.pack(fill="x", padx=4, pady=2)
-        v["id_min"] = tk.StringVar(value=_id_min)
-        v["od_max"] = tk.StringVar(value=_od_max)
-        _range_row(geo_frm, "Diameter (mm):", v["id_min"], v["od_max"], label_width=14)
-        v["spacing_lo"] = tk.StringVar(value=_sp_lo)
-        v["spacing_hi"] = tk.StringVar(value=_sp_hi)
-        _range_row(geo_frm, "Spacing (mm):", v["spacing_lo"], v["spacing_hi"], label_width=14)
+        r_id = ttk.Frame(geo); r_id.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r_id, text="ID min (mm):", width=16, anchor="w").pack(side="left")
+        self._tx_id_min_var = tk.StringVar(value=TX_ID_MIN)
+        ttk.Entry(r_id, textvariable=self._tx_id_min_var, width=6).pack(side="left", padx=4)
 
-        port_frm = ttk.LabelFrame(parent, text="Port Location")
-        port_frm.pack(fill="x", padx=4, pady=2)
-        v["port_inside"]  = tk.BooleanVar(value=_p_in)
-        v["port_outside"] = tk.BooleanVar(value=_p_out)
+        self._tx_w_lo_var = tk.StringVar(value=TX_W_LO)
+        self._tx_w_hi_var = tk.StringVar(value=TX_W_HI)
+        _range_row(geo, "Trace width (mm):", self._tx_w_lo_var, self._tx_w_hi_var)
 
-        def _guard(cv, ov):
-            def _cb(*_):
-                if not cv.get() and not ov.get():
-                    ov.set(True)
-            return _cb
+        r = ttk.Frame(geo); r.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r, text="Spacing (mm):", width=16, anchor="w").pack(side="left")
+        self._tx_spacing_var = tk.StringVar(value=TX_SPACING)
+        ttk.Entry(r, textvariable=self._tx_spacing_var, width=6).pack(side="left", padx=4)
 
-        ttk.Checkbutton(port_frm, text="Port outside",
-                        variable=v["port_outside"]).pack(anchor="w", padx=6)
-        ttk.Checkbutton(port_frm, text="Port inside",
-                        variable=v["port_inside"]).pack(anchor="w", padx=6)
-        v["port_outside"].trace_add("write", _guard(v["port_outside"], v["port_inside"]))
-        v["port_inside"].trace_add("write",  _guard(v["port_inside"],  v["port_outside"]))
-        return v
+        self._tx_turns_lo_var = tk.StringVar(value=TX_TURNS_LO)
+        self._tx_turns_hi_var = tk.StringVar(value=TX_TURNS_HI)
+        _range_row(geo, "L1 turns:", self._tx_turns_lo_var, self._tx_turns_hi_var)
+
+        self._tx_l2_turns_lo_var = tk.StringVar(value=TX_TURNS_LO)
+        r_l2 = ttk.Frame(geo); r_l2.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r_l2, text="L2 turns:", width=16, anchor="w").pack(side="left")
+        ttk.Entry(r_l2, textvariable=self._tx_l2_turns_lo_var, width=6).pack(side="left", padx=(4, 2))
+        ttk.Label(r_l2, text="–", foreground="gray").pack(side="left")
+        self._tx_l2_turns_hi_label = ttk.Label(r_l2, text=self._tx_turns_hi_var.get(),
+                                                foreground="#808080", width=6, anchor="w")
+        self._tx_l2_turns_hi_label.pack(side="left", padx=(2, 0))
+        ttk.Label(r_l2, text="(= L1 max)", foreground="gray",
+                  font=("TkDefaultFont", 7)).pack(side="left", padx=(4, 0))
+        self._tx_turns_hi_var.trace_add("write",
+            lambda *_: self._tx_l2_turns_hi_label.config(
+                text=self._tx_turns_hi_var.get()))
+
+    def _build_rx_side(self, parent):
+        info = ttk.LabelFrame(parent, text="Fixed (hardcoded)")
+        info.pack(fill="x", padx=4, pady=(4, 2))
+        _fixed_row(info, "Port:",       "inside")
+        _fixed_row(info, "Layers:",     "all 4 active")
+        _fixed_row(info, "Copper:",     "outer=1oz  inner=0.5oz")
+        _fixed_row(info, "Outer gap:",  "0.2104 mm (7628×1 prepreg)")
+        _fixed_row(info, "Inner gap:",  "0.6 mm (core)")
+
+        geo = ttk.LabelFrame(parent, text="Geometry (sampled)")
+        geo.pack(fill="x", padx=4, pady=2)
+
+        self._rx_od_lo_var = tk.StringVar(value=RX_OD_LO)
+        self._rx_od_hi_var = tk.StringVar(value=RX_OD_HI)
+        _range_row(geo, "OD range (mm):", self._rx_od_lo_var, self._rx_od_hi_var)
+
+        r_id = ttk.Frame(geo); r_id.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r_id, text="ID min (mm):", width=16, anchor="w").pack(side="left")
+        self._rx_id_min_var = tk.StringVar(value=RX_ID_MIN)
+        ttk.Entry(r_id, textvariable=self._rx_id_min_var, width=6).pack(side="left", padx=4)
+
+        self._rx_w_lo_var = tk.StringVar(value=RX_W_LO)
+        self._rx_w_hi_var = tk.StringVar(value=RX_W_HI)
+        _range_row(geo, "Trace width (mm):", self._rx_w_lo_var, self._rx_w_hi_var)
+
+        r = ttk.Frame(geo); r.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r, text="Spacing (mm):", width=16, anchor="w").pack(side="left")
+        self._rx_spacing_var = tk.StringVar(value=RX_SPACING)
+        ttk.Entry(r, textvariable=self._rx_spacing_var, width=6).pack(side="left", padx=4)
+
+        self._rx_turns_lo_var = tk.StringVar(value=RX_TURNS_LO)
+        self._rx_turns_hi_var = tk.StringVar(value=RX_TURNS_HI)
+        _range_row(geo, "Turns:", self._rx_turns_lo_var, self._rx_turns_hi_var)
+
+        r_gd = ttk.Frame(geo); r_gd.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r_gd, text="Ground disc Ø (mm):", width=20, anchor="w").pack(side="left")
+        self._rx_gdisc_dia_var = tk.StringVar(value=RX_GROUND_DISC)
+        ttk.Entry(r_gd, textvariable=self._rx_gdisc_dia_var, width=6).pack(side="left", padx=4)
+        ttk.Label(r_gd, text="(both inner layers; 0 disables)",
+                  foreground="#808080", font=("TkDefaultFont", 8)).pack(side="left", padx=6)
+
+        topo = ttk.LabelFrame(parent, text="Topology (sampled)")
+        topo.pack(fill="x", padx=4, pady=2)
+        ttk.Label(topo, text="series  |  parallel_pairs_ser",
+                  foreground="#808080", font=("TkDefaultFont", 8)).pack(
+                      anchor="w", padx=6, pady=4)
 
     def _build_right_column(self, parent):
         shared = ttk.LabelFrame(parent, text="Shared Parameters")
         shared.pack(fill="x", padx=4, pady=(4, 2))
 
-        row1 = ttk.Frame(shared)
-        row1.pack(fill="x", padx=4, pady=(4, 2))
+        row1 = ttk.Frame(shared); row1.pack(fill="x", padx=4, pady=(4, 2))
         for label, attr, default, width in [
-            ("Resolution (mm):", "_res_var",   RESOLUTION_MM, 6),
-            ("nhinc:",           "_nhinc_var", NHINC,         4),
-            ("nwinc:",           "_nwinc_var", NWINC,         4),
+            ("Resolution (mm):", "_res_var", RESOLUTION_MM, 6),
         ]:
             f = ttk.Frame(row1); f.pack(side="left", padx=(0, 10))
             ttk.Label(f, text=label, anchor="w").pack(anchor="w")
@@ -414,13 +439,13 @@ class AutomationTab(ttk.Frame):
         self._pcb_gap_lo_var = tk.StringVar(value=PCB_GAP_LO)
         self._pcb_gap_hi_var = tk.StringVar(value=PCB_GAP_HI)
         _range_row(row2, "PCB gap (mm):", self._pcb_gap_lo_var, self._pcb_gap_hi_var,
-                   label_width=14, entry_width=6, pady=0)
+                   label_width=16, entry_width=6, pady=0)
 
         row3 = ttk.Frame(shared); row3.pack(fill="x", padx=4, pady=(0, 4))
-        self._fmin_var = tk.StringVar(value=FREQ_MIN_HZ)
-        self._fmax_var = tk.StringVar(value=FREQ_MAX_HZ)
-        _range_row(row3, "Freq range (Hz):", self._fmin_var, self._fmax_var,
-                   label_width=14, entry_width=10, pady=0)
+        self._fmin_var = tk.StringVar(value=FREQ_MIN_KHZ)
+        self._fmax_var = tk.StringVar(value=FREQ_MAX_KHZ)
+        _range_row(row3, "Freq range (kHz):", self._fmin_var, self._fmax_var,
+                   label_width=17, entry_width=7, pady=0)
 
         gen_frm = ttk.LabelFrame(parent, text="Generate LHS Samples")
         gen_frm.pack(fill="x", padx=4, pady=2)
@@ -431,22 +456,6 @@ class AutomationTab(ttk.Frame):
         ttk.Label(f, text="Total samples:", anchor="w").pack(anchor="w")
         self._n_var = tk.StringVar(value=TOTAL_SAMPLES)
         ttk.Entry(f, textvariable=self._n_var, width=8).pack(anchor="w")
-
-        f = ttk.Frame(gr); f.pack(side="left", padx=(0, 10))
-        self._gp_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="Add ground circles",
-                        variable=self._gp_enabled_var,
-                        command=self._update_gp_state).pack(anchor="w")
-        gp_row = ttk.Frame(f); gp_row.pack(anchor="w", pady=(2, 0))
-        ttk.Label(gp_row, text="Min (mm):").pack(side="left", padx=(20, 2))
-        self._gp_min_var = tk.StringVar(value="18.0")
-        self._gp_min_entry = ttk.Entry(gp_row, textvariable=self._gp_min_var, width=6)
-        self._gp_min_entry.pack(side="left")
-        ttk.Label(gp_row, text="Max (mm):").pack(side="left", padx=(6, 2))
-        self._gp_max_var = tk.StringVar(value="24.0")
-        self._gp_max_entry = ttk.Entry(gp_row, textvariable=self._gp_max_var, width=6)
-        self._gp_max_entry.pack(side="left")
-        self._update_gp_state()
 
         self._gen_btn = ttk.Button(gr, text="Generate Samples", command=self._on_generate)
         self._gen_btn.pack(side="left", padx=(0, 8))
@@ -461,20 +470,94 @@ class AutomationTab(ttk.Frame):
                                 wrap="none", font=("Consolas", 8),
                                 bg="#1e1e1e", fg="#d4d4d4",
                                 insertbackground="white", relief="flat", bd=0)
-        vsb2 = ttk.Scrollbar(con_frm, orient="vertical", command=self._console.yview)
-        hsb2 = ttk.Scrollbar(con_frm, orient="horizontal", command=self._console.xview)
-        self._console.configure(yscrollcommand=vsb2.set, xscrollcommand=hsb2.set)
-        vsb2.pack(side="right", fill="y")
-        hsb2.pack(side="bottom", fill="x")
+        vsb = ttk.Scrollbar(con_frm, orient="vertical",   command=self._console.yview)
+        hsb = ttk.Scrollbar(con_frm, orient="horizontal", command=self._console.xview)
+        self._console.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
         self._console.pack(fill="both", expand=True, padx=(4, 0), pady=(0, 2))
 
-    def _update_gp_state(self):
-        state = "normal" if self._gp_enabled_var.get() else "disabled"
-        if hasattr(self, "_gp_min_entry"):
-            self._gp_min_entry.config(state=state)
-            self._gp_max_entry.config(state=state)
+    # ================================================================ domain config builder
+
+    def _build_domain_config(self) -> dict:
+        def fv(var): return float(var.get())
+
+        return {
+            "tx": {
+                "od_mm":            [fv(self._tx_od_lo_var), fv(self._tx_od_hi_var)],
+                "id_min_mm":        fv(self._tx_id_min_var),
+                "trace_width_mm":   [fv(self._tx_w_lo_var),     fv(self._tx_w_hi_var)],
+                "trace_spacing_mm": [fv(self._tx_spacing_var),  fv(self._tx_spacing_var)],
+                "turns":            [int(self._tx_turns_lo_var.get()),
+                                     int(self._tx_turns_hi_var.get())],
+                "l2_turns":         [int(self._tx_l2_turns_lo_var.get()),
+                                     int(self._tx_turns_hi_var.get())],
+                "l1l2_gap_mm":      [0.2104, 0.2104],
+            },
+            "rx": {
+                "od_mm":            [fv(self._rx_od_lo_var), fv(self._rx_od_hi_var)],
+                "id_min_mm":        fv(self._rx_id_min_var),
+                "trace_width_mm":   [fv(self._rx_w_lo_var),     fv(self._rx_w_hi_var)],
+                "trace_spacing_mm": [fv(self._rx_spacing_var),  fv(self._rx_spacing_var)],
+                "turns":            [int(self._rx_turns_lo_var.get()),
+                                     int(self._rx_turns_hi_var.get())],
+                "outer_gap_mm":     [0.2104, 0.2104],
+                "inner_gap_mm":     [0.6, 0.6],
+                "ground_disc_dia_mm": fv(self._rx_gdisc_dia_var),
+            },
+            "global": {
+                "pcb_gap_mm":    [fv(self._pcb_gap_lo_var), fv(self._pcb_gap_hi_var)],
+                "resolution_mm": fv(self._res_var),
+                "freq_hz":       [float(self._fmin_var.get()) * 1000.0,
+                                  float(self._fmax_var.get()) * 1000.0],
+            },
+            "n_total": int(self._n_var.get()),
+        }
+
+    # ================================================================ empty-panel input persistence
+
+    _EMPTY_INPUT_VARS = [
+        "tx_od_lo", "tx_od_hi", "tx_id_min", "tx_w_lo", "tx_w_hi",
+        "tx_spacing", "tx_turns_lo", "tx_turns_hi", "tx_l2_turns_lo",
+        "rx_od_lo", "rx_od_hi", "rx_id_min", "rx_w_lo", "rx_w_hi",
+        "rx_spacing", "rx_turns_lo", "rx_turns_hi", "rx_gdisc_dia",
+        "res", "pcb_gap_lo", "pcb_gap_hi", "fmin", "fmax", "n",
+    ]
+
+    def _collect_empty_inputs(self) -> dict:
+        out = {}
+        for name in self._EMPTY_INPUT_VARS:
+            attr = f"_{name}_var"
+            var = getattr(self, attr, None)
+            if var is not None:
+                out[name] = var.get()
+        return out
+
+    def _restore_empty_inputs(self, d: dict):
+        if not d:
+            return
+        for name, value in d.items():
+            attr = f"_{name}_var"
+            var = getattr(self, attr, None)
+            if var is not None:
+                try:
+                    var.set(value)
+                except Exception:
+                    pass
+
+    def _attach_empty_input_traces(self):
+        if self.app is None:
+            return
+        def _save(*_):
+            if self._state == ST_EMPTY:
+                self.app.persist_nn_setup_inputs(self._collect_empty_inputs())
+        for name in self._EMPTY_INPUT_VARS:
+            var = getattr(self, f"_{name}_var", None)
+            if var is not None:
+                var.trace_add("write", _save)
 
     # ================================================================ PANEL: SAMPLES
+
     def _build_panel_samples(self, parent):
         folder = self._folder.get()
         n_sam  = _n_samples(folder)
@@ -535,21 +618,21 @@ class AutomationTab(ttk.Frame):
                                 wrap="none", font=("Consolas", 8),
                                 bg="#1e1e1e", fg="#d4d4d4",
                                 insertbackground="white", relief="flat", bd=0)
-        vsb = ttk.Scrollbar(con_frm, orient="vertical", command=self._console.yview)
+        vsb = ttk.Scrollbar(con_frm, orient="vertical",   command=self._console.yview)
         hsb = ttk.Scrollbar(con_frm, orient="horizontal", command=self._console.xview)
         self._console.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         vsb.pack(side="right", fill="y")
         hsb.pack(side="bottom", fill="x")
         self._console.pack(fill="both", expand=True, padx=(4, 0), pady=(0, 2))
 
-        self._n_total_samples = n_sam
+        self._n_total_samples     = n_sam
         self._sweep_covered_uuids = set()
-        self._sweep_n_ok = n_ok
+        self._sweep_n_ok          = n_ok
         self._refresh_sweep_status()
 
     def _populate_domain_info(self, parent, folder):
-        dp = _domain_path(folder)
-        n  = _n_samples(folder)
+        dp   = _domain_path(folder)
+        n    = _n_samples(folder)
         n_ok = _n_ok_results(folder)
 
         row = ttk.Frame(parent); row.pack(fill="x", padx=8, pady=4)
@@ -580,6 +663,7 @@ class AutomationTab(ttk.Frame):
                   foreground="gray", font=("Consolas", 8)).pack(side="left", padx=8)
 
     # ================================================================ PANEL: RESULTS
+
     def _build_panel_results(self, parent):
         folder = self._folder.get()
         n_sam  = _n_samples(folder)
@@ -620,7 +704,7 @@ class AutomationTab(ttk.Frame):
                                           state="disabled")
         self._stop_train_btn.pack(anchor="w")
 
-        f = ttk.Frame(hp_row); f.pack(side="left", padx=(0, 8))
+        f = ttk.Frame(hp_row); f.pack(side="left")
         self._train_status    = tk.StringVar(value="—")
         self._train_epoch_var = tk.StringVar(value="")
         ttk.Label(f, textvariable=self._train_status, foreground="gray").pack(anchor="w")
@@ -642,14 +726,15 @@ class AutomationTab(ttk.Frame):
         self._train_log.pack(fill="both", expand=True, padx=(4, 0), pady=(0, 4))
 
     # ================================================================ PANEL: TRAINED
+
     def _build_panel_trained(self, parent):
         folder = self._folder.get()
 
-        top_row = ttk.Frame(parent)
-        top_row.pack(fill="x", padx=12, pady=(12, 4))
+        top_row = ttk.Frame(parent); top_row.pack(fill="x", padx=12, pady=(12, 4))
         ttk.Label(top_row,
                   text=f"Model trained — {os.path.basename(folder)}",
-                  foreground="#4ec94e", font=("TkDefaultFont", 11, "bold")).pack(side="left")
+                  foreground="#4ec94e",
+                  font=("TkDefaultFont", 11, "bold")).pack(side="left")
         ttk.Button(top_row, text="Next Tab →", command=self._go_next_tab).pack(side="right")
 
         plot = _loss_plot_path(folder)
@@ -681,40 +766,8 @@ class AutomationTab(ttk.Frame):
         ttk.Label(parent, text=f"Folder: {folder}",
                   foreground="gray", font=("Consolas", 8)).pack(pady=(4, 0))
 
-    # ================================================================ domain config
-    def _build_domain_config(self) -> dict:
-        def _flist(lo_var, hi_var):
-            return [float(lo_var.get()), float(hi_var.get())]
-
-        def _side_cfg(v: dict) -> dict:
-            return {
-                "layers_selected":      [bv.get() for bv in v["layers"]],
-                "od_max_mm":            float(v["od_max"].get()),
-                "id_min_mm":            float(v["id_min"].get()),
-                "trace_spacing_mm":     _flist(v["spacing_lo"], v["spacing_hi"]),
-                "outer_cu_oz":          _flist(v["outer_oz_lo"], v["outer_oz_hi"]),
-                "inner_cu_oz":          _flist(v["inner_oz_lo"], v["inner_oz_hi"]),
-                "outer_gap_mm":         _flist(v["outer_gap_lo"], v["outer_gap_hi"]),
-                "inner_gap_mm":         _flist(v["inner_gap_lo"], v["inner_gap_hi"]),
-                "nhinc":                int(self._nhinc_var.get()),
-                "nwinc":                int(self._nwinc_var.get()),
-                "port_outside_allowed": bool(v["port_outside"].get()),
-                "port_inside_allowed":  bool(v["port_inside"].get()),
-            }
-
-        return {
-            "tx": _side_cfg(self._tx),
-            "rx": _side_cfg(self._rx),
-            "global": {
-                "pcb_gap_mm":    _flist(self._pcb_gap_lo_var, self._pcb_gap_hi_var),
-                "resolution_mm": float(self._res_var.get()),
-                "freq_hz":       [float(self._fmin_var.get()),
-                                  float(self._fmax_var.get())],
-            },
-            "n_total": int(self._n_var.get()),
-        }
-
     # ================================================================ log helpers
+
     def _log(self, text: str):
         self._log_queue.put(text)
 
@@ -764,6 +817,7 @@ class AutomationTab(ttk.Frame):
         self._train_log.configure(state="disabled")
 
     # ================================================================ poll
+
     def _poll(self):
         self._flush_log()
         self._flush_train_log()
@@ -776,20 +830,14 @@ class AutomationTab(ttk.Frame):
             rc = self._sweep_proc.returncode
             self._sweep_proc  = None
             self._sweep_thread = None
-            if rc == 0:
-                if hasattr(self, "_sweep_status"):
-                    self._sweep_status.set("Finished")
-                self._log("[sweep] Process exited OK.")
-            else:
-                if hasattr(self, "_sweep_status"):
-                    self._sweep_status.set(f"Exited (code {rc})")
-                self._log(f"[sweep] Process exited with code {rc}.")
+            if hasattr(self, "_sweep_status"):
+                self._sweep_status.set("Finished" if rc == 0 else f"Exited ({rc})")
+            self._log(f"[sweep] Process exited {'OK' if rc == 0 else f'code {rc}'}.")
             if hasattr(self, "_sweep_btn"):
                 self._sweep_btn.config(state="normal")
             if hasattr(self, "_pause_btn"):
                 self._pause_btn.config(state="disabled", text="Pause")
             self._refresh_sweep_status()
-            # Let folder-state poll promote to RESULTS if sweep is complete
             self.after(1000, self._do_state_check)
 
     def _check_train_done(self):
@@ -797,23 +845,20 @@ class AutomationTab(ttk.Frame):
             rc = self._train_proc.returncode
             self._train_proc   = None
             self._train_thread = None
+            if hasattr(self, "_train_status"):
+                self._train_status.set("Done" if rc == 0 else f"Error ({rc})")
             if rc == 0:
-                if hasattr(self, "_train_status"):
-                    self._train_status.set("Done")
                 self._log_train("[train] Finished successfully.")
-                self._log("[train] Training complete — model saved.")
             else:
-                if hasattr(self, "_train_status"):
-                    self._train_status.set(f"Error ({rc})")
                 self._log_train(f"[train] Exited with code {rc}.")
             if hasattr(self, "_train_btn"):
                 self._train_btn.config(state="normal")
             if hasattr(self, "_stop_train_btn"):
                 self._stop_train_btn.config(state="disabled")
-            # Trigger state check — will advance to ST_TRAINED if model file appeared
             self.after(500, self._do_state_check)
 
     # ================================================================ sweep status
+
     def _refresh_sweep_status(self):
         folder = self._folder.get()
         if not folder or not hasattr(self, "_sweep_bar"):
@@ -835,11 +880,7 @@ class AutomationTab(ttk.Frame):
                 d = json.load(f)
         except Exception:
             return
-        covered = set()
-        for r in d.get("results", []):
-            uid = r.get("uuid")
-            if uid:
-                covered.add(uid)
+        covered = {r.get("uuid") for r in d.get("results", []) if isinstance(r, dict) and r.get("uuid")}
         self._sweep_covered_uuids = covered
         self._sweep_n_ok = len(covered)
         pct = f"{100*len(covered)//n_total}%" if n_total else "—"
@@ -858,16 +899,13 @@ class AutomationTab(ttk.Frame):
         if w < 2 or self._n_total_samples == 0:
             return
         n_total = self._n_total_samples
-        n_done  = len(self._sweep_covered_uuids)
         n_ok    = self._sweep_n_ok
-        if n_done > 0:
-            x_done = max(1, int(w * n_done / n_total))
-            c.create_rectangle(0, 1, x_done, h - 1, fill="#4ec94e", outline="")
-        if n_ok > 0 and n_ok < n_done:
+        if n_ok > 0:
             x_ok = max(1, int(w * n_ok / n_total))
-            c.create_rectangle(x_ok, 1, x_done, h - 1, fill="#2a6e2a", outline="")
+            c.create_rectangle(0, 1, x_ok, h - 1, fill="#4ec94e", outline="")
 
     # ================================================================ generate
+
     def _on_generate(self):
         if self._gen_thread and self._gen_thread.is_alive():
             return
@@ -896,10 +934,6 @@ class AutomationTab(ttk.Frame):
                        "--config",  cfg_path,
                        "--out-dir", folder,
                        "--n",       str(cfg["n_total"])]
-                if self._gp_enabled_var.get():
-                    cmd += ["--ground-circle-enabled", "1",
-                            "--ground-circle-min", str(self._gp_min_var.get()),
-                            "--ground-circle-max", str(self._gp_max_var.get())]
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, cwd=_NN_DIR)
@@ -923,6 +957,7 @@ class AutomationTab(ttk.Frame):
         self._gen_thread.start()
 
     # ================================================================ sweep
+
     def _on_sweep_start(self):
         if self._sweep_proc is not None:
             return
@@ -997,6 +1032,7 @@ class AutomationTab(ttk.Frame):
             self._log("[sweep] Stop flag set — terminating workers.")
 
     # ================================================================ train
+
     def _on_train_start(self):
         if self._train_proc is not None:
             return

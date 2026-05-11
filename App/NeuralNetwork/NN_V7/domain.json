@@ -1,0 +1,125 @@
+{
+  "tx": {
+    "od_mm": [
+      52.0,
+      54.0
+    ],
+    "id_min_mm": 39.0,
+    "trace_width_mm": [
+      0.22,
+      1.4
+    ],
+    "trace_spacing_mm": [
+      0.16,
+      0.16
+    ],
+    "turns": [
+      3,
+      10
+    ],
+    "l2_turns_frac": [
+      0.4,
+      1.0
+    ],
+    "l1l2_gap_mm": [
+      0.2104,
+      0.2104
+    ],
+    "nhinc": 1,
+    "nwinc": 3,
+    "l2_turns": [
+      2,
+      10
+    ]
+  },
+  "rx": {
+    "od_mm": [
+      52.0,
+      54.0
+    ],
+    "id_min_mm": 35.0,
+    "trace_width_mm": [
+      0.2,
+      1.0
+    ],
+    "trace_spacing_mm": [
+      0.16,
+      0.16
+    ],
+    "turns": [
+      8,
+      25
+    ],
+    "outer_gap_mm": [
+      0.2104,
+      0.2104
+    ],
+    "inner_gap_mm": [
+      0.6,
+      0.6
+    ],
+    "ground_disc_dia_mm": 20.0,
+    "nhinc": 1,
+    "nwinc": 3
+  },
+  "global": {
+    "pcb_gap_mm": [
+      2.4,
+      2.4
+    ],
+    "resolution_mm": 1.3,
+    "freq_hz": [
+      280000.0,
+      350000.0
+    ]
+  },
+  "n_total": 3000,
+  "n_valid": 3000,
+  "seed": 42,
+  "fixed": {
+    "tx_topology": "series",
+    "tx_port_inside": false,
+    "tx_layers": [
+      {
+        "active": true,
+        "copper_oz": 1.0
+      },
+      {
+        "active": true,
+        "copper_oz": 0.5
+      },
+      {
+        "active": false,
+        "copper_oz": 1.0
+      },
+      {
+        "active": false,
+        "copper_oz": 1.0
+      }
+    ],
+    "rx_port_inside": true,
+    "rx_layers": [
+      {
+        "active": true,
+        "copper_oz": 1.0
+      },
+      {
+        "active": true,
+        "copper_oz": 0.5
+      },
+      {
+        "active": true,
+        "copper_oz": 0.5
+      },
+      {
+        "active": true,
+        "copper_oz": 1.0
+      }
+    ],
+    "rx_topos": [
+      "series",
+      "parallel_pairs_ser"
+    ]
+  },
+  "config_hash": "1c3a3b9c0d1c"
+}

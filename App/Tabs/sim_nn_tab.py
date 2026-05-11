@@ -728,7 +728,7 @@ class SimNNTab(ttk.Frame):
             "rx_width":  vals["rx_width"],
             "rx_od_mm":  vals["rx_od_mm"],
             "freq_hz":   vals["freq_hz"],
-            "ground_circle_dia_mm": gc_dia,
+            "rx_ground_disc_dia_mm": gc_dia,
             "tx_port_inside": float(bool(self._tx_port_inside_var.get())),
             "rx_port_inside": float(bool(self._rx_port_inside_var.get())),
         }

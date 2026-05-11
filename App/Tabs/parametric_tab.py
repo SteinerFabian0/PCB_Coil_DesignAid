@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 Parametric coil tab (TX / RX).
+
+TX: layers 1+2 only, series topology, port on outside (all hardcoded).
+RX: all 4 layers, series OR parallel_pairs_ser (selectable), port on inside,
+    copper [1,0.5,0.5,1] (hardcoded).
 """
 
 import os, sys, math, threading, queue
@@ -9,8 +13,6 @@ from tkinter import ttk, filedialog, messagebox
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.patches import Polygon
-from matplotlib.collections import PolyCollection
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -29,19 +31,12 @@ except Exception:
     zc_parser = None
     _RUNNER_OK = False
 
-# --- Visual constants -----------------------------------------------------
-# User convention: layer 1 topmost = red, 2 green, 3 orange, 4 blue.
+# Layer 1=red, 2=green, 3=orange, 4=blue.
 LAYER_COLORS = ["#e63434", "#18d935", "#ce6c33", "#2080d0"]
 
 ROW_BG_EMPTY    = "#f0f0f0"
 ROW_BG_FILLED   = "#dfeeff"
 ROW_BG_SELECTED = "#ffd89a"
-
-TOPOLOGY_CHOICES = [
-    ("All parallel",   "parallel"),
-    ("All series",     "series"),
-    ("1p2 -|- 3p4",    "parallel_pairs_ser"),
-]
 
 _STATUS_COLORS = {
     "nothing":  ("Nothing loaded in Sim",        "#c01010"),
@@ -49,9 +44,20 @@ _STATUS_COLORS = {
     "outdated": ("Outdated Coil loaded in Sim",  "#c06010"),
 }
 
-# For the default (non-true-scale) 3D view, exaggerate z gaps so thin
-# PCB stacks are visible alongside coil ODs of tens of mm.
 Z_EXAGGERATION = 12.0
+
+# Hardcoded per role.
+_TX_TOPOLOGY    = "series"
+_TX_PORT_INSIDE = False
+_TX_ACTIVE_SLOTS = [True, True, False, False]
+
+_RX_TOPOLOGIES = [
+    ("All series",  "series"),
+    ("1p2 -|- 3p4", "parallel_pairs_ser"),
+]
+_RX_PORT_INSIDE = True
+_RX_ACTIVE_SLOTS = [True, True, True, True]
+_RX_COPPER_OZ   = [1.0, 0.5, 0.5, 1.0]
 
 
 class ParametricCoilTab(ttk.Frame):
@@ -62,36 +68,36 @@ class ParametricCoilTab(ttk.Frame):
     DEFAULT_SPACING_MM    = 0.16
     DEFAULT_TURNS         = 11
     DEFAULT_RESOLUTION_MM = 0.6
-    DEFAULT_OUTER_GAP     = 0.2
-    DEFAULT_INNER_GAP     = 1.3
-    DEFAULT_COPPER_OZ     = [1.0, 0.5, 0.5, 1.0]
+    DEFAULT_LAYER_GAP     = 0.2104  # TX: L1-L2 prepreg gap; RX: outer prepreg gap
 
     QUICKSIM_RESOLUTION_MM = 1.2
-    QUICKSIM_TIMEOUT_SEC   = 120   # wall-clock limit for quickSim
+    QUICKSIM_TIMEOUT_SEC   = 120
 
     def __init__(self, parent, app, role, coil_index, temp_dir,
                  on_next_tab=None, **kw):
         super().__init__(parent, **kw)
         self.app = app
-        self.role = role
+        self.role = role          # "TX" or "RX"
         self.coil_index = coil_index
         self.temp_dir = temp_dir
         self._on_next_tab = on_next_tab
 
-        self._layer_data = None           # display-native (for visualizer)
-        self._layer_data_emitted = None   # what was last sent to sim
+        self._layer_data = None
+        self._layer_data_emitted = None
         self._last_params = None
         self._selected_slot_idx = None
         self._debounce_id = None
         self._enabled = True
         self._my_temp_files = set()
 
-        self._link_cu = tk.BooleanVar(value=True)
         self._true_scale = tk.BooleanVar(value=False)
-        self._port_inside = tk.BooleanVar(value=False)
+        # RX topology selector (TX is hardcoded "series").
+        self._rx_topology_var = tk.StringVar(value="series")
+        # TX-only: independent layer 2 turns.
+        self._tx_indep_l2 = tk.BooleanVar(value=False)
+        self._tx_l2_turns_var = tk.StringVar(value="11")
 
-        # QuickSim state.
-        self._quicksim_value = None    # float µH or None
+        self._quicksim_value = None
         self._quicksim_stale = False
         self._quicksim_thread = None
         self._quicksim_queue = queue.Queue()
@@ -99,7 +105,32 @@ class ParametricCoilTab(ttk.Frame):
         self._build()
         self.after(100, self._post_build_init)
 
-    # ---- post-init: restore from savestate, then first refresh -----------
+    # ---- role helpers -------------------------------------------------------
+
+    @property
+    def _is_tx(self):
+        return self.role == "TX"
+
+    def _topology(self):
+        return _TX_TOPOLOGY if self._is_tx else self._rx_topology_var.get()
+
+    def _port_inside(self):
+        return _TX_PORT_INSIDE if self._is_tx else _RX_PORT_INSIDE
+
+    def _active_slots(self):
+        return _TX_ACTIVE_SLOTS if self._is_tx else _RX_ACTIVE_SLOTS
+
+    def _copper_oz_list(self):
+        if self._is_tx:
+            vals = [1.0, 0.5]
+            for i, v in enumerate(self.tx_oz_vars):
+                try: vals[i] = float(v.get())
+                except Exception: pass
+            return [vals[0], vals[1], 0.5, 1.0]   # slots 3,4 inactive for TX
+        return _RX_COPPER_OZ
+
+    # ---- post-init ----------------------------------------------------------
+
     def _post_build_init(self):
         self._suspend_savestate = True
         try:
@@ -109,34 +140,17 @@ class ParametricCoilTab(ttk.Frame):
         self._schedule_refresh()
         self.after(self.DEBOUNCE_MS + 50, self._poll_quicksim)
 
-    # ---- UI build --------------------------------------------------------
+    # ---- UI build -----------------------------------------------------------
+
     def _build(self):
         main = ttk.Frame(self); main.pack(fill="both", expand=True,
-                                           padx=6, pady=6)
-        ctrl = ttk.Frame(main); ctrl.pack(side="left", fill="y",
-                                           padx=(0, 8))
+                                          padx=6, pady=6)
+        ctrl = ttk.Frame(main); ctrl.pack(side="left", fill="y", padx=(0, 8))
         self._build_controls(ctrl)
-        right = ttk.Frame(main); right.pack(side="left", fill="both",
-                                             expand=True)
+        right = ttk.Frame(main); right.pack(side="left", fill="both", expand=True)
         self._build_viewer(right)
 
     def _build_controls(self, parent):
-        # Topology picker.
-        tf = ttk.LabelFrame(parent, text="Topology")
-        tf.pack(fill="x", pady=(0, 6))
-        self.topology_var = tk.StringVar(value="parallel")
-        for label, val in TOPOLOGY_CHOICES:
-            ttk.Radiobutton(tf, text=label, variable=self.topology_var,
-                            value=val,
-                            command=self._on_topology_change
-                            ).pack(anchor="w", padx=6, pady=1)
-        self._port_inside_cb = ttk.Checkbutton(
-            tf, text="Port on Inside",
-            variable=self._port_inside,
-            command=self._on_port_inside_change,
-            state="enabled")
-        self._port_inside_cb.pack(anchor="w", padx=6, pady=(2, 2))
-
         # Spiral settings.
         sp = ttk.LabelFrame(parent, text="Spiral (applies to all active layers)")
         sp.pack(fill="x", pady=(0, 6))
@@ -146,50 +160,87 @@ class ParametricCoilTab(ttk.Frame):
         self.turns_var = self._entry(sp, "Turns/layer:",        self.DEFAULT_TURNS)
         self.res_var   = self._entry(sp, "Resolution (mm):",    self.DEFAULT_RESOLUTION_MM)
 
-        # Stack-up gaps.
-        zf = ttk.LabelFrame(parent, text="Stack-up gaps")
+        # RX topology selector.
+        if not self._is_tx:
+            tf = ttk.LabelFrame(parent, text="Topology")
+            tf.pack(fill="x", pady=(0, 6))
+            for label, val in _RX_TOPOLOGIES:
+                ttk.Radiobutton(tf, text=label, variable=self._rx_topology_var,
+                                value=val,
+                                command=self._on_rx_topology_change
+                                ).pack(anchor="w", padx=6, pady=1)
+
+        # Stack-up gap (role-specific label/count).
+        zf = ttk.LabelFrame(parent, text="Stack-up gap")
         zf.pack(fill="x", pady=(0, 6))
-        self.outer_gap_var = self._entry(zf, "Outer L. gap (mm):", self.DEFAULT_OUTER_GAP)
-        self.inner_gap_var = self._entry(zf, "Inner L. gap (mm):", self.DEFAULT_INNER_GAP)
+        if self._is_tx:
+            self.layer_gap_var = self._entry(zf, "Layer 1 - 2 gap (mm):", self.DEFAULT_LAYER_GAP)
+        else:
+            self.layer_gap_var = self._entry(zf, "Outer L. gap (mm):", self.DEFAULT_LAYER_GAP)
+            self.inner_gap_var = self._entry(zf, "Inner L. gap (mm):", 0.6)
 
-        # Layer row table.
-        lt = ttk.LabelFrame(parent, text="Layers")
-        lt.pack(fill="x", pady=(0, 6))
-        ttk.Checkbutton(lt, text="Link copper oz (outer pair + inner pair)",
-                        variable=self._link_cu,
-                        command=self._on_link_toggle
-                        ).pack(anchor="w", padx=4, pady=(2, 4))
+        # Layer info / copper weight rows.
+        lf = ttk.LabelFrame(parent, text="Layers")
+        lf.pack(fill="x", pady=(0, 6))
+        if self._is_tx:
+            ttk.Label(lf, text="Series  |  Port outside  (fixed)",
+                      foreground="#606060").pack(anchor="w", padx=6, pady=(4, 2))
+        else:
+            ttk.Label(lf, text="All 4 layers  |  Port inside  (fixed)",
+                      foreground="#606060").pack(anchor="w", padx=6, pady=2)
+            ttk.Label(lf, text="Cu oz: 1.0 / 0.5 / 0.5 / 1.0  (fixed)",
+                      foreground="#606060").pack(anchor="w", padx=6, pady=(0, 4))
 
-        self.slot_active_vars = []
-        self.slot_oz_vars = []
+        # TX: per-layer rows with Cu oz entry. RX: label-only rows.
         self.slot_row_frames = []
-        for i in range(4):
-            row = tk.Frame(lt, bg=ROW_BG_EMPTY, bd=1, relief="solid")
+        self.tx_oz_vars = []   # only populated for TX
+        active = self._active_slots()
+        tx_oz_defaults = [1.0, 0.5]
+        for i in range(2 if self._is_tx else 4):
+            row = tk.Frame(lf, bg=ROW_BG_FILLED if active[i] else ROW_BG_EMPTY,
+                           bd=1, relief="solid")
             row.pack(fill="x", padx=4, pady=1)
-
-            av = tk.BooleanVar(value=(i == 0))
-            ttk.Checkbutton(row, text=f"Layer {i+1}", variable=av,
-                            command=self._on_active_toggle
-                            ).pack(side="left", padx=4, pady=2)
-
-            tk.Label(row, text="Cu oz:", bg=ROW_BG_EMPTY
-                     ).pack(side="left", padx=(4, 0))
-            ozv = tk.StringVar(value=f"{self.DEFAULT_COPPER_OZ[i]}")
-            ttk.Entry(row, textvariable=ozv, width=6
-                      ).pack(side="left", padx=2, pady=2)
-            ozv.trace_add("write", lambda *_a, idx=i: self._on_oz_change(idx))
-
-            self.slot_active_vars.append(av)
-            self.slot_oz_vars.append(ozv)
-            self.slot_row_frames.append(row)
-
+            tk.Label(row, text=f"Layer {i+1}",
+                     bg=ROW_BG_FILLED if active[i] else ROW_BG_EMPTY
+                     ).pack(side="left", padx=4, pady=2)
+            if self._is_tx:
+                tk.Label(row, text="Cu oz:", bg=ROW_BG_FILLED
+                         ).pack(side="left", padx=(6, 0))
+                ozv = tk.StringVar(value=f"{tx_oz_defaults[i]}")
+                ttk.Entry(row, textvariable=ozv, width=6
+                          ).pack(side="left", padx=2, pady=2)
+                ozv.trace_add("write", lambda *_a: self._schedule_refresh())
+                self.tx_oz_vars.append(ozv)
             row.bind("<Button-1>", lambda e, idx=i: self._focus_slot(idx))
             for child in row.winfo_children():
                 if isinstance(child, tk.Label):
                     child.bind("<Button-1>",
                                lambda e, idx=i: self._focus_slot(idx))
+            self.slot_row_frames.append(row)
 
-        # View-mode buttons.
+        # TX-only: independent layer 2 turns.
+        if self._is_tx:
+            l2f = ttk.LabelFrame(parent, text="Layer 2 (independent)")
+            l2f.pack(fill="x", pady=(0, 6))
+            ttk.Checkbutton(l2f, text="Independent L2 turns",
+                            variable=self._tx_indep_l2,
+                            command=self._on_tx_indep_l2_toggle
+                            ).pack(anchor="w", padx=6, pady=(4, 2))
+            self._l2_controls_frame = ttk.Frame(l2f)
+            self._l2_controls_frame.pack(fill="x")
+            row = ttk.Frame(self._l2_controls_frame)
+            row.pack(fill="x", padx=4, pady=2)
+            ttk.Label(row, text="L2 turns:", width=22, anchor="w").pack(side="left")
+            ttk.Entry(row, textvariable=self._tx_l2_turns_var, width=10
+                      ).pack(side="left")
+            self._tx_l2_turns_var.trace_add("write", lambda *_: self._on_l2_turns_changed())
+            self._tx_l2_w_label = ttk.Label(self._l2_controls_frame,
+                                             text="L2 width: —",
+                                             foreground="#404080")
+            self._tx_l2_w_label.pack(anchor="w", padx=6, pady=(0, 4))
+            self._update_l2_controls_state()
+
+        # View mode.
         vf = ttk.Frame(parent); vf.pack(fill="x", pady=(4, 2))
         ttk.Button(vf, text="View Stack (3D)",
                    command=self._view_stack).pack(fill="x", padx=4, pady=1)
@@ -203,16 +254,14 @@ class ParametricCoilTab(ttk.Frame):
         # QuickSim row.
         qs = ttk.Frame(parent); qs.pack(fill="x", pady=(0, 2))
         self.quicksim_btn = ttk.Button(qs, text="Quick Sim L",
-                                        command=self._on_quick_sim,
-                                        width=14)
+                                       command=self._on_quick_sim, width=14)
         self.quicksim_btn.pack(side="left", padx=4)
         self.quicksim_label = tk.Label(qs, text="~ — µH", fg="gray")
         self.quicksim_label.pack(side="left", padx=4)
 
         # Send to Sim + status + Next Tab.
         ttk.Button(parent, text=f"Send to Simulation ({self.role})",
-                   width=28,
-                   command=self._on_send_to_sim).pack(fill="x", padx=4, pady=2)
+                   width=28, command=self._on_send_to_sim).pack(fill="x", padx=4, pady=2)
         self.sim_status_label = tk.Label(parent, text="",
                                           fg=_STATUS_COLORS["nothing"][1],
                                           anchor="w")
@@ -225,7 +274,6 @@ class ParametricCoilTab(ttk.Frame):
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=4)
 
-        # Export / reset.
         ttk.Button(parent, text="Export INP…", width=28,
                    command=self.export_inp).pack(fill="x", padx=4, pady=1)
         ttk.Button(parent, text="Reset This Tab", width=28,
@@ -252,7 +300,8 @@ class ParametricCoilTab(ttk.Frame):
         var.trace_add("write", lambda *_a: self._schedule_refresh())
         return var
 
-    # ---- enable/disable --------------------------------------------------
+    # ---- enable/disable -----------------------------------------------------
+
     def set_enabled(self, enabled):
         self._enabled = enabled
         state = "normal" if enabled else "disabled"
@@ -273,57 +322,40 @@ class ParametricCoilTab(ttk.Frame):
         for child in widget.winfo_children():
             self._walk_state(child, state)
 
-    # ---- user events -----------------------------------------------------
-    def _on_topology_change(self):
-        topo = self.topology_var.get()
-        if topo == "parallel_pairs_ser":
-            for av in self.slot_active_vars:
-                av.set(True)
-        if topo == "parallel":
-            self._port_inside.set(False)
-            self._port_inside_cb.configure(state="disabled")
-        else:
-            self._port_inside_cb.configure(state="normal")
-        self._mark_quicksim_stale()
+    # ---- user events --------------------------------------------------------
+
+    def _on_l2_turns_changed(self):
+        try:
+            n2 = int(self._tx_l2_turns_var.get())
+            n1 = int(float(self.turns_var.get()))
+            if n2 > n1:
+                self._tx_l2_turns_var.set(str(n1))
+                return   # setting the var triggers this callback again
+        except ValueError:
+            pass
+        self._schedule_refresh()
+
+    def _on_tx_indep_l2_toggle(self):
+        self._update_l2_controls_state()
         self._mark_sim_outdated_if_loaded()
         self._schedule_refresh()
         self._save_state()
 
-    def _on_port_inside_change(self):
-        self._mark_quicksim_stale()
+    def _update_l2_controls_state(self):
+        if not self._is_tx:
+            return
+        enabled = self._tx_indep_l2.get()
+        state = "normal" if enabled else "disabled"
+        self._walk_state(self._l2_controls_frame, state)
+        if not enabled:
+            self._tx_l2_w_label.configure(text="L2 width: —")
+
+    def _on_rx_topology_change(self):
         self._mark_sim_outdated_if_loaded()
         self._schedule_refresh()
         self._save_state()
-
-    def _on_active_toggle(self):
-        self._mark_quicksim_stale()
-        self._mark_sim_outdated_if_loaded()
-        self._schedule_refresh()
-        self._save_state()
-
-    def _on_link_toggle(self):
-        if self._link_cu.get():
-            # Outer pair: slots 1 & 4 share value of slot 1.
-            self.slot_oz_vars[3].set(self.slot_oz_vars[0].get())
-            # Inner pair: slots 2 & 3 share value of slot 2.
-            self.slot_oz_vars[2].set(self.slot_oz_vars[1].get())
-        self._mark_quicksim_stale()
-        self._schedule_refresh()
-        self._save_state()
-
-    def _on_oz_change(self, changed_idx):
-        if self._link_cu.get():
-            v = self.slot_oz_vars[changed_idx].get()
-            # Outer pair: 0 ↔ 3. Inner pair: 1 ↔ 2.
-            pair = {0: 3, 3: 0, 1: 2, 2: 1}.get(changed_idx)
-            if pair is not None and self.slot_oz_vars[pair].get() != v:
-                self.slot_oz_vars[pair].set(v)
-        self._mark_quicksim_stale()
-        self._mark_sim_outdated_if_loaded()
-        self._schedule_refresh()
 
     def _on_true_scale_toggle(self):
-        # View-only toggle; redraw but don't invalidate anything.
         if self._selected_slot_idx is None:
             self._draw_stack_3d()
         self._save_state()
@@ -349,11 +381,11 @@ class ParametricCoilTab(ttk.Frame):
             self._on_next_tab()
 
     def _paint_row_bgs(self):
+        active = self._active_slots()
         for i, row in enumerate(self.slot_row_frames):
-            active = self.slot_active_vars[i].get()
             if self._selected_slot_idx == i:
                 bg = ROW_BG_SELECTED
-            elif active:
+            elif active[i]:
                 bg = ROW_BG_FILLED
             else:
                 bg = ROW_BG_EMPTY
@@ -362,7 +394,8 @@ class ParametricCoilTab(ttk.Frame):
                 if isinstance(child, tk.Label):
                     child.configure(bg=bg)
 
-    # ---- refresh / validation -------------------------------------------
+    # ---- refresh / validation -----------------------------------------------
+
     def _schedule_refresh(self, *_):
         if not self._enabled: return
         if self._debounce_id is not None:
@@ -380,22 +413,34 @@ class ParametricCoilTab(ttk.Frame):
         ok, msg = pc.validate_spiral(params)
         if not ok:
             self._show_fail(msg); return
-        topo = self.topology_var.get()
-        n_active = sum(1 for s in stackup.slots if s.active)
-        if topo == "parallel_pairs_ser" and n_active != 4:
-            self._show_fail("This topology requires all 4 layers active.")
-            return
-        if n_active < 1:
-            self._show_fail("Activate at least one layer."); return
-        try:
-            layers = pc.active_layer_data(params, stackup)
-        except Exception as e:
-            self._show_fail(f"Generation error: {e}"); return
 
-        # Apply reverse flags so the *visualizer* shows true current flow
-        # for series topologies (per user's preference).
+        # TX with independent L2 turns takes a separate code path.
+        if self._is_tx and self._tx_indep_l2.get():
+            try:
+                n2 = int(self._tx_l2_turns_var.get())
+                n1 = int(params.turns)
+                if n2 < 1 or n2 > n1:
+                    raise ValueError(f"must be 1 – {n1}")
+            except ValueError as e:
+                self._show_fail(f"L2 turns: {e}"); return
+            try:
+                layers, w2 = pc.active_layer_data_tx_independent(
+                    params, stackup, n2)
+                self._tx_l2_w_label.configure(
+                    text=f"L2 width: {w2:.4f} mm")
+            except Exception as e:
+                self._show_fail(f"Layer 2 error: {e}"); return
+        else:
+            if self._is_tx and hasattr(self, "_tx_l2_w_label"):
+                self._tx_l2_w_label.configure(text="L2 width: —")
+            try:
+                layers = pc.active_layer_data(params, stackup)
+            except Exception as e:
+                self._show_fail(f"Generation error: {e}"); return
+
+        topo = self._topology()
         flags = pc.series_reverse_flags_for_topology(topo, len(layers))
-        if self._port_inside.get() and topo != "parallel":
+        if self._port_inside() and topo != "parallel":
             flags = [not f for f in flags]
         layers = pc.reverse_nodes_for_series_flow(layers, flags)
 
@@ -419,18 +464,27 @@ class ParametricCoilTab(ttk.Frame):
     def _update_info_line(self):
         if not self._layer_data:
             self.info_var.set(""); return
-        topo = self.topology_var.get()
+        topo = self._topology()
         n_nodes = sum(len(ld["nodes"]) for ld in self._layer_data)
-        t_per = self._last_params.turns
         n_act = len(self._layer_data)
-        if   topo == "parallel":            eff_t, eff_m = t_per,      1
-        elif topo == "series":              eff_t, eff_m = t_per*n_act, n_act
-        elif topo == "parallel_pairs_ser":  eff_t, eff_m = t_per*2,    2
-        else:                               eff_t, eff_m = t_per,      1
-        single_len = self._single_layer_length_mm()
-        self.info_var.set(
-            f"{n_act} active | {topo} | eff. turns={eff_t:g} | "
-            f"eff. length={single_len*eff_m:.1f} mm | {n_nodes} nodes")
+        if self._is_tx and self._tx_indep_l2.get() and n_act == 2:
+            try:
+                n2 = float(self._tx_l2_turns_var.get())
+            except ValueError:
+                n2 = 0.0
+            eff_t = self._last_params.turns + n2
+            self.info_var.set(
+                f"{n_act} active | series | "
+                f"L1={self._last_params.turns:g}T L2={n2:g}T | "
+                f"eff. turns={eff_t:g} | {n_nodes} nodes")
+        else:
+            t_per = self._last_params.turns
+            eff_m = 2 if topo == "parallel_pairs_ser" else n_act
+            eff_t = t_per * eff_m
+            single_len = self._single_layer_length_mm()
+            self.info_var.set(
+                f"{n_act} active | {topo} | eff. turns={eff_t:g} | "
+                f"eff. length={single_len*eff_m:.1f} mm | {n_nodes} nodes")
 
     def _single_layer_length_mm(self):
         if not self._layer_data: return 0.0
@@ -458,20 +512,28 @@ class ParametricCoilTab(ttk.Frame):
                 resolution_mm=float(self.res_var.get()))
         except ValueError:
             return None, None, "Enter numeric spiral parameters."
+
         try:
-            slots = [pc.LayerSlot(active=bool(self.slot_active_vars[i].get()),
-                                  copper_oz=float(self.slot_oz_vars[i].get()))
+            outer_gap = float(self.layer_gap_var.get())
+            if self._is_tx:
+                inner_gap = 0.0
+            else:
+                inner_gap = float(self.inner_gap_var.get())
+
+            oz_list = self._copper_oz_list()
+            active = self._active_slots()
+            slots = [pc.LayerSlot(active=active[i], copper_oz=oz_list[i])
                      for i in range(4)]
             stackup = pc.StackUp(slots=slots,
-                                 outer_gap_mm=float(self.outer_gap_var.get()),
-                                 inner_gap_mm=float(self.inner_gap_var.get()))
+                                 outer_gap_mm=outer_gap,
+                                 inner_gap_mm=inner_gap)
         except ValueError:
             return None, None, "Enter numeric stack-up parameters."
         return params, stackup, None
 
-    # ---- drawing ---------------------------------------------------------
+    # ---- drawing ------------------------------------------------------------
+
     def _build_ribbon_world(self, nodes, trace_w):
-        """Outer/inner offset polygon along a centerline — 2D."""
         n = len(nodes)
         if n < 2: return []
         half = trace_w / 2.0
@@ -491,36 +553,27 @@ class ParametricCoilTab(ttk.Frame):
         return outer + inner[::-1]
 
     def _draw_single_layer_ribbon(self, ld):
-        """Single-layer focus: true-width ribbon, correct color."""
         self.fig.clf()
         ax = self.fig.add_subplot(111)
-        w = self._last_params.trace_width_mm
+        w = ld.get("w_mm", self._last_params.trace_width_mm)
         poly = self._build_ribbon_world(ld["nodes"], w)
         color = LAYER_COLORS[(ld["slot"] - 1) % len(LAYER_COLORS)]
         if poly:
             xs, ys = zip(*poly)
             ax.fill(xs, ys, color=color, alpha=0.85,
                     edgecolor="#202020", linewidth=0.5)
-        # Start/end markers (reflect reversed direction if series).
         n = ld["nodes"]
         ax.plot(n[0][0],  n[0][1],  "go", markersize=8, label="Entry")
         ax.plot(n[-1][0], n[-1][1], "rs", markersize=8, label="Exit")
         ax.set_aspect("equal")
         ax.set_title(f"Layer {ld['slot']}  (z = {ld['z']:.3f} mm, "
-                     f"h = {ld['h_mm']:.3f} mm)")
+                     f"h = {ld['h_mm']:.3f} mm, w = {w:.4f} mm)")
         ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
         ax.grid(True, alpha=0.3); ax.legend(loc="best")
         self.fig.tight_layout()
         self.canvas.draw_idle()
 
     def _draw_stack_3d(self):
-        """
-        3D stack with user's mental-model z: layer 1 topmost.
-
-        Code-z in parametric_coil.generate_nodes: slot 1 = 0, slot 4 > 0.
-        We invert the display axis so z_display = -z_code; matplotlib
-        then renders slot 1 at the top of the 3D plot.
-        """
         if not self._layer_data: return
         self.fig.clf()
         ax = self.fig.add_subplot(111, projection="3d")
@@ -531,19 +584,16 @@ class ParametricCoilTab(ttk.Frame):
         for ld in self._layer_data:
             xs = [p[0] for p in ld["nodes"]]
             ys = [p[1] for p in ld["nodes"]]
-            # Flip z so slot 1 (z_code=0) ends up at the top visually.
             zs = [-p[2] * z_scale for p in ld["nodes"]]
             color = LAYER_COLORS[(ld["slot"] - 1) % len(LAYER_COLORS)]
             ax.plot(xs, ys, zs, color=color, linewidth=1.1,
                     label=f"Layer {ld['slot']}")
-            # Entry/exit dots on each layer (makes reversed directions visible).
             ax.scatter([xs[0]], [ys[0]], [zs[0]],
                        color="#00a000", s=20, edgecolors="black", linewidth=0.5)
             ax.scatter([xs[-1]], [ys[-1]], [zs[-1]],
                        color="#c01010", s=20, edgecolors="black", linewidth=0.5)
 
-        # Draw via connections as purple lines between layer endpoints.
-        topo = self.topology_var.get()
+        topo = self._topology()
         via_conns = pc.via_connections_for_topology(topo, len(self._layer_data))
         for ki, ei, kj, ej in via_conns:
             pa = self._layer_data[ki]["nodes"][ei]
@@ -555,7 +605,7 @@ class ParametricCoilTab(ttk.Frame):
         ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
         ax.set_zlabel("-Z (mm, layer 1 top)"
                       + ("" if true_scale else f"  [×{Z_EXAGGERATION:g}]"))
-        title = f"{self.role} stack — {self.topology_var.get()}"
+        title = f"{self.role} stack — {self._topology()}"
         if not true_scale:
             title += "  (z exaggerated)"
         ax.set_title(title)
@@ -573,35 +623,46 @@ class ParametricCoilTab(ttk.Frame):
         ax.set_ylim3d(cy-span/2, cy+span/2)
         ax.set_zlim3d(cz-span/2, cz+span/2)
 
-    # ---- public ---------------------------------------------------------
+    # ---- public -------------------------------------------------------------
+
     def is_ready(self):
         return self._layer_data is not None
 
-    # ---- Send to sim / Export / Reset -----------------------------------
+    # ---- Send to sim / Export / Reset ---------------------------------------
+
     def _compose_inp(self, dest_path, fmin, fmax, resolution_override=None,
                      record_emitted=True):
-        topo = self.topology_var.get()
-        port_inside = self._port_inside.get()
-        # Re-generate layers at possibly different resolution (for QuickSim).
+        topo = self._topology()
+        port_inside = self._port_inside()
+        tx_indep = self._is_tx and self._tx_indep_l2.get()
+
         if resolution_override is not None:
-            sp = pc.SpiralParams(
-                od_mm=self._last_params.od_mm,
-                trace_width_mm=self._last_params.trace_width_mm,
-                spacing_mm=self._last_params.spacing_mm,
-                turns=self._last_params.turns,
-                resolution_mm=resolution_override)
             _, stackup, _ = self._snapshot_inputs()
-            layers = pc.active_layer_data(sp, stackup)
+            if tx_indep:
+                n2 = int(self._tx_l2_turns_var.get())
+                sp = pc.SpiralParams(
+                    od_mm=self._last_params.od_mm,
+                    trace_width_mm=self._last_params.trace_width_mm,
+                    spacing_mm=self._last_params.spacing_mm,
+                    turns=self._last_params.turns,
+                    resolution_mm=resolution_override)
+                layers, _ = pc.active_layer_data_tx_independent(sp, stackup, n2)
+            else:
+                sp = pc.SpiralParams(
+                    od_mm=self._last_params.od_mm,
+                    trace_width_mm=self._last_params.trace_width_mm,
+                    spacing_mm=self._last_params.spacing_mm,
+                    turns=self._last_params.turns,
+                    resolution_mm=resolution_override)
+                layers = pc.active_layer_data(sp, stackup)
         else:
             layers = [dict(ld, nodes=list(ld["nodes"]))
                       for ld in self._layer_data]
-            # Undo the visualizer's reverse (including any port_inside flip)
-            # so the writer can apply its own flags from scratch.
-            if topo != "parallel":
-                flags = pc.series_reverse_flags_for_topology(topo, len(layers))
-                if port_inside:
-                    flags = [not f for f in flags]
-                layers = pc.reverse_nodes_for_series_flow(layers, flags)
+            # Undo visualizer's reversal so writer can apply from scratch.
+            flags = pc.series_reverse_flags_for_topology(topo, len(layers))
+            if port_inside:
+                flags = [not f for f in flags]
+            layers = pc.reverse_nodes_for_series_flow(layers, flags)
 
         pc.write_topology_inp(topo, layers, dest_path,
                               w_mm=self._last_params.trace_width_mm,
@@ -613,16 +674,14 @@ class ParametricCoilTab(ttk.Frame):
 
     def _on_send_to_sim(self):
         if not self.is_ready():
-            messagebox.showwarning("Send to Sim",
-                                   "Valid coil required."); return
+            messagebox.showwarning("Send to Sim", "Valid coil required."); return
         fmin = self.app.sim_tab.get_target_freq()
         if fmin is None:
             messagebox.showerror("Send to Sim",
                                  "Set target frequency in Simulation tab.")
             return
         fmax = fmin + 15000.0
-        dest = os.path.join(self.temp_dir,
-                            f"param_{self.role.lower()}.inp")
+        dest = os.path.join(self.temp_dir, f"param_{self.role.lower()}.inp")
         try:
             topo, _ = self._compose_inp(dest, fmin, fmax)
         except Exception as e:
@@ -630,7 +689,7 @@ class ParametricCoilTab(ttk.Frame):
         self._my_temp_files.add(dest)
 
         layer_params = [
-            (self._last_params.trace_width_mm, ld["h_mm"], len(ld["nodes"]))
+            (ld.get("w_mm", self._last_params.trace_width_mm), ld["h_mm"], len(ld["nodes"]))
             for ld in self._layer_data]
         meta = {"role": self.role, "topology": topo,
                 "layer_params": layer_params,
@@ -639,7 +698,6 @@ class ParametricCoilTab(ttk.Frame):
             self.role, "Parametric Generator", dest, meta)
         self._set_sim_status("current")
 
-        # Also push parameters to the Simulation NN tab.
         try:
             nn_tab = getattr(self.app, "sim_nn_tab", None)
             if nn_tab is not None:
@@ -681,16 +739,17 @@ class ParametricCoilTab(ttk.Frame):
             self.s_var.set(f"{self.DEFAULT_SPACING_MM}")
             self.turns_var.set(f"{self.DEFAULT_TURNS}")
             self.res_var.set(f"{self.DEFAULT_RESOLUTION_MM}")
-            self.outer_gap_var.set(f"{self.DEFAULT_OUTER_GAP}")
-            self.inner_gap_var.set(f"{self.DEFAULT_INNER_GAP}")
-            self.topology_var.set("parallel")
-            self._port_inside.set(False)
-            self._port_inside_cb.configure(state="disabled")
-            self._link_cu.set(True)
+            self.layer_gap_var.set(f"{self.DEFAULT_LAYER_GAP}")
+            if self._is_tx:
+                for i, v in enumerate(self.tx_oz_vars):
+                    v.set("1.0" if i == 0 else "0.5")
+                self._tx_indep_l2.set(False)
+                self._tx_l2_turns_var.set("11")
+                self._update_l2_controls_state()
+            else:
+                self.inner_gap_var.set("0.6")
+                self._rx_topology_var.set("series")
             self._true_scale.set(False)
-            for i in range(4):
-                self.slot_active_vars[i].set(i == 0)
-                self.slot_oz_vars[i].set(f"{self.DEFAULT_COPPER_OZ[i]}")
             self._layer_data = None
             self._layer_data_emitted = None
             self._last_params = None
@@ -712,7 +771,8 @@ class ParametricCoilTab(ttk.Frame):
         self._paint_row_bgs()
         self._schedule_refresh()
 
-    # ---- QuickSim -------------------------------------------------------
+    # ---- QuickSim -----------------------------------------------------------
+
     def _mark_quicksim_stale(self):
         if self._quicksim_value is not None:
             self._quicksim_stale = True
@@ -730,12 +790,10 @@ class ParametricCoilTab(ttk.Frame):
 
     def _on_quick_sim(self):
         if not _RUNNER_OK:
-            messagebox.showerror("Quick Sim",
-                                 "FastHenry runner unavailable.")
+            messagebox.showerror("Quick Sim", "FastHenry runner unavailable.")
             return
         if not self.is_ready():
-            messagebox.showwarning("Quick Sim",
-                                   "Valid coil required."); return
+            messagebox.showwarning("Quick Sim", "Valid coil required."); return
         if self._quicksim_thread and self._quicksim_thread.is_alive():
             return
         fmin = self.app.sim_tab.get_target_freq()
@@ -744,8 +802,6 @@ class ParametricCoilTab(ttk.Frame):
                                  "Set target frequency in Simulation tab.")
             return
         fmax = fmin + 15000.0
-        # Use a dedicated sub-directory so quickSim's Zc.mat never collides
-        # with the sim-tab's Zc.mat (both would otherwise land in temp/).
         qs_dir = os.path.join(self.temp_dir, f"qs_{self.role.lower()}")
         os.makedirs(qs_dir, exist_ok=True)
         dest = os.path.join(qs_dir, f"quicksim_{self.role.lower()}.inp")
@@ -760,15 +816,14 @@ class ParametricCoilTab(ttk.Frame):
         self.quicksim_btn.configure(state="disabled", text="Running…")
         self._quicksim_thread = threading.Thread(
             target=self._quicksim_worker,
-            args=(dest, fmin + 5000.0),  # pick mid-ish frequency
+            args=(dest, fmin + 5000.0),
             daemon=True)
         self._quicksim_thread.start()
 
     def _quicksim_worker(self, inp_path, target_f):
         try:
             with runner.FastHenryRunner() as fh:
-                ok = fh.run(inp_path,
-                            timeout_sec=self.QUICKSIM_TIMEOUT_SEC,
+                ok = fh.run(inp_path, timeout_sec=self.QUICKSIM_TIMEOUT_SEC,
                             progress_cb=None)
                 if not ok:
                     self._quicksim_queue.put(("error", "Timed out")); return
@@ -781,8 +836,7 @@ class ParametricCoilTab(ttk.Frame):
                 L_h = Zmat[0][0].imag / (2.0 * math.pi * f_used)
                 self._quicksim_queue.put(("done", L_h * 1e6))
         except Exception as e:
-            self._quicksim_queue.put(("error",
-                                      f"{type(e).__name__}: {e}"))
+            self._quicksim_queue.put(("error", f"{type(e).__name__}: {e}"))
 
     def _poll_quicksim(self):
         try:
@@ -802,7 +856,8 @@ class ParametricCoilTab(ttk.Frame):
         finally:
             self.after(self.DEBOUNCE_MS, self._poll_quicksim)
 
-    # ---- sim-loaded-status helpers --------------------------------------
+    # ---- sim-loaded-status helpers ------------------------------------------
+
     def _set_sim_status(self, key):
         text, color = _STATUS_COLORS[key]
         self.sim_status_label.configure(text=text, fg=color)
@@ -813,57 +868,56 @@ class ParametricCoilTab(ttk.Frame):
             self._set_sim_status("outdated")
 
     def on_sim_slot_cleared(self):
-        """Called by SimTab when our slot is cleared externally."""
         self._set_sim_status("nothing")
 
-    # ---- savestate ------------------------------------------------------
+    # ---- savestate ----------------------------------------------------------
+
     def _save_state(self):
         if getattr(self, "_suspend_savestate", False): return
         self.app.persist_parametric_tab(self.role, self.to_state())
 
     def to_state(self):
-        return {
-            "topology":    self.topology_var.get(),
-            "port_inside": self._port_inside.get(),
-            "od":          self.od_var.get(),
-            "w":           self.w_var.get(),
-            "s":           self.s_var.get(),
-            "turns":       self.turns_var.get(),
-            "res":         self.res_var.get(),
-            "outer_gap":   self.outer_gap_var.get(),
-            "inner_gap":   self.inner_gap_var.get(),
-            "link_cu":     self._link_cu.get(),
-            "true_scale":  self._true_scale.get(),
-            "active":      [v.get() for v in self.slot_active_vars],
-            "oz":          [v.get() for v in self.slot_oz_vars],
+        state = {
+            "od":         self.od_var.get(),
+            "w":          self.w_var.get(),
+            "s":          self.s_var.get(),
+            "turns":      self.turns_var.get(),
+            "res":        self.res_var.get(),
+            "layer_gap":  self.layer_gap_var.get(),
+            "true_scale": self._true_scale.get(),
         }
+        if self._is_tx:
+            state["tx_oz"] = [v.get() for v in self.tx_oz_vars]
+            state["tx_indep_l2"] = self._tx_indep_l2.get()
+            state["tx_l2_turns"] = self._tx_l2_turns_var.get()
+        else:
+            state["inner_gap"] = self.inner_gap_var.get()
+            state["rx_topology"] = self._rx_topology_var.get()
+        return state
 
     def _restore_from_savestate(self):
         state = self.app.load_parametric_tab_state(self.role)
         if not state: return
         try:
-            topo = state.get("topology", "parallel")
-            self.topology_var.set(topo)
-            port_inside = bool(state.get("port_inside", False))
-            self._port_inside.set(port_inside)
-            if topo == "parallel":
-                self._port_inside_cb.configure(state="disabled")
-            else:
-                self._port_inside_cb.configure(state="normal")
             self.od_var.set(state.get("od", f"{self.DEFAULT_OD_MM}"))
             self.w_var.set(state.get("w", f"{self.DEFAULT_TRACE_W_MM}"))
             self.s_var.set(state.get("s", f"{self.DEFAULT_SPACING_MM}"))
             self.turns_var.set(state.get("turns", f"{self.DEFAULT_TURNS}"))
             self.res_var.set(state.get("res", f"{self.DEFAULT_RESOLUTION_MM}"))
-            self.outer_gap_var.set(state.get("outer_gap", f"{self.DEFAULT_OUTER_GAP}"))
-            self.inner_gap_var.set(state.get("inner_gap", f"{self.DEFAULT_INNER_GAP}"))
-            self._link_cu.set(bool(state.get("link_cu", True)))
+            self.layer_gap_var.set(state.get("layer_gap", f"{self.DEFAULT_LAYER_GAP}"))
             self._true_scale.set(bool(state.get("true_scale", False)))
-            act = state.get("active", [True, False, False, False])
-            oz  = state.get("oz", [str(v) for v in self.DEFAULT_COPPER_OZ])
-            for i in range(4):
-                self.slot_active_vars[i].set(bool(act[i]) if i < len(act) else False)
-                if i < len(oz):
-                    self.slot_oz_vars[i].set(str(oz[i]))
+            if self._is_tx:
+                saved_oz = state.get("tx_oz", ["1.0", "0.5"])
+                defaults = ["1.0", "0.5"]
+                for i, v in enumerate(self.tx_oz_vars):
+                    v.set(saved_oz[i] if i < len(saved_oz) else defaults[i])
+                self._tx_indep_l2.set(bool(state.get("tx_indep_l2", False)))
+                self._tx_l2_turns_var.set(state.get("tx_l2_turns", "11"))
+                self._update_l2_controls_state()
+            else:
+                self.inner_gap_var.set(state.get("inner_gap", "0.6"))
+                saved_topo = state.get("rx_topology", "series")
+                valid = [v for _, v in _RX_TOPOLOGIES]
+                self._rx_topology_var.set(saved_topo if saved_topo in valid else "series")
         except Exception:
             pass

@@ -2,15 +2,14 @@
 """
 Generate Latin Hypercube Samples for the combined TX+RX design-space sweep.
 
-Domain configuration lives in a domain_master.json file that pins every
-free / fixed variable for the run.  The same file is read by the GUI and by
-the NN at training time so that the valid input domain is explicit and
-reproducible.
+Fixed (not sampled, not NN inputs):
+  TX: series topology, port outside, L1+L2 active, 1 oz outer / 0.5 oz inner
+  RX: all 4 layers active, port inside, 1 oz outer / 0.5 oz inner
 
-The generator is deterministic: hard-coded seed + domain config + sample
-count => identical sample list.  A small companion master file is written
-with the full domain, so later code (bounds validation, NN training)
-does not have to re-read lhs_samples.json.
+Free variables (sampled → NN inputs):
+  TX: od, turns (L1), l2_turns, trace_width, spacing, l1l2_gap, pcb_gap
+  RX: od (≥ TX od, within 1.4 mm), turns, trace_width, spacing, outer_gap, inner_gap, topology
+  freq: linearly assigned across sample index (not an LHS dimension)
 
 CLI usage:
     python generate_lhs_samples.py --config domain_master.json
@@ -23,7 +22,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import sys
 import uuid as uuid_module
@@ -32,7 +30,6 @@ from scipy.stats import qmc
 
 _HERE        = os.path.dirname(os.path.abspath(__file__))
 _APP_ROOT    = os.path.dirname(os.path.dirname(_HERE))
-_SIMDATA_DIR = os.path.join(_APP_ROOT, "SimulationData")
 _MODULES_DIR = os.path.join(_APP_ROOT, "Modules")
 
 for _p in (_HERE, _MODULES_DIR):
@@ -47,67 +44,74 @@ import parametric_coil as pc  # noqa: E402
 
 HARDCODED_SEED = 42
 
-# Hidden minimum turn counts — samples below these are never generated.
-_MIN_TX_TURNS = 3
-_MIN_RX_TURNS = 3
+_MIN_TX_TURNS   = 3
+_MIN_TX_L2_TURNS = 1
+_MIN_RX_TURNS   = 3
+
+# Fixed stackup — never sampled, never NN inputs.
+_TX_OUTER_OZ  = 1.0
+_TX_INNER_OZ  = 0.5
+_TX_LAYERS    = [
+    {"active": True,  "copper_oz": _TX_OUTER_OZ},
+    {"active": True,  "copper_oz": _TX_INNER_OZ},
+    {"active": False, "copper_oz": 1.0},
+    {"active": False, "copper_oz": 1.0},
+]
+_RX_OUTER_OZ  = 1.0
+_RX_INNER_OZ  = 0.5
+_RX_LAYERS    = [
+    {"active": True, "copper_oz": _RX_OUTER_OZ},
+    {"active": True, "copper_oz": _RX_INNER_OZ},
+    {"active": True, "copper_oz": _RX_INNER_OZ},
+    {"active": True, "copper_oz": _RX_OUTER_OZ},
+]
+
+# RX topologies — encoded as int in samples (0=series, 1=parallel_pairs_ser).
+_RX_TOPOS = ["series", "parallel_pairs_ser"]
 
 DEFAULT_DOMAIN = {
     "tx": {
-        "layers_selected":  [True, True, True, False],
-        "od_max_mm":        53.0,
-        "id_min_mm":        35.0,
+        "od_mm":            [50.0, 54.0],  # sampled range [min, max]
+        "id_min_mm":        39.0,          # feasibility floor only
         "trace_width_mm":   [0.2, 1.2],
         "trace_spacing_mm": [0.16, 0.16],
         "turns":            [6, 18],
-        "outer_cu_oz":      [1.0, 1.0],
-        "inner_cu_oz":      [0.5, 1.0],
-        "outer_gap_mm":     [0.2, 0.2],
-        "inner_gap_mm":     [1.3, 1.3],
+        "l2_turns_frac":    [0.4, 1.0],
+        "l1l2_gap_mm":      [0.2104, 0.2104],
         "nhinc":            1,
         "nwinc":            3,
-        "port_outside_allowed": True,
-        "port_inside_allowed":  False,
     },
     "rx": {
-        "layers_selected":  [True, True, True, True],
-        "od_max_mm":        53.0,
-        "id_min_mm":        35.0,
+        "od_mm":            [50.0, 54.0],  # sampled; constrained to [tx_od, tx_od+1.4] at decode time
+        "id_min_mm":        35.0,          # feasibility floor only
         "trace_width_mm":   [0.2, 1.2],
         "trace_spacing_mm": [0.16, 0.16],
         "turns":            [4, 25],
-        "outer_cu_oz":      [1.0, 1.0],
-        "inner_cu_oz":      [0.5, 0.5],
-        "outer_gap_mm":     [0.2, 0.2],
+        "outer_gap_mm":     [0.2104, 0.2104],
         "inner_gap_mm":     [0.6, 0.6],
+        "ground_disc_dia_mm": 20.0,        # passive copper on both inner layers; 0 disables
         "nhinc":            1,
         "nwinc":            3,
-        "port_outside_allowed": False,
-        "port_inside_allowed":  True,
     },
     "global": {
         "pcb_gap_mm":    [2.6, 2.6],
         "resolution_mm": 1.2,
-        "freq_hz":       [340_000.0, 380_000.0],
-        "freq_step_hz":  5000.0,
+        "freq_hz":       [280_000.0, 350_000.0],  # linearly assigned per sample index
     },
     "n_total": 20_000,
 }
 
 
 # ---------------------------------------------------------------------------
-# UUID generation for deduplication
+# UUID for deduplication
 # ---------------------------------------------------------------------------
 
 def sample_uuid(sample: dict) -> str:
-    """Deterministic UUID based on all simulation-relevant parameters."""
     SIM_KEYS = [
-        "tx_turns", "tx_trace_width_mm", "tx_od_mm", "tx_spacing_mm",
-        "tx_outer_gap_mm", "tx_inner_gap_mm", "tx_topology", "tx_port_inside",
-        "tx_layers", "rx_turns", "rx_trace_width_mm", "rx_od_mm",
-        "rx_spacing_mm", "rx_outer_gap_mm", "rx_inner_gap_mm", "rx_topology",
-        "rx_port_inside", "rx_layers", "pcb_gap_mm", "resolution_mm",
-        "freq_hz", "nhinc", "nwinc", "rx_nhinc", "rx_nwinc",
-        "ground_circle_dia_mm",
+        "tx_od", "tx_turns", "tx_l2_turns", "tx_w", "tx_s", "tx_l1l2_gap",
+        "rx_od", "rx_turns", "rx_w", "rx_s", "rx_outer_gap", "rx_inner_gap",
+        "rx_topo", "rx_ground_disc_dia",
+        "pcb_gap", "freq", "resolution",
     ]
     canonical = {k: sample[k] for k in SIM_KEYS if k in sample}
     payload = json.dumps(canonical, sort_keys=True, default=str).encode()
@@ -116,37 +120,8 @@ def sample_uuid(sample: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Domain Helpers
+# Domain helpers
 # ---------------------------------------------------------------------------
-
-def allowed_topologies(layers_selected) -> list:
-    n_active = sum(1 for a in layers_selected if a)
-    if n_active >= 4:
-        return ["parallel", "series", "parallel_pairs_ser"]
-    if n_active >= 2:
-        return ["parallel", "series"]
-    return ["parallel"]
-
-
-def port_choices(side_cfg: dict) -> list:
-    out = []
-    if side_cfg.get("port_outside_allowed", True):
-        out.append(False)
-    if side_cfg.get("port_inside_allowed", False):
-        out.append(True)
-    if not out:
-        out = [False]
-    return out
-
-
-def quantize_oz(u: float, lo: float, hi: float, step: float = 0.5) -> float:
-    lo_q = round(lo / step) * step
-    hi_q = round(hi / step) * step
-    if hi_q <= lo_q:
-        return lo_q
-    n_steps = int(round((hi_q - lo_q) / step)) + 1
-    idx = min(int(u * n_steps), n_steps - 1)
-    return round(lo_q + idx * step, 4)
 
 def _scale(u, lo, hi):
     return lo + u * (hi - lo)
@@ -164,8 +139,9 @@ def _stackup_val(u: float, lo: float, hi: float) -> float:
     return round(options[idx], 4)
 
 
+
 # ---------------------------------------------------------------------------
-# Config hashing / canonicalisation
+# Config canonicalisation
 # ---------------------------------------------------------------------------
 
 def canonicalize(cfg: dict) -> dict:
@@ -174,6 +150,9 @@ def canonicalize(cfg: dict) -> dict:
         src = cfg.get(side) or {}
         dst = dict(DEFAULT_DOMAIN[side])
         dst.update(src)
+        # Backwards-compat: if old single od_max_mm supplied, convert to range.
+        if "od_mm" not in dst and "od_max_mm" in dst:
+            dst["od_mm"] = [dst["od_max_mm"], dst["od_max_mm"]]
         out[side] = dst
     src_g = cfg.get("global") or {}
     out["global"] = {**DEFAULT_DOMAIN["global"], **src_g}
@@ -181,6 +160,8 @@ def canonicalize(cfg: dict) -> dict:
     if not isinstance(g.get("pcb_gap_mm"), list):
         v = float(g.get("pcb_gap_mm", 2.6))
         g["pcb_gap_mm"] = [v, v]
+    # Remove legacy freq_step_hz if present (freq is now index-assigned).
+    g.pop("freq_step_hz", None)
     return out
 
 
@@ -190,238 +171,178 @@ def config_hash(cfg: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Feasibility check
+# Feasibility
 # ---------------------------------------------------------------------------
 
-def _feasible(side_cfg: dict, od, w, s, t, og, ig, layers) -> tuple:
+def _feasible_tx(tx_cfg, od, w, s, t, l1l2_gap, l2_turns) -> tuple:
     sp = pc.SpiralParams(od_mm=od, trace_width_mm=w, spacing_mm=s,
                          turns=t, resolution_mm=1.0)
     ok, msg = pc.validate_spiral(sp)
     if not ok:
         return False, msg
     id_mm = 2.0 * (sp.r_inner_centerline - w / 2.0)
-    if id_mm < side_cfg["id_min_mm"]:
-        return False, f"ID {id_mm:.2f} mm < {side_cfg['id_min_mm']} mm minimum"
+    if id_mm < tx_cfg.get("id_min_mm", 0.0):
+        return False, f"TX ID {id_mm:.2f} mm < {tx_cfg.get('id_min_mm', 0.0)} mm"
     stackup = pc.StackUp(
         slots=[pc.LayerSlot(active=l["active"], copper_oz=l["copper_oz"])
-               for l in layers],
+               for l in _TX_LAYERS],
+        outer_gap_mm=l1l2_gap, inner_gap_mm=0.0,
+    )
+    ok, msg = pc.validate_stackup(stackup, min_active=2, max_active=2)
+    if not ok:
+        return False, f"TX stackup: {msg}"
+    try:
+        _, w2 = pc.compute_layer2_width(sp, l2_turns)
+        if w2 <= 0:
+            return False, f"TX L2 width {w2:.4f} mm <= 0"
+    except Exception as e:
+        return False, str(e)
+    return True, ""
+
+
+def _feasible_rx(rx_cfg, od, w, s, t, og, ig) -> tuple:
+    sp = pc.SpiralParams(od_mm=od, trace_width_mm=w, spacing_mm=s,
+                         turns=t, resolution_mm=1.0)
+    ok, msg = pc.validate_spiral(sp)
+    if not ok:
+        return False, msg
+    id_mm = 2.0 * (sp.r_inner_centerline - w / 2.0)
+    if id_mm < rx_cfg.get("id_min_mm", 0.0):
+        return False, f"RX ID {id_mm:.2f} mm < {rx_cfg.get('id_min_mm', 0.0)} mm"
+    stackup = pc.StackUp(
+        slots=[pc.LayerSlot(active=l["active"], copper_oz=l["copper_oz"])
+               for l in _RX_LAYERS],
         outer_gap_mm=og, inner_gap_mm=ig,
     )
     ok, msg = pc.validate_stackup(stackup)
     return ok, msg
 
-def _build_layers(selected: list, inner_oz: float, outer_oz: float) -> list:
-    oz = [outer_oz, inner_oz, inner_oz, outer_oz]
-    return [{"active": bool(selected[i]), "copper_oz": float(oz[i])}
-            for i in range(4)]
-
 
 # ---------------------------------------------------------------------------
-# LHS Sampling
+# LHS decoding — 13 dimensions (freq is assigned linearly per sample index)
+#   0  tx_turns
+#   1  tx_w
+#   2  tx_od         (sampled from tx["od_mm"] range)
+#   3  tx_s
+#   4  tx_l1l2_gap
+#   5  tx_l2_turns / tx_l2_turns_frac
+#   6  rx_turns
+#   7  rx_w
+#   8  rx_od_offset  (0..1 → [tx_od, min(tx_od+1.4, rx_od_max)])
+#   9  rx_s
+#  10  rx_outer_gap
+#  11  rx_inner_gap
+#  12  rx_topo  (categorical)
 # ---------------------------------------------------------------------------
 
-_LHS_DIMS = 22
+_LHS_DIMS = 13
+_RX_OD_MAX_OFFSET_MM = 1.4  # RX OD always within this of TX OD, and RX OD >= TX OD
 
 
-def _freq_step_val(u: float, lo: float, hi: float, step: float = 5000.0) -> float:
-    lo_q = math.ceil(lo / step) * step
-    hi_q = math.floor(hi / step) * step
-    if hi_q <= lo_q:
-        return float(lo_q)
-    n_steps = int(round((hi_q - lo_q) / step)) + 1
-    idx = min(int(u * n_steps), n_steps - 1)
-    return float(lo_q + idx * step)
-
-
-def _decode(u_row, cfg):
+def _decode(u_row, cfg, sample_index: int = 0, n_total: int = 1):
     tx, rx, glob = cfg["tx"], cfg["rx"], cfg["global"]
-    tx_topos = allowed_topologies(tx["layers_selected"])
-    rx_topos = allowed_topologies(rx["layers_selected"])
-    tx_ports = port_choices(tx)
-    rx_ports = port_choices(rx)
 
-    def _cat(u, options):
-        idx = min(int(u * len(options)), len(options) - 1)
-        return options[idx]
-
-    # Clamp turns to hidden minimum of _MIN_TX_TURNS / _MIN_RX_TURNS
-    tx_turns_raw = _round_int(_scale(u_row[0], *tx["turns"]), *tx["turns"])
-    tx_turns = max(tx_turns_raw, _MIN_TX_TURNS)
-
-    rx_turns_raw = _round_int(_scale(u_row[8], *rx["turns"]), *rx["turns"])
-    rx_turns = max(rx_turns_raw, _MIN_RX_TURNS)
-
+    tx_turns = max(_round_int(_scale(u_row[0], *tx["turns"]), *tx["turns"]),
+                   _MIN_TX_TURNS)
     tx_w     = round(_scale(u_row[1], *tx["trace_width_mm"]), 4)
-    tx_od    = round(_scale(u_row[2], tx["id_min_mm"] + 2.0,
-                                    tx["od_max_mm"]), 4)
-    tx_s     = _stackup_val(u_row[3], *tx["trace_spacing_mm"])
-    tx_og    = _stackup_val(u_row[4], *tx["outer_gap_mm"])
-    tx_ig    = _stackup_val(u_row[5], *tx["inner_gap_mm"])
-    tx_oz_o  = quantize_oz(u_row[6], *tx["outer_cu_oz"])
-    tx_oz_i  = quantize_oz(u_row[7], *tx["inner_cu_oz"])
 
-    rx_w     = round(_scale(u_row[9],  *rx["trace_width_mm"]), 4)
-    # RX OD: allow up to 5 mm larger than TX OD, still bounded by domain od_max
-    rx_od_lo = max(rx["id_min_mm"] + 2.0, tx_od - 4.0)
-    rx_od_hi = min(rx["od_max_mm"], tx_od + 5.0)
+    tx_od_range = tx.get("od_mm", [tx.get("od_max_mm", 54.0)] * 2)
+    tx_od    = round(_scale(u_row[2], tx_od_range[0], tx_od_range[1]), 4)
+
+    tx_s     = _stackup_val(u_row[3], *tx["trace_spacing_mm"])
+    tx_gap   = round(_scale(u_row[4], *tx["l1l2_gap_mm"]), 4)
+
+    _l2_min_from_l1 = -(-tx_turns // 2)  # ceil(tx_turns / 2)
+    if "l2_turns" in tx:
+        l2_lo, l2_hi = tx["l2_turns"]
+        tx_l2_turns = max(_MIN_TX_L2_TURNS, _l2_min_from_l1,
+                          min(tx_turns, _round_int(_scale(u_row[5], l2_lo, l2_hi), l2_lo, l2_hi)))
+    else:
+        frac_lo, frac_hi = tx.get("l2_turns_frac", [0.4, 1.0])
+        l2_frac = _scale(u_row[5], frac_lo, frac_hi)
+        tx_l2_turns = max(_MIN_TX_L2_TURNS, _l2_min_from_l1,
+                          min(tx_turns, int(round(l2_frac * tx_turns))))
+
+    rx_turns = max(_round_int(_scale(u_row[6], *rx["turns"]), *rx["turns"]),
+                   _MIN_RX_TURNS)
+    rx_w     = round(_scale(u_row[7], *rx["trace_width_mm"]), 4)
+
+    # RX OD: always >= TX OD, and within _RX_OD_MAX_OFFSET_MM above TX OD.
+    # u_row[8] spans the full [0,1] range so RX OD varies uniformly in the offset band.
+    rx_od_range = rx.get("od_mm", [rx.get("od_max_mm", 54.0)] * 2)
+    rx_od_hi = min(tx_od + _RX_OD_MAX_OFFSET_MM, rx_od_range[1])
+    rx_od_lo = tx_od  # RX OD >= TX OD
     if rx_od_hi < rx_od_lo:
         rx_od_hi = rx_od_lo
-    rx_od    = round(_scale(u_row[10], rx_od_lo, rx_od_hi), 4)
-    rx_s     = _stackup_val(u_row[11], *rx["trace_spacing_mm"])
-    rx_og    = _stackup_val(u_row[12], *rx["outer_gap_mm"])
-    rx_ig    = _stackup_val(u_row[13], *rx["inner_gap_mm"])
-    rx_oz_o  = quantize_oz(u_row[14], *rx["outer_cu_oz"])
-    rx_oz_i  = quantize_oz(u_row[15], *rx["inner_cu_oz"])
+    rx_od    = round(_scale(u_row[8], rx_od_lo, rx_od_hi), 4)
 
-    freq_hz     = _freq_step_val(u_row[16], *glob["freq_hz"],
-                               step=glob.get("freq_step_hz", 5000.0))
-    pcb_gap_mm  = _stackup_val(u_row[17], *glob["pcb_gap_mm"])
-    tx_topo     = _cat(u_row[18], tx_topos)
-    rx_topo     = _cat(u_row[19], rx_topos)
-    tx_p_in     = _cat(u_row[20], tx_ports)
-    rx_p_in     = _cat(u_row[21], rx_ports)
+    rx_s     = _stackup_val(u_row[9],  *rx["trace_spacing_mm"])
+    rx_og    = _stackup_val(u_row[10], *rx["outer_gap_mm"])
+    rx_ig    = _stackup_val(u_row[11], *rx["inner_gap_mm"])
+
+    n_topos  = len(_RX_TOPOS)
+    rx_topo  = min(int(u_row[12] * n_topos), n_topos - 1)  # 0 or 1
+
+    # Frequency: linearly distributed across sample index, independent of LHS.
+    freq_lo, freq_hi = glob["freq_hz"]
+    if n_total > 1:
+        freq = freq_lo + (freq_hi - freq_lo) * sample_index / (n_total - 1)
+    else:
+        freq = freq_lo
+    freq = round(freq, 1)
+
+    pcb_gap  = _stackup_val(0.5, *glob["pcb_gap_mm"])  # fixed mid-point
+
+    rx_gdisc = float(rx.get("ground_disc_dia_mm", 20.0))
 
     return {
-        "tx_turns": tx_turns, "tx_width": tx_w, "tx_od_mm": tx_od,
-        "tx_spacing_mm": tx_s, "tx_outer_gap_mm": tx_og,
-        "tx_inner_gap_mm": tx_ig, "tx_outer_oz": tx_oz_o,
-        "tx_inner_oz": tx_oz_i, "tx_topology": tx_topo,
-        "tx_port_inside": tx_p_in,
-        "rx_turns": rx_turns, "rx_width": rx_w, "rx_od_mm": rx_od,
-        "rx_spacing_mm": rx_s, "rx_outer_gap_mm": rx_og,
-        "rx_inner_gap_mm": rx_ig, "rx_outer_oz": rx_oz_o,
-        "rx_inner_oz": rx_oz_i, "rx_topology": rx_topo,
-        "rx_port_inside": rx_p_in,
-        "freq_hz": freq_hz,
-        "pcb_gap_mm": pcb_gap_mm,
+        "tx_od": tx_od, "tx_turns": tx_turns, "tx_l2_turns": tx_l2_turns,
+        "tx_w": tx_w, "tx_s": tx_s, "tx_l1l2_gap": tx_gap,
+        "rx_od": rx_od, "rx_turns": rx_turns,
+        "rx_w": rx_w, "rx_s": rx_s,
+        "rx_outer_gap": rx_og, "rx_inner_gap": rx_ig,
+        "rx_topo": rx_topo,
+        "rx_ground_disc_dia": rx_gdisc,
+        "pcb_gap": pcb_gap, "freq": freq,
+        "resolution": glob["resolution_mm"],
     }
 
 
+# ---------------------------------------------------------------------------
+# Sample generation
+# ---------------------------------------------------------------------------
+
 def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
-                     oversample: int = 32, log=print,
-                     ground_circle_enabled: bool = False,
-                     ground_circle_min_mm: float = 18.0,
-                     ground_circle_max_mm: float = 24.0) -> list:
-    """Return up to *n_total* feasible sample dicts (deterministic).
-
-    If ground_circle_enabled=True, each base sample is expanded into copies
-    with different GC diameters. hasGroundCircle=True for those, False (and
-    ground_circle_dia_mm=0) for baseline samples without a ground circle.
-    """
-    if ground_circle_enabled:
-        if ground_circle_max_mm <= ground_circle_min_mm:
-            gc_diameters = [float(ground_circle_min_mm)]
-        else:
-            span = ground_circle_max_mm - ground_circle_min_mm
-            gc_diameters = [
-                round(ground_circle_min_mm + span * t, 1)
-                for t in (0.0, 1/3, 2/3, 1.0)
-            ]
-        # Each base sample produces 1 no-GC copy + len(gc_diameters) GC copies
-        n_variants = 1 + len(gc_diameters)
-        n_base = max(1, round(n_total / n_variants))
-    else:
-        gc_diameters = []
-        n_base = n_total
-
+                     oversample: int = 32, log=print) -> list:
     cfg = canonicalize(cfg)
-    n_candidates = max(n_base * oversample, n_base + 100)
+    n_candidates = max(n_total * oversample, n_total + 100)
     sampler = qmc.LatinHypercube(d=_LHS_DIMS, seed=seed)
     raw = sampler.random(n_candidates)
 
     valid, rejected = [], 0
     for row in raw:
-        if len(valid) >= n_base:
+        if len(valid) >= n_total:
             break
-        c = _decode(row, cfg)
+        c = _decode(row, cfg, sample_index=len(valid), n_total=n_total)
 
-        tx_layers = _build_layers(cfg["tx"]["layers_selected"],
-                                  c["tx_inner_oz"], c["tx_outer_oz"])
-        rx_layers = _build_layers(cfg["rx"]["layers_selected"],
-                                  c["rx_inner_oz"], c["rx_outer_oz"])
-
-        ok_tx, _ = _feasible(cfg["tx"],
-                             c["tx_od_mm"], c["tx_width"],
-                             c["tx_spacing_mm"], c["tx_turns"],
-                             c["tx_outer_gap_mm"], c["tx_inner_gap_mm"],
-                             tx_layers)
-        if not ok_tx:
+        ok, _ = _feasible_tx(cfg["tx"],
+                              c["tx_od"], c["tx_w"], c["tx_s"],
+                              c["tx_turns"], c["tx_l1l2_gap"], c["tx_l2_turns"])
+        if not ok:
             rejected += 1
             continue
 
-        ok_rx, _ = _feasible(cfg["rx"],
-                             c["rx_od_mm"], c["rx_width"],
-                             c["rx_spacing_mm"], c["rx_turns"],
-                             c["rx_outer_gap_mm"], c["rx_inner_gap_mm"],
-                             rx_layers)
-        if not ok_rx:
+        ok, _ = _feasible_rx(cfg["rx"],
+                              c["rx_od"], c["rx_w"], c["rx_s"],
+                              c["rx_turns"], c["rx_outer_gap"], c["rx_inner_gap"])
+        if not ok:
             rejected += 1
             continue
 
-        tx_nwinc = 2 if c["tx_width"] < 0.4 else 3
-        rx_nwinc = 2 if c["rx_width"] < 0.4 else 3
+        c["uuid"] = sample_uuid(c)
+        valid.append(c)
 
-        sample = {
-            # TX
-            "tx_turns":          c["tx_turns"],
-            "tx_trace_width_mm": c["tx_width"],
-            "tx_od_mm":          c["tx_od_mm"],
-            "tx_spacing_mm":     c["tx_spacing_mm"],
-            "tx_outer_gap_mm":   c["tx_outer_gap_mm"],
-            "tx_inner_gap_mm":   c["tx_inner_gap_mm"],
-            "tx_topology":       c["tx_topology"],
-            "tx_port_inside":    c["tx_port_inside"],
-            "tx_layers":         tx_layers,
-            # RX
-            "rx_turns":          c["rx_turns"],
-            "rx_trace_width_mm": c["rx_width"],
-            "rx_od_mm":          c["rx_od_mm"],
-            "rx_spacing_mm":     c["rx_spacing_mm"],
-            "rx_outer_gap_mm":   c["rx_outer_gap_mm"],
-            "rx_inner_gap_mm":   c["rx_inner_gap_mm"],
-            "rx_topology":       c["rx_topology"],
-            "rx_port_inside":    c["rx_port_inside"],
-            "rx_layers":         rx_layers,
-            # Global
-            "pcb_gap_mm":        c["pcb_gap_mm"],
-            "resolution_mm":     cfg["global"]["resolution_mm"],
-            "freq_hz":           c["freq_hz"],
-            "fmin_hz":           c["freq_hz"],
-            "fmax_hz":           c["freq_hz"],
-            "freq_ndec":         0,
-            "nhinc":             cfg["tx"]["nhinc"],
-            "nwinc":             cfg["tx"]["nwinc"],
-            "rx_nhinc":          cfg["rx"]["nhinc"],
-            "tx_nwinc":          tx_nwinc,
-            "rx_nwinc":          rx_nwinc,
-            # Ground circle — baseline: disabled
-            "hasGroundCircle":       False,
-            "ground_circle_dia_mm":  0.0,
-        }
-        sample["uuid"] = sample_uuid(sample)
-        valid.append(sample)
-
-    log(f"LHS: {len(valid)} valid / {rejected} rejected "
-        f"out of {n_candidates} candidates")
-
-    if ground_circle_enabled and gc_diameters:
-        n_base_actual = len(valid)
-        expanded = []
-        for base_sample in valid:
-            # Keep the no-GC variant (hasGroundCircle=False, dia=0)
-            expanded.append(base_sample)
-            # Add one variant per GC diameter
-            for dia in gc_diameters:
-                gc_sample = base_sample.copy()
-                gc_sample["hasGroundCircle"]      = True
-                gc_sample["ground_circle_dia_mm"] = float(dia)
-                gc_sample["uuid"] = sample_uuid(gc_sample)
-                expanded.append(gc_sample)
-        valid = expanded
-        log(f"Ground circles enabled: {n_base_actual} base × "
-            f"(1 no-GC + {len(gc_diameters)} GC variants {gc_diameters}) "
-            f"= {len(valid)} total samples")
-
+    log(f"LHS: {len(valid)} valid / {rejected} rejected out of {n_candidates} candidates")
     return valid
 
 
@@ -429,36 +350,40 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
 # File writers
 # ---------------------------------------------------------------------------
 
-def write_domain_master(cfg: dict, out_path: str,
-                        n_total: int, n_valid: int) -> str:
+def write_domain_master(cfg: dict, out_path: str, n_total: int, n_valid: int) -> str:
     canon = canonicalize(cfg)
-    canon["n_total"] = int(n_total)
-    canon["n_valid"] = int(n_valid)
-    canon["seed"]    = HARDCODED_SEED
-    h = config_hash(canon)
+    canon["n_total"]    = int(n_total)
+    canon["n_valid"]    = int(n_valid)
+    canon["seed"]       = HARDCODED_SEED
+    canon["fixed"] = {
+        "tx_topology":   "series",
+        "tx_port_inside": False,
+        "tx_layers":     _TX_LAYERS,
+        "rx_port_inside": True,
+        "rx_layers":     _RX_LAYERS,
+        "rx_topos":      _RX_TOPOS,
+    }
+    h = config_hash(cfg)
     canon["config_hash"] = h
-    canon["tx"]["allowed_topologies"] = allowed_topologies(canon["tx"]["layers_selected"])
-    canon["rx"]["allowed_topologies"] = allowed_topologies(canon["rx"]["layers_selected"])
-    for _gc_key in ("ground_circle_enabled", "ground_circle_min_mm", "ground_circle_max_mm"):
-        if _gc_key in cfg:
-            canon[_gc_key] = cfg[_gc_key]
     with open(out_path, "w") as f:
         json.dump(canon, f, indent=2, default=str)
     return h
 
 
+# Results file (results.json) is written by run_sweep.py as a list of verbose
+# dicts under the "results" key — see run_sweep.py docstring for the schema.
+
+
 def write_samples_file(samples: list, cfg: dict, out_path: str,
-                       config_hash_: str, batch_num: int = None) -> None:
+                       config_hash_: str) -> None:
     payload = {
         "meta": {
-            "n_samples":    len(samples),
-            "seed":         HARDCODED_SEED,
-            "config_hash":  config_hash_,
-            "domain":       canonicalize(cfg),
+            "n_samples":   len(samples),
+            "seed":        HARDCODED_SEED,
+            "config_hash": config_hash_,
         },
         "samples": samples,
     }
-
     tmp = out_path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2, default=str)
@@ -473,34 +398,21 @@ def _load_config(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
 
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Deterministic LHS sampler")
-    parser.add_argument("--config", required=True,
-                        help="Path to the domain config JSON")
-    parser.add_argument("--out-dir", dest="out_dir", required=True,
-                        help="Model folder to write lhs_samples.json and domain.json into")
-    parser.add_argument("--n", type=int, default=None)
-    parser.add_argument("--ground-circle-enabled", type=int, default=0)
-    parser.add_argument("--ground-circle-min", type=float, default=18.0)
-    parser.add_argument("--ground-circle-max", type=float, default=24.0)
+    parser.add_argument("--config",  required=True)
+    parser.add_argument("--out-dir", dest="out_dir", required=True)
+    parser.add_argument("--n",       type=int, default=None)
     args = parser.parse_args()
 
-    cfg = _load_config(args.config)
+    cfg     = _load_config(args.config)
     n_total = args.n if args.n is not None else cfg.get("n_total", 0)
     if not n_total or n_total <= 0:
         print("ERROR: n_total must be > 0", file=sys.stderr)
         return 2
 
-    cfg["ground_circle_enabled"] = bool(args.ground_circle_enabled)
-    cfg["ground_circle_min_mm"]  = float(args.ground_circle_min)
-    cfg["ground_circle_max_mm"]  = float(args.ground_circle_max)
-
-    samples = generate_samples(
-        cfg, n_total,
-        ground_circle_enabled=bool(args.ground_circle_enabled),
-        ground_circle_min_mm=args.ground_circle_min,
-        ground_circle_max_mm=args.ground_circle_max,
-    )
+    samples = generate_samples(cfg, n_total)
     if not samples:
         print("ERROR: no feasible samples — check the domain config", file=sys.stderr)
         return 3
@@ -510,7 +422,7 @@ def main() -> int:
     h = write_domain_master(cfg, master_path, n_total, len(samples))
 
     out_path = os.path.join(args.out_dir, "lhs_samples.json")
-    write_samples_file(samples, cfg, out_path, h, batch_num=None)
+    write_samples_file(samples, cfg, out_path, h)
 
     print(f"Wrote {len(samples)} samples -> {out_path}")
     print(f"Domain file         -> {master_path}  (hash {h})")

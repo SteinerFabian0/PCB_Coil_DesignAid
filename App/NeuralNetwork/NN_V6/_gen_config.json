@@ -1,0 +1,68 @@
+{
+  "tx": {
+    "od_mm": [
+      50.0,
+      54.0
+    ],
+    "id_min_mm": 39.0,
+    "trace_width_mm": [
+      0.22,
+      1.4
+    ],
+    "trace_spacing_mm": [
+      0.16,
+      0.16
+    ],
+    "turns": [
+      3,
+      10
+    ],
+    "l2_turns": [
+      2,
+      10
+    ],
+    "l1l2_gap_mm": [
+      0.2104,
+      0.2104
+    ]
+  },
+  "rx": {
+    "od_mm": [
+      50.0,
+      54.0
+    ],
+    "id_min_mm": 35.0,
+    "trace_width_mm": [
+      0.2,
+      1.0
+    ],
+    "trace_spacing_mm": [
+      0.16,
+      0.16
+    ],
+    "turns": [
+      8,
+      25
+    ],
+    "outer_gap_mm": [
+      0.2104,
+      0.2104
+    ],
+    "inner_gap_mm": [
+      0.6,
+      0.6
+    ]
+  },
+  "global": {
+    "pcb_gap_mm": [
+      2.4,
+      2.4
+    ],
+    "resolution_mm": 1.2,
+    "freq_hz": [
+      280000.0,
+      350000.0
+    ]
+  },
+  "n_total": 3000
+}

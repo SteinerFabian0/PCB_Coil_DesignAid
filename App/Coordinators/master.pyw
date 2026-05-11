@@ -122,8 +122,35 @@ class CoilApp(tk.Tk):
                               self.sim_tab, self.auto_tab,
                               self.nn_optim_tab, self.nn_analysis_tab]
 
-        nb.select(self.param_tx_tab)
+        # Restore active tab from savestate, fall back to Parametric TX.
+        saved_tab_name = self._state.get("ui", {}).get("active_tab", "")
+        _tab_map = {
+            "dxf_tx":       self.dxf_tx_tab,
+            "dxf_rx":       self.dxf_rx_tab,
+            "param_tx":     self.param_tx_tab,
+            "param_rx":     self.param_rx_tab,
+            "simulation":   self.sim_tab,
+            "sim_nn":       self.sim_nn_tab,
+            "nn_setup":     self.auto_tab,
+            "nn_optim":     self.nn_optim_tab,
+            "nn_analysis":  self.nn_analysis_tab,
+        }
+        _start_tab = _tab_map.get(saved_tab_name, self.param_tx_tab)
+        nb.select(_start_tab)
         self._nb = nb
+
+        # Save active tab whenever the user switches.
+        _tab_names = {id(v): k for k, v in _tab_map.items()}
+        def _on_tab_changed(event):
+            try:
+                widget = nb.nametowidget(nb.select())
+                name = _tab_names.get(id(widget), "")
+                if name:
+                    self._state.setdefault("ui", {})["active_tab"] = name
+                    savestate.save(PROJECT_ROOT, self._state)
+            except Exception:
+                pass
+        nb.bind("<<NotebookTabChanged>>", _on_tab_changed)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -192,6 +219,13 @@ class CoilApp(tk.Tk):
 
     def load_nn_setup_folder(self) -> str:
         return self._state.get("nn_setup", {}).get("folder", "")
+
+    def persist_nn_setup_inputs(self, inputs: dict):
+        self._state.setdefault("nn_setup", {})["inputs"] = inputs
+        savestate.save(PROJECT_ROOT, self._state)
+
+    def load_nn_setup_inputs(self) -> dict:
+        return self._state.get("nn_setup", {}).get("inputs", {})
 
     def set_nn_optim_tab_visible(self, visible: bool):
         """Show or hide (disable) the NN Optimisation tab."""

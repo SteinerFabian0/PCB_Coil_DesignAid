@@ -201,6 +201,7 @@ def active_layer_data(spiral_params, stackup):
 
     Returns [{"slot": 1..4, "z": float, "h_mm": float,
               "nodes": [(x,y,z), ...]}, ...]
+    The "w_mm" key is absent, meaning callers should use a shared global width.
     """
     zs = layer_z_positions(stackup.outer_gap_mm, stackup.inner_gap_mm)
     out = []
@@ -215,6 +216,86 @@ def active_layer_data(spiral_params, stackup):
             "nodes": nodes,
         })
     return out
+
+
+def compute_layer2_width(l1_params, n2_turns):
+    """
+    Compute the trace width for a second spiral layer so that its inner
+    endpoint x-coordinate matches layer 1's inner endpoint.
+
+    The spiral inner endpoint lies at x = R0 - N*pitch  (on the +x axis),
+    where R0 = OD/2 - W/2 is the outer centerline radius.
+
+    Layer 2 shares the same R0 (outer connection point) and spacing S.
+    Setting inner endpoints equal:
+        R0 - N1*pitch1 = R0 - N2*pitch2
+        N1*pitch1 = N2*pitch2
+        pitch2 = N1*pitch1 / N2
+        W2 = pitch2 - S
+
+    Returns (w2_mm, pitch2_mm).  w2_mm may be <= 0 if N2 is too large;
+    callers should validate.
+    """
+    pitch2 = l1_params.turns * l1_params.pitch_mm / n2_turns
+    w2 = pitch2 - l1_params.spacing_mm
+    return w2, pitch2
+
+
+def active_layer_data_tx_independent(l1_params, stackup, n2_turns):
+    """
+    TX-specific variant: layer 1 uses l1_params, layer 2 gets its own
+    SpiralParams computed so its endpoints align with layer 1's endpoints.
+
+    The returned layer dicts include a "w_mm" key for the per-layer trace
+    width, which write_series_inp honours when present.
+
+    Only the first two active slots are processed (TX uses slots 1+2).
+    Returns (layer_data, w2_mm) — w2_mm lets the UI show the computed value.
+    Raises ValueError if n2_turns is invalid or w2_mm <= 0.
+    """
+    n1 = int(round(l1_params.turns))
+    n2 = int(round(n2_turns))
+    if n2 < 1 or n2 > n1:
+        raise ValueError(f"L2 turns must be between 1 and N1={n1}.")
+
+    w2, _pitch2 = compute_layer2_width(l1_params, n2)
+    if w2 <= 0:
+        raise ValueError(
+            f"Layer-2 width would be {w2:.4f} mm (≤ 0) — reduce N2 or turns.")
+
+    l2_params = SpiralParams(
+        od_mm=l1_params.od_mm,
+        trace_width_mm=w2,
+        spacing_mm=l1_params.spacing_mm,
+        turns=n2,
+        resolution_mm=l1_params.resolution_mm,
+    )
+
+    zs = layer_z_positions(stackup.outer_gap_mm, stackup.inner_gap_mm)
+    active_slots = [s for s in enumerate(stackup.slots) if s[1].active]
+    if len(active_slots) < 2:
+        raise ValueError("TX independent layers needs at least 2 active slots.")
+
+    idx0, slot0 = active_slots[0]
+    idx1, slot1 = active_slots[1]
+
+    layer_data = [
+        {
+            "slot": idx0 + 1,
+            "z": zs[idx0],
+            "h_mm": slot0.copper_h_mm,
+            "w_mm": l1_params.trace_width_mm,
+            "nodes": generate_nodes(l1_params, z=zs[idx0]),
+        },
+        {
+            "slot": idx1 + 1,
+            "z": zs[idx1],
+            "h_mm": slot1.copper_h_mm,
+            "w_mm": w2,
+            "nodes": generate_nodes(l2_params, z=zs[idx1]),
+        },
+    ]
+    return layer_data, w2
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +468,6 @@ def write_series_inp(layer_data, out_path, w_mm,
             f.write(f"* slot {ld['slot']}: z={ld['z']:.3f} mm, "
                     f"h={ld['h_mm']:.4f} mm\n")
         f.write(".Units mm\n\n")
-        f.write(f".Default sigma={sigma} w={w_mm} h={layer_data[0]['h_mm']}"
-                f" nhinc={nhinc} nwinc={nwinc}\n\n")
 
         for k, ld in enumerate(layer_data):
             for i, (x, y, z) in enumerate(ld["nodes"]):
@@ -397,10 +476,15 @@ def write_series_inp(layer_data, out_path, w_mm,
 
         edge_counter = 0
         current_h = layer_data[0]["h_mm"]
+        current_w = layer_data[0].get("w_mm", w_mm)
+        f.write(f".Default sigma={sigma} w={current_w} h={current_h}"
+                f" nhinc={nhinc} nwinc={nwinc}\n")
         for k, ld in enumerate(layer_data):
-            if ld["h_mm"] != current_h:
+            layer_w = ld.get("w_mm", w_mm)
+            if ld["h_mm"] != current_h or layer_w != current_w:
                 current_h = ld["h_mm"]
-                f.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+                current_w = layer_w
+                f.write(f".Default sigma={sigma} w={current_w} h={current_h}"
                         f" nhinc={nhinc} nwinc={nwinc}\n")
             base = offsets[k]
             for i in range(len(ld["nodes"]) - 1):
@@ -672,12 +756,15 @@ def _collect_segment_text(layer_data, node_offset, edge_offset, w_mm,
     edge_buf = io.StringIO()
     ec = edge_offset
     current_h = layer_data[0]["h_mm"]
-    edge_buf.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+    current_w = layer_data[0].get("w_mm", w_mm)
+    edge_buf.write(f".Default sigma={sigma} w={current_w} h={current_h}"
                    f" nhinc={nhinc} nwinc={nwinc}\n")
     for k, ld in enumerate(layer_data):
-        if ld["h_mm"] != current_h:
+        layer_w = ld.get("w_mm", w_mm)
+        if ld["h_mm"] != current_h or layer_w != current_w:
             current_h = ld["h_mm"]
-            edge_buf.write(f".Default sigma={sigma} w={w_mm} h={current_h}"
+            current_w = layer_w
+            edge_buf.write(f".Default sigma={sigma} w={current_w} h={current_h}"
                            f" nhinc={nhinc} nwinc={nwinc}\n")
         base = offsets[k]
         for i in range(len(ld["nodes"]) - 1):
@@ -727,6 +814,16 @@ def _collect_segment_text(layer_data, node_offset, edge_offset, w_mm,
             port_s, port_e, cum, ec)
 
 
+_TX_CORE_MM      = 1.065     # FR-4 core thickness, TX board
+_TX_L1_OZ        = 1.0       # outer copper weight (used for L1↔L3 z offset calc)
+_TX_L3_OZ        = 0.5       # inner copper weight on L3 (the ground pour)
+# Distance between TX coil-side reference (slot-1 centerline at z=0) and the
+# centerline of the layer-3 copper (on the back side of the core).
+# = core thickness + half of L1 copper + half of L3 copper
+_TX_L3_Z_OFFSET = -(_TX_CORE_MM + 0.5 * _TX_L1_OZ * OZ_TO_MM
+                                + 0.5 * _TX_L3_OZ * OZ_TO_MM)
+
+
 def write_combined_tx_rx_inp(
     tx_layer_data, rx_layer_data,
     out_path,
@@ -740,7 +837,8 @@ def write_combined_tx_rx_inp(
     tx_nhinc=None, tx_nwinc=None,
     rx_nhinc=None, rx_nwinc=None,
     fmin=1.1e5, fmax=1.4e5, freq_ndec=1,
-    ground_circle_dia_mm=0.0,
+    rx_ground_disc_dia_mm: float = 0.0,
+    tx_ground_enabled:     bool  = False,
 ):
     """
     Emit a single FastHenry .inp containing both TX (port 1) and RX (port 2)
@@ -799,23 +897,36 @@ def write_combined_tx_rx_inp(
         f.write(rx_edges)
         f.write("\n")
 
-        if ground_circle_dia_mm > 0:
-            from ground_plane import GroundPlaneParams, ground_plane_inp_block
+        # TX layer-3 polygon ground (back side of the TX board, opposite the
+        # coil). z is computed from the physical core thickness; not derived
+        # from tx_layer_data because slot 3 is inactive there.
+        if tx_ground_enabled:
+            from ground_plane import (TX_LAYER3_POLYGON_SPEC,
+                                      polygon_inp_block,
+                                      PolygonGroundPlaneParams)
+            from dataclasses import replace as _dc_replace
+            tx_poly = _dc_replace(TX_LAYER3_POLYGON_SPEC,
+                                  z_mm=_TX_L3_Z_OFFSET)
+            f.write("* --- TX layer-3 ground pour ---\n")
+            f.write(polygon_inp_block(tx_poly,
+                                      node_offset=100_000,
+                                      edge_offset=100_000))
+            f.write("\n")
 
-            # TX ground circle at layer 3 (index 2) z-position
-            tx_layer_zs = [ld["z"] for ld in tx_layer_data]
-            if len(tx_layer_zs) > 2:
-                tx_gp_z = tx_layer_zs[2]
-                tx_gp = GroundPlaneParams(dia_mm=ground_circle_dia_mm, z_mm=tx_gp_z)
-                f.write(ground_plane_inp_block(tx_gp, node_offset=100_000, edge_offset=100_000))
-                f.write("\n")
-
-            # RX ground circle at layer 2 (index 1) z-position
-            rx_layer_zs = [ld["z"] for ld in rx_shifted]
-            if len(rx_layer_zs) > 1:
-                rx_gp_z = rx_layer_zs[1]
-                rx_gp = GroundPlaneParams(dia_mm=ground_circle_dia_mm, z_mm=rx_gp_z)
-                f.write(ground_plane_inp_block(rx_gp, node_offset=110_000, edge_offset=110_000))
+        # RX ground discs on BOTH inner layers (slots 2 and 3 → indices 1, 2).
+        if rx_ground_disc_dia_mm > 0 and len(rx_shifted) >= 3:
+            from ground_plane import DiscGroundPlaneParams, disc_inp_block
+            for k, layer_idx in enumerate((1, 2)):
+                ld    = rx_shifted[layer_idx]
+                disc  = DiscGroundPlaneParams(
+                    dia_mm    = rx_ground_disc_dia_mm,
+                    z_mm      = ld["z"],
+                    copper_oz = ld["h_mm"] / OZ_TO_MM,
+                )
+                f.write(f"* --- RX ground disc on inner layer {layer_idx + 1} ---\n")
+                f.write(disc_inp_block(disc,
+                                       node_offset=110_000 + 10_000 * k,
+                                       edge_offset=110_000 + 10_000 * k))
                 f.write("\n")
 
         f.write(f"* Port 1 = TX\n")

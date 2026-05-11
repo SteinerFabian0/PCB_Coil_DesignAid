@@ -53,13 +53,13 @@ PRINT_EVERY = max(1, EPOCHS // 20)
 # inference path passes the same constant value so scaling agrees.
 NUMERIC_INPUT_COLS = [
     # TX geometry
-    "tx_turns", "tx_width", "tx_od_mm",
+    "tx_turns", "tx_l2_turns", "tx_width", "tx_od_mm",
     "tx_spacing_mm", "tx_outer_gap_mm", "tx_inner_gap_mm",
     # RX geometry
     "rx_turns", "rx_width", "rx_od_mm",
     "rx_spacing_mm", "rx_outer_gap_mm", "rx_inner_gap_mm",
     # Global
-    "freq_hz", "pcb_gap_mm", "ground_circle_dia_mm",
+    "freq_hz", "pcb_gap_mm", "rx_ground_disc_dia_mm",
     # Booleans (encoded as 0/1)
     "tx_port_inside", "rx_port_inside",
     # Per-layer copper oz, zero when inactive (4 layers per side)

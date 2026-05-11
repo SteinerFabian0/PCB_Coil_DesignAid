@@ -613,7 +613,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
             # Global
             "freq_hz":             np.full(bs_v, freq_ref_hz,  dtype=np.float32),
             "pcb_gap_mm":          np.full(bs_v, pcb_gap_mm,   dtype=np.float32),
-            "ground_circle_dia_mm": gc_s,
+            "rx_ground_disc_dia_mm": gc_s,
             # Booleans
             "tx_port_inside": tx_port_in_s,
             "rx_port_inside": rx_port_in_s,
@@ -834,7 +834,7 @@ def _build_sim_params(winners, params, timeout_sec):
             fmax_hz           = freq_hz,
             resolution_mm     = float(glb.get("resolution_mm", 1.5)),
             timeout_sec       = timeout_sec,
-            ground_circle_dia_mm = round(float(w.get("gc_dia_mm", 0.0)), 1),
+            rx_ground_disc_dia_mm = round(float(w.get("gc_dia_mm", 20.0)), 1),
         )
         params_list.append(p)
     return params_list
@@ -871,10 +871,9 @@ def _append_to_refined(sim_results, winners, refined_path, log_cb):
             continue
 
         row = dict(sr)  # passthrough: freq_hz, L_*, R_*, Q_*, M, k, geometry,
-                        # layers, port_inside, pcb_gap_mm, ground_circle_dia_mm,
+                        # layers, port_inside, pcb_gap_mm, rx_ground_disc_dia_mm,
                         # pid, elapsed_sec — all already rounded by the sim.
         row["uuid"]             = str(uuid.uuid4())
-        row["hasGroundCircle"]  = bool(round(float(sr.get("ground_circle_dia_mm", 0.0)), 3) > 0.0)
 
         if row["uuid"] not in existing_uuids:
             data["results"].append(row)
