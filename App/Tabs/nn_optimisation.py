@@ -48,7 +48,6 @@ from cap_combinator import E_VALUES_NF
 # ─────────────────────────────────────────────────────────────────────────────
 # UI Defaults  ← tweak these to change the tab's initial values
 # ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_GC_ENABLED     = True
 DEFAULT_P_TARGET_MW    = "40"     # mW
 DEFAULT_V_MIN          = "3.2"    # V
 DEFAULT_V_MAX          = "4.4"    # V
@@ -64,12 +63,6 @@ DEFAULT_TR_EPOCHS    = "300"
 DEFAULT_TR_BATCH     = "1024"   # bigger batches saturate the 4070 Ti and cut DataLoader overhead
 DEFAULT_TR_LR        = "0.0005"
 DEFAULT_TR_VAL_SPLIT = "0.2"
-
-# Fixed-stackup defaults for one optimisation run (user-editable in the tab).
-# 0 oz = layer inactive. Re-run the optimiser for other stackups / pcb gaps.
-DEFAULT_PCB_GAP_MM     = "2.4"
-DEFAULT_TX_LAYER_OZ    = ["1.0", "1.0", "1.0", "0"]
-DEFAULT_RX_LAYER_OZ    = ["1.0", "0.5", "0.5", "1.0"]
 
 # Resolution at which sampled combinations are snapped to physical grid.
 # Spurious sub-resolution variation contaminates the surrogate's training
@@ -362,17 +355,21 @@ def _nn_sweep(params, log_cb, cancel_flag):
             "trainer so the inference path can match the training schema.")
 
     # ── Pull params ───────────────────────────────────────────────────────
-    tx_od_max    = params["tx_od_max"]
-    tx_id_min    = params["tx_id_min"]
-    tx_width_min = params["tx_width_min"]
-    tx_width_max = params["tx_width_max"]
-    tx_turns_min = params["tx_turns_min"]
+    tx_od_max       = params["tx_od_max"]
+    tx_id_min       = params["tx_id_min"]
+    tx_width_min    = params["tx_width_min"]
+    tx_width_max    = params["tx_width_max"]
+    tx_turns_min    = int(params["tx_turns_min"])
+    tx_turns_max    = int(params.get("tx_turns_max", 99))
+    tx_l2_turns_min = int(params.get("tx_l2_turns_min", 1))
+    tx_l2_turns_max = int(params.get("tx_l2_turns_max", tx_turns_max))
 
     rx_od_max    = params["rx_od_max"]
     rx_id_min    = params["rx_id_min"]
     rx_width_min = params["rx_width_min"]
     rx_width_max = params["rx_width_max"]
-    rx_turns_min = params["rx_turns_min"]
+    rx_turns_min = int(params["rx_turns_min"])
+    rx_turns_max = int(params.get("rx_turns_max", 99))
 
     tx_topologies = params["tx_topologies"]
     rx_topologies = params["rx_topologies"]
@@ -451,14 +448,27 @@ def _nn_sweep(params, log_cb, cancel_flag):
     y_mean_g  = torch.as_tensor(y_scaler.mean_,  dtype=torch.float32, device=device)
     y_scale_g = torch.as_tensor(y_scaler.scale_, dtype=torch.float32, device=device)
 
+    # V7 schema: trainer logs `tx_outer_gap_mm` from the TX L1↔L2 gap
+    # (`tx.l1l2_gap_mm` in domain), and TX has no inner-layer gap.
+    def _rng_mid(rng, fallback):
+        if isinstance(rng, (list, tuple)) and len(rng) >= 2:
+            return 0.5 * (float(rng[0]) + float(rng[1]))
+        return float(fallback)
+
+    tx_outer_gap = _rng_mid(tx_dom.get("l1l2_gap_mm",
+                                       tx_dom.get("outer_gap_mm")), 0.2104)
+    tx_inner_gap = _rng_mid(tx_dom.get("inner_gap_mm"), 0.0)
+    rx_outer_gap = _rng_mid(rx_dom.get("outer_gap_mm"), 0.2104)
+    rx_inner_gap = _rng_mid(rx_dom.get("inner_gap_mm"), 0.6)
+
     # ── Feature schema: constants vs per-batch variables ──────────────────
     const_vals = {
         "tx_spacing_mm":         _SPACING_MM,
-        "tx_outer_gap_mm":       float(tx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
-        "tx_inner_gap_mm":       float(tx_dom.get("inner_gap_mm", [1.0, 1.0])[0]),
+        "tx_outer_gap_mm":       tx_outer_gap,
+        "tx_inner_gap_mm":       tx_inner_gap,
         "rx_spacing_mm":         _SPACING_MM,
-        "rx_outer_gap_mm":       float(rx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
-        "rx_inner_gap_mm":       float(rx_dom.get("inner_gap_mm", [0.6, 0.6])[0]),
+        "rx_outer_gap_mm":       rx_outer_gap,
+        "rx_inner_gap_mm":       rx_inner_gap,
         "freq_hz":               float(freq_ref_hz),
         "pcb_gap_mm":            pcb_gap_mm,
         "rx_ground_disc_dia_mm": gc_val,
@@ -472,6 +482,11 @@ def _nn_sweep(params, log_cb, cancel_flag):
         "rx_turns", "rx_width", "rx_od_mm",
         "tx_port_inside", "rx_port_inside",
     }
+    # tx_l2_turns is part of the V7 surrogate schema; older models won't
+    # have it and will fall through the missing-column check (which is
+    # what we want — the trainer must be retrained on the new feature set).
+    if "tx_l2_turns" in feat_cols:
+        var_cols.add("tx_l2_turns")
     for name in TOPOLOGY_VOCAB:
         var_cols.add(f"tx_topo_{name}")
         var_cols.add(f"rx_topo_{name}")
@@ -487,18 +502,19 @@ def _nn_sweep(params, log_cb, cancel_flag):
     col_idx = {c: feat_cols.index(c) for c in feat_cols}
     n_feat  = len(feat_cols)
 
-    idx_tx_turns = col_idx["tx_turns"]
-    idx_tx_width = col_idx["tx_width"]
-    idx_tx_od    = col_idx["tx_od_mm"]
-    idx_rx_turns = col_idx["rx_turns"]
-    idx_rx_width = col_idx["rx_width"]
-    idx_rx_od    = col_idx["rx_od_mm"]
-    idx_tx_port  = col_idx["tx_port_inside"]
-    idx_rx_port  = col_idx["rx_port_inside"]
-    idx_tx_topo  = np.array([col_idx[f"tx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
-    idx_rx_topo  = np.array([col_idx[f"rx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
-    tx_vocab_pos = np.array([TOPOLOGY_VOCAB.index(t) for t in tx_topologies], dtype=np.int64)
-    rx_vocab_pos = np.array([TOPOLOGY_VOCAB.index(t) for t in rx_topologies], dtype=np.int64)
+    idx_tx_turns    = col_idx["tx_turns"]
+    idx_tx_width    = col_idx["tx_width"]
+    idx_tx_od       = col_idx["tx_od_mm"]
+    idx_tx_l2_turns = col_idx.get("tx_l2_turns")     # None if model lacks this feature
+    idx_rx_turns    = col_idx["rx_turns"]
+    idx_rx_width    = col_idx["rx_width"]
+    idx_rx_od       = col_idx["rx_od_mm"]
+    idx_tx_port     = col_idx["tx_port_inside"]
+    idx_rx_port     = col_idx["rx_port_inside"]
+    idx_tx_topo     = np.array([col_idx[f"tx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
+    idx_rx_topo     = np.array([col_idx[f"rx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
+    tx_vocab_pos    = np.array([TOPOLOGY_VOCAB.index(t) for t in tx_topologies], dtype=np.int64)
+    rx_vocab_pos    = np.array([TOPOLOGY_VOCAB.index(t) for t in rx_topologies], dtype=np.int64)
 
     geom_per_batch = max(1, BATCH_SIZE // n_pairs)
     X_buf = np.zeros((geom_per_batch, n_feat), dtype=np.float32)
@@ -521,6 +537,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
     keep_eta = torch.full((K_keep,), inf_neg, dtype=torch.float32, device=device)
     keep = {
         "tx_turns":       _kbuf(),
+        "tx_l2_turns":    _kbuf(),
         "tx_width":       _kbuf(),
         "tx_od_mm":       _kbuf(),
         "rx_turns":       _kbuf(),
@@ -582,6 +599,16 @@ def _nn_sweep(params, log_cb, cancel_flag):
         tx_t_min   = np.minimum(np.full(bs, tx_turns_min, dtype=np.int32), tx_t_max)
         tx_turns_s = rng.integers(tx_t_min, tx_t_max + 1).astype(np.float32)
 
+        # tx_l2_turns ∈ [max(_MIN_L2, ceil(tx_turns/2)), min(tx_turns, l2_max)]
+        # Mirrors the LHS generator's feasibility constraint so the surrogate
+        # sees the same input distribution at inference time.
+        _l2_floor_from_l1 = ((tx_turns_s.astype(np.int32) + 1) // 2)
+        l2_lo_arr = np.maximum(tx_l2_turns_min, _l2_floor_from_l1).astype(np.int32)
+        l2_hi_arr = np.minimum(tx_turns_s.astype(np.int32),
+                               np.full(bs, tx_l2_turns_max, dtype=np.int32))
+        l2_hi_arr = np.maximum(l2_hi_arr, l2_lo_arr)
+        tx_l2_turns_s = rng.integers(l2_lo_arr, l2_hi_arr + 1).astype(np.float32)
+
         rx_od_lo_s = np.full(bs, rx_id_min + 2.0, dtype=np.float32)
         u_rx       = rng.random(size=bs).astype(np.float32)
         rx_od_s    = _snap(rx_od_lo_s + u_rx * np.maximum(rx_od_max - rx_od_lo_s, 0.0),
@@ -610,6 +637,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
         tx_turns_s = tx_turns_s[id_ok]; tx_od_s    = tx_od_s[id_ok]
         tx_width_s = tx_width_s[id_ok]; rx_od_s    = rx_od_s[id_ok]
         rx_turns_s = rx_turns_s[id_ok]; rx_width_s = rx_width_s[id_ok]
+        tx_l2_turns_s = tx_l2_turns_s[id_ok]
         tx_topo_idx_s = tx_topo_idx_s[id_ok]; rx_topo_idx_s = rx_topo_idx_s[id_ok]
         tx_port_idx_s = tx_port_idx_s[id_ok]; rx_port_idx_s = rx_port_idx_s[id_ok]
         tx_id_s    = tx_id_s[id_ok];    rx_id_s    = rx_id_s[id_ok]
@@ -640,6 +668,8 @@ def _nn_sweep(params, log_cb, cancel_flag):
         X[:, idx_rx_od]    = rx_od_s
         X[:, idx_tx_port]  = tx_port_in_s
         X[:, idx_rx_port]  = rx_port_in_s
+        if idx_tx_l2_turns is not None:
+            X[:, idx_tx_l2_turns] = tx_l2_turns_s
         # Topology one-hot via vectorised fancy indexing (no per-vocab loop)
         X[:, idx_tx_topo]  = 0.0
         X[:, idx_rx_topo]  = 0.0
@@ -692,10 +722,11 @@ def _nn_sweep(params, log_cb, cancel_flag):
         cap_idx  = new_sel %  n_pairs
 
         # Upload per-geometry arrays once (lazy — only when there are winners)
-        tx_turns_t = torch.from_numpy(tx_turns_s).to(device, non_blocking=True)
-        tx_width_t = torch.from_numpy(tx_width_s).to(device, non_blocking=True)
-        tx_od_t    = torch.from_numpy(tx_od_s).to(device, non_blocking=True)
-        rx_turns_t = torch.from_numpy(rx_turns_s).to(device, non_blocking=True)
+        tx_turns_t    = torch.from_numpy(tx_turns_s).to(device, non_blocking=True)
+        tx_l2_turns_t = torch.from_numpy(tx_l2_turns_s).to(device, non_blocking=True)
+        tx_width_t    = torch.from_numpy(tx_width_s).to(device, non_blocking=True)
+        tx_od_t       = torch.from_numpy(tx_od_s).to(device, non_blocking=True)
+        rx_turns_t    = torch.from_numpy(rx_turns_s).to(device, non_blocking=True)
         rx_width_t = torch.from_numpy(rx_width_s).to(device, non_blocking=True)
         rx_od_t    = torch.from_numpy(rx_od_s).to(device, non_blocking=True)
         tx_topo_t  = torch.from_numpy(tx_topo_idx_s.astype(np.int32)).to(device, non_blocking=True)
@@ -717,6 +748,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
         keep_eta = top_vals
         keep = {
             "tx_turns":       _merge(keep["tx_turns"],       tx_turns_t[geom_idx]),
+            "tx_l2_turns":    _merge(keep["tx_l2_turns"],    tx_l2_turns_t[geom_idx]),
             "tx_width":       _merge(keep["tx_width"],       tx_width_t[geom_idx]),
             "tx_od_mm":       _merge(keep["tx_od_mm"],       tx_od_t[geom_idx]),
             "rx_turns":       _merge(keep["rx_turns"],       rx_turns_t[geom_idx]),
@@ -755,6 +787,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
 
     concat = {
         "tx_turns":       _to_np(keep["tx_turns"]),
+        "tx_l2_turns":    _to_np(keep["tx_l2_turns"]),
         "tx_width":       _to_np(keep["tx_width"]),
         "tx_od_mm":       _to_np(keep["tx_od_mm"]),
         "rx_turns":       _to_np(keep["rx_turns"]),
@@ -835,6 +868,7 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
         seen.add(key)
         winners.append({
             "tx_turns":       tx_t,
+            "tx_l2_turns":    int(result["tx_l2_turns"][i]) if "tx_l2_turns" in result else 0,
             "tx_width":       float(result["tx_width"][i]),
             "tx_od_mm":       float(result["tx_od_mm"][i]),
             "tx_topology":    tx_topo,
@@ -867,64 +901,73 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
 
 def _build_sim_params(winners, params, timeout_sec):
     """
-    Build FastHenry SimParams from winning combos.
+    Build FastHenry `SimParams` from winning combos (V7 schema).
 
-    pcb_gap_mm and per-layer copper stackup come from the run's fixed config
-    (the user picks them once per optimisation run); gaps come from domain
-    (constant per training set); other geometry / topology / port_inside
-    fields come from the winning combination so each FastHenry sim is run
-    on the exact configuration the surrogate scored.
+    V7 hard-fixes a number of fields inside `parallel_sim`:
+      • tx_topology="series", tx_port_inside=False
+      • rx_port_inside=True; rx_topology is an int index (0=series, 1=ppser)
+      • tx/rx layer stackup is baked into `parallel_sim._TX_LAYERS` / `_RX_LAYERS`
+      • TX uses `tx_l1l2_gap_mm` (no inner gap)
+    The kwargs we pass must match the V7 `SimParams` dataclass exactly.
     """
     from parallel_sim import SimParams
 
     domain     = params["domain"]
     glb        = domain.get("global", {})
     freq_range = glb.get("freq_hz", [340000.0, 380000.0])
-    freq_hz    = 0.5 * (freq_range[0] + freq_range[1])
+    freq_hz    = 0.5 * (float(freq_range[0]) + float(freq_range[1]))
     freq_hz    = round(_snap(freq_hz, _GRID_FREQ_HZ_STEP), 1)
 
-    tx_d = domain.get("tx", {})
-    rx_d = domain.get("rx", {})
+    tx_d   = domain.get("tx", {})
+    rx_d   = domain.get("rx", {})
+    fixed  = domain.get("fixed", {})
 
-    pcb_gap_mm = float(params["pcb_gap_mm"])
-    tx_layers  = list(params["tx_layers"])
-    rx_layers  = list(params["rx_layers"])
+    def _rng_mid(rng, fallback):
+        if isinstance(rng, (list, tuple)) and len(rng) >= 2:
+            return 0.5 * (float(rng[0]) + float(rng[1]))
+        return float(fallback)
+
+    tx_l1l2_gap = _rng_mid(tx_d.get("l1l2_gap_mm",
+                                    tx_d.get("outer_gap_mm")), 0.2104)
+    rx_outer    = _rng_mid(rx_d.get("outer_gap_mm"), 0.2104)
+    rx_inner    = _rng_mid(rx_d.get("inner_gap_mm"), 0.6)
+
+    pcb_gap_mm  = float(params["pcb_gap_mm"])
+    rx_topos    = fixed.get("rx_topos") or ["series", "parallel_pairs_ser"]
 
     params_list = []
     for w in winners:
+        try:
+            rx_topo_idx = rx_topos.index(w["rx_topology"])
+        except (ValueError, KeyError):
+            rx_topo_idx = 0
+
         p = SimParams(
-            tx_turns          = int(w["tx_turns"]),
-            tx_trace_width_mm = round(float(w["tx_width"]), 4),
-            tx_od_mm          = round(float(w["tx_od_mm"]), 4),
-            tx_spacing_mm     = _SPACING_MM,
-            tx_outer_gap_mm   = float(tx_d.get("outer_gap_mm", [0.2, 0.2])[0]),
-            tx_inner_gap_mm   = float(tx_d.get("inner_gap_mm", [1.0, 1.0])[0]),
-            tx_topology       = w["tx_topology"],
-            tx_layers         = tx_layers,
-            tx_port_inside    = bool(w["tx_port_inside"]),
+            tx_turns        = int(w["tx_turns"]),
+            tx_od_mm        = round(float(w["tx_od_mm"]), 4),
+            tx_w_mm         = round(float(w["tx_width"]), 4),
+            tx_spacing_mm   = _SPACING_MM,
+            tx_l1l2_gap_mm  = tx_l1l2_gap,
+            tx_l2_turns     = int(w.get("tx_l2_turns", 0)),
+            tx_nwinc        = int(tx_d.get("nwinc", 3)),
 
-            rx_turns          = int(w["rx_turns"]),
-            rx_trace_width_mm = round(float(w["rx_width"]), 4),
-            rx_od_mm          = round(float(w["rx_od_mm"]), 4),
-            rx_spacing_mm     = _SPACING_MM,
-            rx_outer_gap_mm   = float(rx_d.get("outer_gap_mm", [0.2, 0.2])[0]),
-            rx_inner_gap_mm   = float(rx_d.get("inner_gap_mm", [0.6, 0.6])[0]),
-            rx_topology       = w["rx_topology"],
-            rx_layers         = rx_layers,
-            rx_port_inside    = bool(w["rx_port_inside"]),
+            rx_turns        = int(w["rx_turns"]),
+            rx_od_mm        = round(float(w["rx_od_mm"]), 4),
+            rx_w_mm         = round(float(w["rx_width"]), 4),
+            rx_spacing_mm   = _SPACING_MM,
+            rx_outer_gap_mm = rx_outer,
+            rx_inner_gap_mm = rx_inner,
+            rx_topo         = rx_topo_idx,
+            rx_nwinc        = int(rx_d.get("nwinc", 3)),
 
-            tx_nhinc          = int(tx_d.get("nhinc", 1)),
-            tx_nwinc          = int(tx_d.get("nwinc", 3)),
-            rx_nhinc          = int(rx_d.get("nhinc", 1)),
-            rx_nwinc          = int(rx_d.get("nwinc", 3)),
+            pcb_gap_mm      = pcb_gap_mm,
+            freq_hz         = freq_hz,
+            resolution_mm   = float(glb.get("resolution_mm", 1.2)),
+            timeout_sec     = float(timeout_sec),
 
-            pcb_gap_mm        = pcb_gap_mm,
-            freq_hz           = freq_hz,
-            fmin_hz           = freq_hz,
-            fmax_hz           = freq_hz,
-            resolution_mm     = float(glb.get("resolution_mm", 1.5)),
-            timeout_sec       = timeout_sec,
             rx_ground_disc_dia_mm = round(float(w.get("gc_dia_mm", 20.0)), 1),
+            tx_ground_enabled     = True,
+            tag                   = "opt",
         )
         params_list.append(p)
     return params_list
@@ -1214,49 +1257,12 @@ class NNOptimisationTab(ttk.Frame):
         self._rx_od_max = self._row(rx_f, "OD max (mm):", "")
         self._rx_id_min = self._row(rx_f, "ID min (mm):", "")
 
-        # ── Ground circle ────────────────────────────────────────────────────
-        gc_f = ttk.LabelFrame(col_l, text="Ground Circle")
-        gc_f.pack(fill="x", pady=(0, 6))
-        self._gc_enabled = tk.BooleanVar(value=DEFAULT_GC_ENABLED)
-        ttk.Checkbutton(gc_f, text="Enable Ground Circle (fixed diameter)",
-                        variable=self._gc_enabled,
-                        command=self._on_gc_toggle).pack(anchor="w", padx=6, pady=(4, 2))
-        gc_row = ttk.Frame(gc_f)
-        gc_row.pack(fill="x", padx=6, pady=(0, 4))
-        ttk.Label(gc_row, text="GC diameter (mm):", width=22, anchor="w").pack(side="left")
-        self._gc_dia = tk.StringVar(value="")
-        self._gc_dia_entry = ttk.Entry(gc_row, textvariable=self._gc_dia, width=8)
-        self._gc_dia_entry.pack(side="left")
-        self._on_gc_toggle()
-
-        # ── Fixed stackup & PCB gap for this run ─────────────────────────────
-        st_f = ttk.LabelFrame(col_l, text="PCB Gap & Layer Stackup (fixed for run)")
-        st_f.pack(fill="x", pady=(0, 6))
-
-        gap_row = ttk.Frame(st_f); gap_row.pack(fill="x", padx=6, pady=(4, 2))
-        ttk.Label(gap_row, text="PCB gap (mm):", width=22, anchor="w").pack(side="left")
-        self._pcb_gap_mm = tk.StringVar(value=DEFAULT_PCB_GAP_MM)
-        ttk.Entry(gap_row, textvariable=self._pcb_gap_mm, width=8).pack(side="left")
-
-        ttk.Label(st_f, text="Copper oz per layer (0 = layer inactive):",
-                  foreground="gray", font=("TkDefaultFont", 8)
-                  ).pack(anchor="w", padx=6, pady=(4, 2))
-
-        self._tx_oz_vars = []
-        tx_row = ttk.Frame(st_f); tx_row.pack(fill="x", padx=6, pady=2)
-        ttk.Label(tx_row, text="TX  L1 / L2 / L3 / L4:", width=22, anchor="w").pack(side="left")
-        for i in range(4):
-            v = tk.StringVar(value=DEFAULT_TX_LAYER_OZ[i])
-            self._tx_oz_vars.append(v)
-            ttk.Entry(tx_row, textvariable=v, width=5).pack(side="left", padx=1)
-
-        self._rx_oz_vars = []
-        rx_row = ttk.Frame(st_f); rx_row.pack(fill="x", padx=6, pady=2)
-        ttk.Label(rx_row, text="RX  L1 / L2 / L3 / L4:", width=22, anchor="w").pack(side="left")
-        for i in range(4):
-            v = tk.StringVar(value=DEFAULT_RX_LAYER_OZ[i])
-            self._rx_oz_vars.append(v)
-            ttk.Entry(rx_row, textvariable=v, width=5).pack(side="left", padx=1)
+        # Ground disc, PCB gap and per-layer stackup were tunable in earlier
+        # versions, but the V7 LHS generator and FastHenry pipeline hard-code
+        # all three (rx.ground_disc_dia_mm fixed, _TX_LAYERS/_RX_LAYERS baked
+        # into parallel_sim, pcb_gap range degenerate).  The surrogate has no
+        # training data outside those values, so the optimiser reads them
+        # straight from domain.json now — see `load_domain_from_model`.
 
         # ── NN model folder (from NN Setup tab) ───────────────────────────────
         nn_f = ttk.LabelFrame(col_l, text="NN Model")
@@ -1413,63 +1419,104 @@ class NNOptimisationTab(ttk.Frame):
     # ─────────────────────────────────────────────────────────────────────────
 
     def load_domain_from_model(self, model_dir: str):
+        """
+        Read a V7-style `domain.json`:
+          • tx/rx OD given as a range `od_mm: [lo, hi]` (no `od_max_mm`).
+          • Topologies are fixed: `fixed.tx_topology` (single string) and
+            `fixed.rx_topos` (list — what the trainer one-hots over).
+          • Stackup is fixed per side under `fixed.tx_layers`/`fixed.rx_layers`.
+          • Ground disc: `rx.ground_disc_dia_mm` (0 disables; no min/max range).
+          • New `tx.l2_turns` range — separate sampling dimension.
+        """
         domain = _load_domain(model_dir)
         self._domain = domain
         self._model_label_var.set(self._short_path(model_dir))
+
+        # Reset fixed-run snapshot — _parse_params reads it instead of UI vars.
+        self._fixed_gc_dia_mm    = 0.0
+        self._fixed_pcb_gap_mm   = 0.0
+        self._fixed_tx_oz_layers = [0.0, 0.0, 0.0, 0.0]
+        self._fixed_rx_oz_layers = [0.0, 0.0, 0.0, 0.0]
 
         if domain is None:
             self._domain_info_var.set(
                 "ERROR: domain.json missing or corrupt — model is unusable.")
             self._domain_info_lbl.configure(foreground="red")
             for v in (self._tx_od_max, self._tx_id_min,
-                      self._rx_od_max, self._rx_id_min, self._gc_dia):
+                      self._rx_od_max, self._rx_id_min):
                 v.set("")
             return
 
         self._domain_info_lbl.configure(foreground="#1a6fcc")
 
-        tx  = domain.get("tx", {})
-        rx  = domain.get("rx", {})
-        glb = domain.get("global", {})
+        tx    = domain.get("tx", {})
+        rx    = domain.get("rx", {})
+        glb   = domain.get("global", {})
+        fixed = domain.get("fixed", {})
 
-        self._tx_od_max.set(f"{tx.get('od_max_mm'):.1f}")
-        self._tx_id_min.set(f"{tx.get('id_min_mm'):.1f}")
-        self._rx_od_max.set(f"{rx.get('od_max_mm'):.1f}")
-        self._rx_id_min.set(f"{rx.get('id_min_mm'):.1f}")
+        def _hi(rng, fallback):
+            if isinstance(rng, (list, tuple)) and len(rng) >= 2:
+                return float(rng[1])
+            return float(fallback)
 
-        gc_en  = domain.get("ground_circle_enabled", False)
-        gc_min = domain.get("ground_circle_min_mm", 18.0)
-        gc_max = domain.get("ground_circle_max_mm", 24.0)
-        gc_def = 20.0 if gc_min <= 20.0 <= gc_max else gc_min
-        self._gc_dia.set(f"{gc_def:.1f}")
-        self._gc_enabled.set(gc_en)
-        self._on_gc_toggle()
+        tx_od_hi = _hi(tx.get("od_mm"), tx.get("od_max_mm", 54.0))
+        rx_od_hi = _hi(rx.get("od_mm"), rx.get("od_max_mm", 54.0))
+        tx_id_lo = float(tx.get("id_min_mm", 0.0))
+        rx_id_lo = float(rx.get("id_min_mm", 0.0))
 
-        freq      = glb.get("freq_hz", [0, 0])
-        tx_topos  = tx.get("allowed_topologies", [])
-        rx_topos  = rx.get("allowed_topologies", [])
-        tx_turns  = tx.get("turns", ["-", "-"])
-        rx_turns  = rx.get("turns", ["-", "-"])
+        self._tx_od_max.set(f"{tx_od_hi:.1f}")
+        self._tx_id_min.set(f"{tx_id_lo:.1f}")
+        self._rx_od_max.set(f"{rx_od_hi:.1f}")
+        self._rx_id_min.set(f"{rx_id_lo:.1f}")
+
+        # Stash all V7-fixed values; _parse_params will consume them directly.
+        self._fixed_gc_dia_mm = float(rx.get("ground_disc_dia_mm", 0.0))
+
+        pcb_rng = glb.get("pcb_gap_mm")
+        if isinstance(pcb_rng, (list, tuple)) and len(pcb_rng) >= 2:
+            self._fixed_pcb_gap_mm = 0.5 * (float(pcb_rng[0]) + float(pcb_rng[1]))
+        elif pcb_rng is not None:
+            self._fixed_pcb_gap_mm = float(pcb_rng)
+
+        def _slot_oz(slots):
+            out = [0.0, 0.0, 0.0, 0.0]
+            for i, slot in enumerate(slots[:4]):
+                try:
+                    out[i] = (float(slot.get("copper_oz", 1.0))
+                              if slot.get("active") else 0.0)
+                except (TypeError, AttributeError):
+                    pass
+            return out
+        self._fixed_tx_oz_layers = _slot_oz(fixed.get("tx_layers", []))
+        self._fixed_rx_oz_layers = _slot_oz(fixed.get("rx_layers", []))
+
+        freq     = glb.get("freq_hz", [0, 0])
+        tx_topo  = fixed.get("tx_topology", "series")
+        rx_topos = fixed.get("rx_topos", []) or rx.get("allowed_topologies", [])
+        tx_turns = tx.get("turns", ["-", "-"])
+        rx_turns = rx.get("turns", ["-", "-"])
+        l2_turns = tx.get("l2_turns", ["-", "-"])
+
+        gc_str   = (f"{self._fixed_gc_dia_mm:.1f} mm"
+                    if self._fixed_gc_dia_mm > 0 else "off")
+        tx_oz_s  = " / ".join(f"{o:g}" for o in self._fixed_tx_oz_layers)
+        rx_oz_s  = " / ".join(f"{o:g}" for o in self._fixed_rx_oz_layers)
+
         info = (
-            f"TX: OD ≤ {tx.get('od_max_mm')} mm | ID ≥ {tx.get('id_min_mm')} mm | "
-            f"turns {tx_turns[0]}–{tx_turns[1]} | topos: {', '.join(tx_topos)}\n"
-            f"RX: OD ≤ {rx.get('od_max_mm')} mm | ID ≥ {rx.get('id_min_mm')} mm | "
+            f"TX: OD {tx.get('od_mm', '?')} mm | ID ≥ {tx_id_lo:.1f} mm | "
+            f"turns {tx_turns[0]}–{tx_turns[1]} | L2 {l2_turns[0]}–{l2_turns[1]} | "
+            f"topo: {tx_topo} (fixed)\n"
+            f"RX: OD {rx.get('od_mm', '?')} mm | ID ≥ {rx_id_lo:.1f} mm | "
             f"turns {rx_turns[0]}–{rx_turns[1]} | topos: {', '.join(rx_topos)}\n"
-            f"Freq: {freq[0]/1e3:.0f}–{freq[1]/1e3:.0f} kHz"
-            + (f"  |  GC: {gc_min}–{gc_max} mm" if gc_en else "")
+            f"Freq: {freq[0]/1e3:.0f}–{freq[1]/1e3:.0f} kHz  |  "
+            f"PCB gap {self._fixed_pcb_gap_mm:.2f} mm  |  GC: {gc_str}\n"
+            f"Stackup oz  TX: {tx_oz_s}   RX: {rx_oz_s}   (all fixed by trainer)"
         )
         self._domain_info_var.set(info)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Event handlers
     # ─────────────────────────────────────────────────────────────────────────
-
-    def _on_gc_toggle(self):
-        state = "normal" if self._gc_enabled.get() else "disabled"
-        try:
-            self._gc_dia_entry.configure(state=state)
-        except Exception:
-            pass
 
     def _get_model_dir(self) -> str:
         if self.app is not None and hasattr(self.app, "auto_tab"):
@@ -1560,20 +1607,32 @@ class NNOptimisationTab(ttk.Frame):
             raise ValueError(
                 "No domain loaded.\n\nSelect a valid model folder in the NN Setup tab.")
 
-        tx  = self._domain.get("tx", {})
-        rx  = self._domain.get("rx", {})
-        glb = self._domain.get("global", {})
+        tx    = self._domain.get("tx", {})
+        rx    = self._domain.get("rx", {})
+        glb   = self._domain.get("global", {})
+        fixed = self._domain.get("fixed", {})
 
-        dom_tx_od_max = tx.get("od_max_mm", 999.0)
-        dom_tx_id_min = tx.get("id_min_mm", 0.0)
-        dom_rx_od_max = rx.get("od_max_mm", 999.0)
-        dom_rx_id_min = rx.get("id_min_mm", 0.0)
+        def _hi(rng, fallback):
+            if isinstance(rng, (list, tuple)) and len(rng) >= 2:
+                return float(rng[1])
+            return float(fallback)
+
+        dom_tx_od_max = _hi(tx.get("od_mm"), tx.get("od_max_mm", 999.0))
+        dom_tx_id_min = float(tx.get("id_min_mm", 0.0))
+        dom_rx_od_max = _hi(rx.get("od_mm"), rx.get("od_max_mm", 999.0))
+        dom_rx_id_min = float(rx.get("id_min_mm", 0.0))
         dom_tx_w      = tx.get("trace_width_mm", [0.2, 1.2])
         dom_rx_w      = rx.get("trace_width_mm", [0.2, 1.2])
         dom_tx_turns  = tx.get("turns", [3, 99])
         dom_rx_turns  = rx.get("turns", [3, 99])
+        dom_tx_l2     = tx.get("l2_turns", [1, int(dom_tx_turns[1])])
         dom_freq      = glb.get("freq_hz", [340000.0, 380000.0])
-        rx_topos      = rx.get("allowed_topologies") or ["parallel", "series", "parallel_pairs_ser"]
+        # V7: TX topology is fixed (single); RX has a closed vocab.
+        tx_topo_fixed = fixed.get("tx_topology", "series")
+        tx_topos      = [tx_topo_fixed]
+        rx_topos      = (fixed.get("rx_topos")
+                         or rx.get("allowed_topologies")
+                         or ["parallel", "series", "parallel_pairs_ser"])
 
         tx_od_max = min(flt(self._tx_od_max, "TX OD max", lo=10.0), dom_tx_od_max)
         tx_id_min = max(flt(self._tx_id_min, "TX ID min", lo=0.0), dom_tx_id_min)
@@ -1585,8 +1644,10 @@ class NNOptimisationTab(ttk.Frame):
         if rx_id_min >= rx_od_max:
             raise ValueError("RX ID min must be < RX OD max.")
 
-        gc_enabled = self._gc_enabled.get()
-        gc_dia_mm  = flt(self._gc_dia, "GC diameter", lo=0.0) if gc_enabled else 0.0
+        # Ground disc, PCB gap, stackup: snapshot taken in load_domain_from_model
+        # straight from domain.json (V7 hard-fixes all three).
+        gc_dia_mm  = float(getattr(self, "_fixed_gc_dia_mm", 0.0))
+        gc_enabled = gc_dia_mm > 0.0
 
         p_target_w = flt(self._p_target_mw, "Target RX power", lo=0.001) / 1000.0
         v_min      = flt(self._v_min, "V_min", lo=0.1)
@@ -1614,32 +1675,18 @@ class NNOptimisationTab(ttk.Frame):
         dither_amp_hz  = flt(self._dither_amp_khz, "Dither amplitude", lo=0.0) * 1e3
         zvs_margin     = flt(self._zvs_margin_pct, "ZVS margin",       lo=0.0, hi=50.0) / 100.0
 
-        # PCB gap + per-layer copper-oz stackup (fixed for this run; the
-        # surrogate still receives them as inputs so it stays consistent
-        # with the training data).
-        pcb_gap_mm = flt(self._pcb_gap_mm, "PCB gap", lo=0.1, hi=10.0)
-        # Snap to 0.5 oz; 0 oz means inactive layer.
-        def _parse_oz(var, name):
-            try:
-                v = float(var.get().strip())
-            except ValueError:
-                raise ValueError(f"'{name}' must be a number (0, 0.5, 1.0, ...).")
-            if v < 0:
-                raise ValueError(f"'{name}' cannot be negative.")
-            v_snap = round(v / _GRID_OZ_STEP) * _GRID_OZ_STEP
-            return round(v_snap, 4)
-
-        tx_oz_per_layer = [_parse_oz(self._tx_oz_vars[i], f"TX L{i+1}") for i in range(4)]
-        rx_oz_per_layer = [_parse_oz(self._rx_oz_vars[i], f"RX L{i+1}") for i in range(4)]
+        # PCB gap + stackup come from the domain snapshot (V7-fixed).
+        pcb_gap_mm = float(getattr(self, "_fixed_pcb_gap_mm", 2.4))
+        tx_oz_per_layer = list(getattr(self, "_fixed_tx_oz_layers",
+                                       [0.0, 0.0, 0.0, 0.0]))
+        rx_oz_per_layer = list(getattr(self, "_fixed_rx_oz_layers",
+                                       [0.0, 0.0, 0.0, 0.0]))
         if not any(o > 0 for o in tx_oz_per_layer):
-            raise ValueError("At least one TX layer must be active (oz > 0).")
+            raise ValueError(
+                "TX stackup has no active layers in the loaded domain.json.")
         if not any(o > 0 for o in rx_oz_per_layer):
-            raise ValueError("At least one RX layer must be active (oz > 0).")
-
-        tx_layers = [{"active": (o > 0), "copper_oz": (o if o > 0 else 1.0)}
-                     for o in tx_oz_per_layer]
-        rx_layers = [{"active": (o > 0), "copper_oz": (o if o > 0 else 1.0)}
-                     for o in rx_oz_per_layer]
+            raise ValueError(
+                "RX stackup has no active layers in the loaded domain.json.")
 
         n_combos  = int(flt(self._n_combos, "Combinations (M)", lo=0.001) * 1_000_000)
         max_iters = int(flt(self._max_iters, "Max iterations", lo=1))
@@ -1659,17 +1706,19 @@ class NNOptimisationTab(ttk.Frame):
                 "Select a folder in the NN Setup tab.")
         self._model_label_var.set(self._short_path(model_dir))
 
-        tx_topos_dom = tx.get("allowed_topologies") or ["parallel", "series", "parallel_pairs_ser"]
-
         return dict(
             model_dir=model_dir,
             tx_od_max=tx_od_max, tx_id_min=tx_id_min,
             tx_width_min=dom_tx_w[0], tx_width_max=dom_tx_w[1],
-            tx_turns_min=dom_tx_turns[0],
+            tx_turns_min=int(dom_tx_turns[0]),
+            tx_turns_max=int(dom_tx_turns[1]),
+            tx_l2_turns_min=int(dom_tx_l2[0]),
+            tx_l2_turns_max=int(dom_tx_l2[1]),
             rx_od_max=rx_od_max, rx_id_min=rx_id_min,
             rx_width_min=dom_rx_w[0], rx_width_max=dom_rx_w[1],
-            rx_turns_min=dom_rx_turns[0],
-            tx_topologies=tx_topos_dom,
+            rx_turns_min=int(dom_rx_turns[0]),
+            rx_turns_max=int(dom_rx_turns[1]),
+            tx_topologies=tx_topos,
             rx_topologies=rx_topos,
             freq_min_hz=dom_freq[0], freq_max_hz=dom_freq[1],
             gc_enabled=gc_enabled, gc_dia_mm=gc_dia_mm,
@@ -1681,10 +1730,8 @@ class NNOptimisationTab(ttk.Frame):
             zvs_margin=zvs_margin,
             n_combos=n_combos, max_iters=max_iters, top_k=top_k,
             fh_workers=fh_workers, fh_timeout=fh_timeout,
-            # Fixed-stackup constants for this run
+            # Fixed-stackup constants snapshotted from domain.json.
             pcb_gap_mm=pcb_gap_mm,
-            tx_layers=tx_layers,
-            rx_layers=rx_layers,
             tx_oz_per_layer=tx_oz_per_layer,
             rx_oz_per_layer=rx_oz_per_layer,
             train_params=dict(epochs=epochs, batch=batch,
