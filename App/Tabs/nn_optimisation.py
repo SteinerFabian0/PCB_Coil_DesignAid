@@ -48,26 +48,31 @@ from cap_combinator import E_VALUES_NF
 # UI Defaults  ← tweak these to change the tab's initial values
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_GC_ENABLED     = True
-DEFAULT_P_TARGET_MW    = "40"     # mW
-DEFAULT_V_MIN          = "3.2"    # V
-DEFAULT_V_MAX          = "4.4"    # V
-DEFAULT_D_MIN_PCT      = ""       # blank = no floor
-DEFAULT_DITHER_AMP_KHZ = "8.0"    # frequency dither amplitude (kHz)
-DEFAULT_ZVS_MARGIN_PCT = "15.0"   # f_drive_min must be this % above f0_tx
-DEFAULT_N_COMBOS_M     = "80"     # millions
-DEFAULT_MAX_ITERS      = "10"
-DEFAULT_TOP_K          = "30"
-DEFAULT_FH_WORKERS     = "15"
+DEFAULT_P_TARGET_MW    = "30"   # mW (post-LDO downstream load)
+DEFAULT_V_MIN          = "3.2"  # V
+DEFAULT_V_MAX          = "4.4"  # V
+DEFAULT_V_CAP_TARGET   = "4.5"  # V — controller steady-state cap target
+DEFAULT_RX_CAP_VRATING = "100"  # V — rated voltage of C_rx series resonant cap
+DEFAULT_D_MIN_PCT      = "20"   # blank = no floor
+DEFAULT_D_MAX_PCT      = "90"   # blank = no ceiling
+DEFAULT_FREQ_MIN_KHZ   = "200"  # kHz — user operating range (min)
+DEFAULT_FREQ_MAX_KHZ   = "360"  # kHz — user operating range (max)
+DEFAULT_DITHER_AMP_KHZ = "5"    # frequency dither amplitude (kHz)
+DEFAULT_ZVS_MARGIN_PCT = "50"   # f_drive_min must be this % above f0_tx
+DEFAULT_N_COMBOS_M     = "30"   # millions
+DEFAULT_MAX_ITERS      = "50"
+DEFAULT_TOP_K          = "6"
+DEFAULT_FH_WORKERS     = "6"
 DEFAULT_FH_TIMEOUT_S   = "360"
-DEFAULT_TR_EPOCHS    = "300"
-DEFAULT_TR_BATCH     = "256"
-DEFAULT_TR_LR        = "0.0005"
-DEFAULT_TR_VAL_SPLIT = "0.2"
+DEFAULT_TR_EPOCHS      = "300"
+DEFAULT_TR_BATCH       = "256"
+DEFAULT_TR_LR          = "0.0005"
+DEFAULT_TR_VAL_SPLIT   = "0.2"
 
 # Fixed-stackup defaults for one optimisation run (user-editable in the tab).
 # 0 oz = layer inactive. Re-run the optimiser for other stackups / pcb gaps.
-DEFAULT_PCB_GAP_MM     = "2.4"
-DEFAULT_TX_LAYER_OZ    = ["1.0", "1.0", "1.0", "0"]
+DEFAULT_PCB_GAP_MM     = "2.5"
+DEFAULT_TX_LAYER_OZ    = ["1.0", "0.5", "0.5", "1.0"]
 DEFAULT_RX_LAYER_OZ    = ["1.0", "0.5", "0.5", "1.0"]
 
 # Resolution at which sampled combinations are snapped to physical grid.
@@ -93,8 +98,18 @@ _V_DIODE = 0.35
 _V_DROP  = 2.0 * _V_DIODE
 
 # RX-side rail constraints (post-rectifier, on storage cap)
-_V_ZENER_DC       = 6.8   # zener clamp on RX cap → power above this is wasted
-_V_MIN_INDUCED_DC = 4.0   # required cap voltage at V_min, D=1 (LDO headroom)
+# The downstream chain is:  rectifier → cap → LDO → 3 V load.
+# The controller actively regulates the cap to V_CAP_TARGET so the tag has
+# headroom to keep running through the WPT-off window during optical transfer.
+# The Zener is a passive safety clamp; it should rarely engage in normal
+# operation because the controller throttles before reaching it.
+_V_LDO_OUT        = 3.0   # 3 V LDO output rail (downstream of cap)
+_V_CAP_TARGET_DEF = 4.5   # default controller setpoint (UI-overridable)
+_V_ZENER_DC       = 6.8   # passive TVS clamp — safety only
+_RX_CAP_V_RATING_DEF = 100.0  # V — default C_rx rated voltage (series resonant cap)
+_V_MIN_INDUCED_DC = 4.0   # hard floor: cap must be able to reach this at V_min, D=1
+                          #   (LDO needs ≥ ~0.5 V dropout, plus reserve for the
+                          #    optical-transfer WPT-off window)
 
 _TRAIN_SCRIPT = os.path.join(_NN_SCRIPTS, "train_surrogate.py")
 
@@ -172,40 +187,77 @@ def _load_nn(model_dir):
 
 def _score_batch(L_tx, L_rx, M, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
                  C_tx, C_rx,
-                 freq_ref_hz, freq_hz, f_drive_min_hz, f_drive_max_hz,
-                 V_min, V_max, P_target_w, D_min,
-                 zvs_margin, V_min_induced_dc, V_zener_dc):
+                 freq_ref_hz, freq_hz, f_drive_min_hz,
+                 V_min, V_max, P_target_w, D_min, D_max,
+                 zvs_margin, V_min_induced_dc, V_zener_dc,
+                 V_cap_target_dc, V_ldo_out, V_rx_cap_rating):
     """
-    Returns (eta_sys, feasible, D_vmin, V_dc_min, f0_tx_hz, f0_rx_hz, f_op_lo_hz).
+    Returns (eta_sys, score, feasible, feasible_relaxed,
+             D_vmax, D_vmin, V_dc_min,
+             f0_tx_hz, f0_rx_hz, f_op_lo_hz, I_tx_pk_vmax, V_Crx_pk).
 
-    Control model:
+    eta_sys          = TRUE physical efficiency end-to-end (TX bridge → 3 V load).
+    score            = ranking metric = eta_sys × dmin_softness × emi_softness × reserve_softness.
+    feasible         = strict (all hard gates AND D_vmax ≥ D_min preference).
+    feasible_relaxed = D_min preference dropped (fallback when strict is empty).
+    I_tx_pk_vmax     = TX coil peak on-time current at V_max (EMI proxy).
+    V_Crx_pk         = Peak voltage across the series resonant cap C_rx at matched load / V_min
+                       = V_pk_matched × Q_rx.  Hard gate: must be ≤ V_rx_cap_rating × 0.8.
+
+    System model (downstream of the air-gap link):
+        rectifier → storage cap → LDO → 3 V load
+      • The user-specified P_target_w is the *post-LDO* load power (what the tag
+        actually consumes downstream of the 3 V rail).
+      • A closed-loop controller throttles drive (duty / detune) to hold the cap
+        at V_cap_target_dc — that gives the tag a reserve voltage so it can keep
+        running through the brief WPT-off window during optical transfer.
+      • Cap-side power demand:  P_cap = P_target_w · V_cap / V_ldo_out
+      • LDO efficiency:         eta_ldo = V_ldo_out / V_cap   (linear regulator)
+      • If the natural full-drive V_dc at V_min exceeds V_cap_target the
+        controller throttles down — no zener heat dump in normal operation
+        (the zener is a passive safety clamp only).
+      • If the natural V_dc is below V_cap_target the cap sags to that lower
+        value (still feasible if ≥ V_min_induced_dc) and eta_ldo improves
+        slightly, at the cost of less reserve for the WPT-off window.
+
+    Control model (link side):
       • At heavy load (V_min) the controller drives near f0_tx, just enough above
-        to maintain ZVS — small *operational* margin, not the full safety margin.
-        Gates and ranking use matched-load values at this op point.
+        to maintain ZVS. Gates and ranking use matched-load values at this op
+        point.
       • At light load (V_max) the controller can detune to f_drive_max to throttle.
         TX-tank power gain G(f) = 1 / (1 + (Q_tx · (f/f0 - f0/f))²) reduces P,
         giving the system room to back off without violating duty floor.
 
-    The user-set zvs_margin is treated as a *feasibility safety buffer* — the
-    combo must support ZVS across the full sweep with that margin — but the
-    heavy-load steady-state op point is assumed close to matched-load.
-
     Hard gates:
       • ZVS:       f_drive_min ≥ f0_tx · (1 + zvs_margin)
-      • P_min:     P_matched(V_min) ≥ P_target
-      • P_max:     P_matched(V_max) · G_min_tx · D_min ≤ P_target
-                   (light-load throttle via detuning + duty)
-      • V_floor:   V_pk_matched(V_min) − V_drop ≥ V_min_induced_dc
+      • P_min:     P_dc_natural(V_min) ≥ P_cap_required   (P_target × V_cap_target / V_ldo)
+      • D_min:     D_vmax ≥ D_min_user             (coil weak enough at Vmax that ≥D_min% duty is required → power-limiting / EMI headroom)
+      • D_max:     D_vmin ≤ D_max_user             (Vmin needs ≤ D_max% duty → envelope-mod gap preserved)
+      • V_floor:   V_dc_natural(V_min) ≥ V_min_induced_dc  (cap can reach the floor at full drive)
 
-    eta_sys (ranking metric, at heavy-load matched-load):
-      eta_link · eta_rect_matched · zener_clip(V_dc_min) · detune_rx(f_drive_min)
+    eta_sys (true physical efficiency, displayed):
+      eta_link · eta_rect_steady · eta_ldo · detune_rx(f_drive_min)
 
-    The zener clip term penalises designs whose natural V_dc exceeds the
-    6.8 V TVS rail — that excess is dumped to ground as heat, not useful
-    power, and has to be reflected in the ranking.
+    where eta_rect_steady is the rectifier efficiency at the *throttled* op point
+    (V_pk = V_cap_steady + V_drop), and eta_ldo accounts for the linear-regulator
+    drop from V_cap_steady down to V_ldo_out.
+
+    score (ranking only, NOT displayed):
+      eta_sys · dmin_softness · emi_softness · reserve_softness
+
+    Soft preferences:
+      • dmin_softness    — D_vmax ≥ D_min (power-limit / EMI headroom at V_max).
+      • emi_softness     — low TX peak on-time current at V_max (radiated H-field).
+      • reserve_softness — natural V_dc at V_min full-drive reaches V_cap_target.
+                           A coil that only just clears V_min_induced_dc lets the
+                           cap sag, eating burst-handling margin during the
+                           WPT-off IR-transmit window. Quadratic ramp 0→1 across
+                           [0, V_cap_target].
     """
-    omega   = 2.0 * math.pi * freq_hz
-    skin_sc = math.sqrt(freq_hz / freq_ref_hz)
+    # freq_hz may be a per-row array when operating frequency is a sweep dim.
+    freq_hz_arr = np.asarray(freq_hz, dtype=np.float64)
+    omega       = 2.0 * math.pi * freq_hz_arr
+    skin_sc     = np.sqrt(freq_hz_arr / freq_ref_hz)
 
     L_tx = np.maximum(L_tx.astype(np.float64) * 1e-6, 1e-9)
     L_rx = np.maximum(L_rx.astype(np.float64) * 1e-6, 1e-9)
@@ -231,17 +283,14 @@ def _score_batch(L_tx, L_rx, M, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
     f0_tx = 1.0 / (2.0 * math.pi * np.sqrt(L_tx * C_tx))
     f0_rx = 1.0 / (2.0 * math.pi * np.sqrt(L_rx * C_rx))
 
-    # ── ZVS feasibility (safety-margin gate) ──────────────────────────────
-    zvs_ok  = f_drive_min_hz >= f0_tx * (1.0 + zvs_margin)
+    # ── ZVS feasibility: f_drive_min = freq - dither must clear f0_tx ─────
+    # f_drive_min/max may be per-row arrays when freq is a sweep dimension.
+    f_drive_min_arr = np.asarray(f_drive_min_hz, dtype=np.float64)
+    zvs_ok  = f_drive_min_arr >= f0_tx * (1.0 + zvs_margin)
 
-    # ── Light-load detune for throttling (drive at top of sweep) ──────────
-    f_op_hi = f_drive_max_hz
-    x_hi    = f_op_hi / f0_tx - f0_tx / f_op_hi
-    G_tx_min = 1.0 / (1.0 + (Q_tx * x_hi) ** 2)   # min gain at light load
 
-    # Heavy-load reporting frequency = bottom of sweep (where controller
-    # operates for max gain). Used for RX detune calc and diagnostics.
-    f_op_lo = np.full_like(f0_tx, f_drive_min_hz)
+    # Heavy-load op point = minimum drive frequency (per-row).
+    f_op_lo = f_drive_min_arr
 
     V_rms_min = V_min * math.sqrt(2.0) / math.pi
     V_rms_max = V_max * math.sqrt(2.0) / math.pi
@@ -258,74 +307,158 @@ def _score_batch(L_tx, L_rx, M, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
 
     V_pk_min_m = _v_pk_matched(V_rms_min)        # heavy load, matched
     V_pk_max_m = _v_pk_matched(V_rms_max)        # light load, matched
-    V_pk_max_op = V_pk_max_m * np.sqrt(G_tx_min)  # light load with detune throttle
-
-    V_dc_min_m  = np.maximum(V_pk_min_m  - _V_DROP, 0.0)
-    V_dc_max_op = np.maximum(V_pk_max_op - _V_DROP, 0.0)
+    V_dc_min_m = np.maximum(V_pk_min_m - _V_DROP, 0.0)
 
     eta_rect_min = np.where(V_pk_min_m > _V_DROP,
                             V_dc_min_m / np.maximum(V_pk_min_m, 1e-12), 0.0)
-    eta_rect_max = np.where(V_pk_max_op > _V_DROP,
-                            V_dc_max_op / np.maximum(V_pk_max_op, 1e-12), 0.0)
 
-    P_dc_min   = P_rx_min_m * eta_rect_min                # max at V_min (matched)
-    P_dc_max_op = P_rx_max_m * G_tx_min * eta_rect_max    # min at V_max (detuned)
+    P_dc_min = P_rx_min_m * eta_rect_min   # natural full-drive DC power at V_min
 
-    # ── Zener clamp (6.8 V TVS to ground on RX cap) ──────────────────────
-    # When the natural rectified V_dc exceeds V_zener, the TVS shunts the
-    # excess current to ground at V=V_zener.  The cap voltage is held at
-    # V_zener, so:
-    #   • useful DC power into the load = V_zener · I_dc_natural
-    #     ≈ P_dc_natural · (V_zener / V_dc_natural)   (current-source-like)
-    #   • the (1 − V_zener / V_dc_natural) fraction is wasted as heat in
-    #     the TVS — that has to flow into the system efficiency.
-    # This applies at BOTH the heavy- and light-load op points.  Without
-    # this, designs that produce huge V_dc (e.g. 16 V into a 6.8 V rail)
-    # were ranked as if all that voltage were useful.
-    zener_clip_min = np.where(V_dc_min_m  > V_zener_dc,
-                              V_zener_dc / np.maximum(V_dc_min_m,  1e-12), 1.0)
-    zener_clip_max = np.where(V_dc_max_op > V_zener_dc,
-                              V_zener_dc / np.maximum(V_dc_max_op, 1e-12), 1.0)
+    # ── Steady-state operating point (controller throttles to V_cap_target) ──
+    # The controller drives the cap to V_cap_target_dc whenever the link can
+    # support it. If the natural V_dc at full drive falls short, the cap
+    # sags to V_dc_min_m (still feasible if ≥ V_min_induced_dc).
+    V_cap_steady = np.minimum(V_dc_min_m, V_cap_target_dc)
 
-    # Effective DC power delivered to the load after the zener clamp.
-    P_dc_min_eff    = P_dc_min    * zener_clip_min
-    P_dc_max_op_eff = P_dc_max_op * zener_clip_max
+    # Throttled rectifier op point: when the controller throttles (natural V_dc
+    # would exceed V_cap_target), the AC swing is reduced until the rectifier
+    # outputs V_cap_target. So V_pk_steady = V_cap_target + V_drop (throttled)
+    # or V_pk_min_m (unthrottled — coil running flat-out).
+    throttled    = V_dc_min_m > V_cap_target_dc
+    V_pk_steady  = np.where(throttled, V_cap_steady + _V_DROP, V_pk_min_m)
+    eta_rect_ss  = np.where(V_pk_steady > _V_DROP,
+                            V_cap_steady / np.maximum(V_pk_steady, 1e-12), 0.0)
 
-    # D_vmin and feasibility gates use the *post-clamp* deliverable power:
-    # if the clamp is the only thing that lets the design be "in spec",
-    # we still have to supply the load below the clamp, so the
-    # P_dc that matters is the clamped value.
-    D_vmin = np.where(P_dc_min_eff > 1e-18, P_target_w / P_dc_min_eff, np.inf)
+    # ── LDO loss (linear regulator: V_cap → 3 V at constant load current) ──
+    # Power at cap = P_target_w · V_cap / V_ldo_out, so eta_ldo = V_ldo / V_cap.
+    eta_ldo = np.minimum(V_ldo_out / np.maximum(V_cap_steady, 1e-12), 1.0)
+
+    # Required cap-side power = P_target × V_cap_target / V_ldo_out.
+    # Use V_cap_target (controller's target) for gates so the budget is
+    # consistent with the assumed steady-state operating point.
+    P_cap_required = P_target_w * V_cap_target_dc / V_ldo_out
+
+    # ── P_dc at V_max (light load), full drive, no zener clip, no detuning ──
+    # Used for duty-cycle gates — represents the natural maximum the coil
+    # would deliver if the controller didn't throttle.
+    P_dc_max_natural = P_rx_max_m * np.where(V_pk_max_m > _V_DROP,
+                                              (V_pk_max_m - _V_DROP)
+                                              / np.maximum(V_pk_max_m, 1e-12), 0.0)
+
+    # D_vmax = duty needed at V_max (no detuning) to deliver P_cap_required.
+    # Gate: D_vmax >= D_min means the coil is weak enough at Vmax that we can't
+    # over-deliver — gives power-limiting / EMI headroom.
+    D_vmax = np.where(P_dc_max_natural > 1e-18,
+                      P_cap_required / P_dc_max_natural, np.inf)
+
+    # D_vmin = duty needed at V_min (no detuning) to deliver P_cap_required.
+    # Gate: D_vmin <= D_max means we never exceed D_max%, preserving envelope-mod gap.
+    D_vmin = np.where(P_dc_min > 1e-18, P_cap_required / P_dc_min, np.inf)
 
     # ── Hard gates ────────────────────────────────────────────────────────
-    pmin_ok = P_dc_min_eff >= P_target_w
+    # pmin_ok: at V_min with 100% duty, coil delivers at least P_cap_required.
+    pmin_ok = P_dc_min >= P_cap_required
     if D_min > 0.0:
-        pmax_ok = P_dc_max_op_eff * D_min <= P_target_w
+        # D_vmax must be in [D_min, 1.0]: ≥ D_min for power-limiting headroom,
+        # ≤ 1.0 because we can't exceed 100% duty (coil too weak otherwise).
+        dmin_ok = (D_vmax >= D_min) & (D_vmax <= 1.0)
     else:
-        pmax_ok = np.ones_like(P_dc_min, dtype=bool)
-    # V_floor uses the clamped cap voltage (whichever is lower).
-    V_dc_min_eff = np.minimum(V_dc_min_m, V_zener_dc)
-    vfloor_ok = V_dc_min_eff >= V_min_induced_dc
+        dmin_ok = np.ones_like(P_dc_min, dtype=bool)
+    # dmax_ok: at V_min, duty needed <= D_max (preserves envelope-mod gap).
+    if D_max < 1.0:
+        dmax_ok = D_vmin <= D_max
+    else:
+        dmax_ok = np.ones_like(P_dc_min, dtype=bool)
+    # V_floor: natural full-drive cap voltage at V_min must clear the floor.
+    # The zener (V_zener_dc) is irrelevant here since V_min_induced_dc << V_zener.
+    vfloor_ok = V_dc_min_m >= V_min_induced_dc
+    V_dc_min_eff = np.minimum(V_dc_min_m, V_zener_dc)   # for display/output
 
-    feasible = (zvs_ok & pmin_ok & pmax_ok & vfloor_ok
-                & (R_tx_ac > 0) & (R_rx_ac > 0) & (M > 0))
+    # ── Series resonant C_rx voltage stress ───────────────────────────────
+    # In a series-resonant RX (L_rx — C_rx — bridge), at matched load:
+    #   I_circ_pk = V_pk_matched / R_rx_ac
+    #   V_Crx_pk  = I_circ_pk × X_Crx = V_pk_matched × Q_rx
+    #               (Q_rx = ω·L_rx / R_rx_ac = X_Lrx / R_rx_ac = X_Crx / R_rx_ac at f0_rx)
+    # 20 % derating applied: gate passes when V_Crx_pk ≤ V_rx_cap_rating × 0.8.
+    V_Crx_pk  = V_pk_min_m * Q_rx
+    vrxcap_ok = V_Crx_pk <= (V_rx_cap_rating * 0.8)
 
-    # ── RX detune at the heavy-load drive frequency ──────────────────────
+    # Base hard gates (D_min is intentionally excluded — it's a soft preference).
+    base_ok = (zvs_ok & pmin_ok & dmax_ok & vfloor_ok & vrxcap_ok
+               & (R_tx_ac > 0) & (R_rx_ac > 0) & (M > 0))
+    feasible        = base_ok & dmin_ok   # strict: includes D_min preference
+    feasible_relaxed = base_ok            # relaxed: D_min dropped if nothing passes strict
+
+    # ── RX detune at the actual operating frequency ──────────────────────
+    # C_rx is snapped to resonate near freq_hz_arr (the operating freq),
+    # so detune is measured relative to that, not freq_ref_hz.
     f0_rx_safe = np.maximum(f0_rx, 1.0)
-    x_rx       = f_op_lo / f0_rx_safe - f0_rx_safe / f_op_lo
+    x_rx       = freq_hz_arr / f0_rx_safe - f0_rx_safe / freq_hz_arr
     detune_rx  = 1.0 / (1.0 + (Q_rx * x_rx) ** 2)
 
-    # System efficiency at the heavy-load op point (this is the ranking
-    # metric — high V_dc designs get docked the same as low-V designs).
-    eta_sys = eta_link * eta_rect_min * zener_clip_min * detune_rx
+    # ── True physical system efficiency (this is what we display) ────────
+    # eta_sys is the actual end-to-end electrical efficiency at the heavy-load
+    # op point — TX bridge → tank → air gap → rectifier → cap → LDO → 3 V load.
+    # It is NEVER multiplied by soft preference penalties; those go into a
+    # separate ranking score below.
+    eta_sys = eta_link * eta_rect_ss * eta_ldo * detune_rx
+
+    # ── EMI proxy: TX peak on-time current at V_max ─────────────────────
+    # The TX coil current during the duty-on portion of the envelope is what
+    # radiates. At matched (heavy) load the TX sees Z_tx_opt impedance, so
+    #   I_tx_pk_on(V) = V_rms · sqrt(2) / Z_tx_opt
+    # We use V_max because that's the worst-case EMI scenario (full battery).
+    # Lower I_tx_pk_on → less radiated H-field → better EMI.
+    I_tx_pk_vmax = V_rms_max * math.sqrt(2.0) / Z_tx_opt
+
+    # ── Ranking score (used for sorting, NOT displayed) ──────────────────
+    # score = eta_sys
+    #         × dmin_softness   (soft preference: D_vmax ≥ D_min)
+    #         × emi_softness    (prefer low TX peak current)
+    #
+    # Both soft factors are gentle (~10–30 % impact at typical deviations) so
+    # a moderately better design with a slightly violated preference can still
+    # win over a worse strictly-compliant design — but a heavily-violated
+    # design loses to any in-band one.
+    score = eta_sys.copy()
+
+    # D_min softness: linear ramp.  In-band → 1.0.  Below band → 1 − α·(D_min−D_vmax)/D_min.
+    # α = 0.6 means D_vmax = 0 docks score by 60 %; D_vmax = D_min/2 docks by 30 %.
+    if D_min > 0.0:
+        deficit = np.clip((D_min - np.minimum(D_vmax, 1.0)) / D_min, 0.0, 1.0)
+        dmin_softness = 1.0 - 0.6 * deficit
+        score = score * dmin_softness.astype(score.dtype)
+
+    # EMI softness: rank-relative — designs with lower TX peak current score better.
+    # We don't know the absolute "good" current ahead of time, so we use a soft
+    # exp-decay penalty: exp(-I_tx_pk / I_ref).  I_ref = 0.5 A is a reasonable
+    # PCB-coil scale; tweak if needed.  This contributes a smooth 0–~30 % preference.
+    I_ref_emi = 0.5
+    emi_softness = 0.7 + 0.3 * np.exp(-I_tx_pk_vmax / I_ref_emi)
+    score = score * emi_softness.astype(score.dtype)
+
+    # Reserve-headroom softness: prefer designs whose natural full-drive V_dc at
+    # V_min reaches V_cap_target. Below that the cap sags and the tag has reduced
+    # reserve for the WPT-off IR-transmit window (a 480 B / 1 Mbaud burst pulls
+    # ~10.5 mA from cap for 4.8 ms ⇒ ~0.55 V droop on a 100 µF cap; 4.5 V start
+    # → 3.95 V end keeps the 3 V LDO out of dropout). Quadratic ramp from floor
+    # to target so a design at 4.0 V (just at floor) loses ~21 % vs one at 4.5 V.
+    reserve_softness = np.clip(V_dc_min_m / np.maximum(V_cap_target_dc, 1e-12),
+                               0.0, 1.0) ** 2
+    score = score * reserve_softness.astype(score.dtype)
 
     return (eta_sys.astype(np.float32),
+            score.astype(np.float32),
             feasible,
+            feasible_relaxed,
+            D_vmax.astype(np.float32),
             D_vmin.astype(np.float32),
             V_dc_min_eff.astype(np.float32),
             f0_tx.astype(np.float32),
             f0_rx.astype(np.float32),
-            f_op_lo.astype(np.float32))
+            f_op_lo.astype(np.float32),
+            I_tx_pk_vmax.astype(np.float32),
+            V_Crx_pk.astype(np.float32))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,15 +538,21 @@ def _nn_sweep(params, log_cb, cancel_flag):
     gc_enabled  = params["gc_enabled"]
     gc_dia_mm   = round(_snap(params["gc_dia_mm"], _GRID_OD_MM_STEP), 4)
 
-    freq_min_hz = params["freq_min_hz"]
-    freq_max_hz = params["freq_max_hz"]
-    freq_ref_hz = round(_snap(0.5 * (freq_min_hz + freq_max_hz),
-                              _GRID_FREQ_HZ_STEP), 1)
+    freq_min_hz = params["freq_min_hz"]   # user operating range (sweep start)
+    freq_max_hz = params["freq_max_hz"]   # user operating range (sweep end)
+    # freq_ref_hz = centre of training domain (fixed NN query point).
+    # Passed explicitly so it stays anchored to dom_freq, not the user sweep range.
+    freq_ref_hz = params.get("freq_ref_hz") or round(
+        _snap(0.5 * (freq_min_hz + freq_max_hz), _GRID_FREQ_HZ_STEP), 1)
 
-    V_min      = params["v_min"]
-    V_max      = params["v_max"]
-    P_target   = params["p_target_w"]
-    D_min      = params["d_min"]
+    V_min          = params["v_min"]
+    V_max          = params["v_max"]
+    P_target       = params["p_target_w"]
+    D_min          = params["d_min"]
+    D_max          = params["d_max"]
+    V_cap_target    = params.get("v_cap_target_dc", _V_CAP_TARGET_DEF)
+    V_ldo_out       = params.get("v_ldo_out", _V_LDO_OUT)
+    V_rx_cap_rating = params.get("v_rx_cap_rating", _RX_CAP_V_RATING_DEF)
 
     # Run-fixed stackup constants (also used as NN inputs).
     pcb_gap_mm     = float(params["pcb_gap_mm"])
@@ -444,11 +583,6 @@ def _nn_sweep(params, log_cb, cancel_flag):
         t: _rx_h_total_for_topology(t, rx_h_layers_m) for t in rx_topologies
     }
 
-    log_cb(f"  NN features ({len(feat_cols)}): {feat_cols}")
-    log_cb(f"  TX topologies: {tx_topologies}  |  RX topologies: {rx_topologies}")
-    log_cb(f"  Fixed: pcb_gap={pcb_gap_mm:.2f}mm  "
-           f"TX oz={tx_oz_layers}  RX oz={rx_oz_layers}")
-
     N              = params["n_combos"]
     dither_amp_hz  = params.get("dither_amp_hz", 0.0)
     zvs_margin     = params.get("zvs_margin", 0.0)
@@ -458,20 +592,33 @@ def _nn_sweep(params, log_cb, cancel_flag):
     if not c_tx_options_f or not c_rx_options_f:
         raise ValueError("Cap option lists must be non-empty for stratified sampling.")
 
-    ctx_arr      = np.array(c_tx_options_f, dtype=np.float64)
-    crx_arr      = np.array(c_rx_options_f, dtype=np.float64)
-    n_caps_tx    = ctx_arr.size
-    n_caps_rx    = crx_arr.size
-    n_pairs      = n_caps_tx * n_caps_rx
-    ctx_pair_arr = np.tile(ctx_arr, n_caps_rx)
-    crx_pair_arr = np.repeat(crx_arr, n_caps_tx)
+    ctx_arr   = np.array(c_tx_options_f, dtype=np.float64)
+    crx_arr   = np.array(c_rx_options_f, dtype=np.float64)
+    n_caps_tx = ctx_arr.size
 
-    f_drive_min_hz = max(freq_min_hz - dither_amp_hz, 1.0)
-    f_drive_max_hz = freq_max_hz + dither_amp_hz
+    # ── Frequency sweep dimension (1 kHz steps across user-specified range) ──
+    # The NN is always queried at freq_ref_hz (the training frequency).
+    # For each operating frequency f_op in the sweep, AC resistance is scaled
+    # by sqrt(f_op / freq_ref_hz) before the efficiency calculation.
+    # This handles the fact that training data was collected at a fixed freq.
+    freq_sweep_hz = np.arange(freq_min_hz, freq_max_hz + 0.5,
+                              _GRID_FREQ_HZ_STEP, dtype=np.float64)
+    n_freqs = freq_sweep_hz.size
 
-    log_cb(f"  Cap pairs per geometry: {n_caps_tx} TX × {n_caps_rx} RX = {n_pairs}")
-    log_cb(f"  Drive sweep: {f_drive_min_hz/1e3:.1f}–{f_drive_max_hz/1e3:.1f} kHz "
-           f"(ZVS margin {zvs_margin*100:.0f}%)")
+    # C_rx is snapped per-geometry-per-freq to the nearest E-series cap that
+    # resonates closest to f_op — it is NOT a free sweep variable.
+    # Total combos per geometry = n_caps_tx × n_freqs.
+    n_pairs = n_caps_tx * n_freqs
+
+    if params.get("log_header", False):
+        log_cb(f"  NN features ({len(feat_cols)}): {feat_cols}")
+        log_cb(f"  TX topologies: {tx_topologies}  |  RX topologies: {rx_topologies}")
+        log_cb(f"  Fixed: pcb_gap={pcb_gap_mm:.2f}mm  "
+               f"TX oz={tx_oz_layers}  RX oz={rx_oz_layers}")
+        log_cb(f"  C_tx options: {n_caps_tx}  |  C_rx: snapped to f0_rx≈f_op per geometry")
+        log_cb(f"  Freq sweep: {freq_min_hz/1e3:.0f}–{freq_max_hz/1e3:.0f} kHz "
+               f"({n_freqs} steps)  |  Dither ±{dither_amp_hz/1e3:.1f} kHz  "
+               f"ZVS margin {zvs_margin*100:.0f}%")
 
     acc_keys = [
         "tx_turns", "tx_width", "tx_od_mm",
@@ -481,8 +628,10 @@ def _nn_sweep(params, log_cb, cancel_flag):
         "L_tx", "L_rx", "M",
         "R_tx", "R_rx", "DCR_tx", "DCR_rx",
         "tx_id_mm", "rx_id_mm",
-        "eta_sys", "D_vmin", "V_dc_min", "f0_tx_hz", "f0_rx_hz", "f_op_lo_hz",
-        "c_tx_nf", "c_rx_nf",
+        "eta_sys", "score", "feasible", "feasible_relaxed",
+        "D_vmax", "D_vmin", "V_dc_min", "f0_tx_hz", "f0_rx_hz", "f_op_lo_hz",
+        "I_tx_pk_vmax", "V_Crx_pk",
+        "c_tx_nf", "c_rx_nf", "freq_hz",
     ]
     accs = {k: [] for k in acc_keys}
 
@@ -500,7 +649,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
         if cancel_flag.is_set():
             return None
         b += 1
-        if b % 20 == 1:
+        if b % 100 == 0:
             log_cb(f"    batch {b}: {n_ok:,}/{N:,} combos, {n_rej:,} rejected")
 
         bs = geom_per_batch
@@ -638,43 +787,85 @@ def _nn_sweep(params, log_cb, cancel_flag):
             Y_sc = model(torch.tensor(X_sc, device=device))
         Y = y_scaler.inverse_transform(Y_sc.cpu().numpy())
 
-        # ── Stratified expansion: each geometry × every (C_tx, C_rx) pair ──
-        n_combos_batch = bs_v * n_pairs
+        # ── Stratified expansion: geometry × C_tx × freq_sweep ──────────────
+        # Layout per geometry: n_freqs blocks of n_caps_tx rows.
+        # For each (geometry, freq) pair, C_rx is snapped to the nearest
+        # E-series cap that resonates closest to f_op (the operating freq).
+        # NN was queried at freq_ref_hz; ACR is scaled by sqrt(f_op/freq_ref).
 
-        L_tx_full   = np.repeat(Y[:, 0], n_pairs).astype(np.float32)
-        L_rx_full   = np.repeat(Y[:, 1], n_pairs).astype(np.float32)
-        M_full      = np.repeat(Y[:, 2], n_pairs).astype(np.float32)
-        R_tx_full   = np.repeat(Y[:, 3], n_pairs).astype(np.float32)
-        R_rx_full   = np.repeat(Y[:, 4], n_pairs).astype(np.float32)
-        DCR_tx_full = np.repeat(DCR_tx_np, n_pairs)
-        DCR_rx_full = np.repeat(DCR_rx_np, n_pairs)
+        L_rx_pred = Y[:, 1].astype(np.float64) * 1e-6   # µH → H, shape (bs_v,)
+        crx_arr_nf = crx_arr * 1e9                        # nF for distance calc
 
-        ctx_full = np.tile(ctx_pair_arr, bs_v)
-        crx_full = np.tile(crx_pair_arr, bs_v)
+        # Pre-build freq broadcast arrays (shape: bs_v × n_freqs).
+        # C_rx ideal = 1 / ((2π f_op)² L_rx).
+        freq_2pi_sq = (2.0 * math.pi * freq_sweep_hz) ** 2  # (n_freqs,)
+        # C_rx ideal per (geom, freq): shape (bs_v, n_freqs)
+        C_rx_ideal_mat = 1.0 / (freq_2pi_sq[None, :] *
+                                 np.maximum(L_rx_pred[:, None], 1e-15))  # F
+        C_rx_ideal_nf_mat = C_rx_ideal_mat * 1e9
+        # Snap to nearest E-series: argmin over crx_arr dim → shape (bs_v, n_freqs)
+        crx_idx_mat = np.argmin(
+            np.abs(C_rx_ideal_nf_mat[:, :, None] - crx_arr_nf[None, None, :]),
+            axis=2
+        )
+        crx_mat = crx_arr[crx_idx_mat]   # F, shape (bs_v, n_freqs)
 
-        eta_sys, feasible, D_vmin, V_dc_min, f0_tx_arr, f0_rx_arr, f_op_lo_arr = _score_batch(
+        # Expand all arrays to shape (bs_v * n_freqs * n_caps_tx,).
+        # Order: for each geometry, iterate freqs, then caps_tx.
+        n_combos_batch = bs_v * n_pairs   # n_pairs = n_freqs * n_caps_tx
+
+        # Geometry fields: repeat each geom value n_pairs times.
+        def _rep(arr): return np.repeat(arr, n_pairs)
+
+        L_tx_full   = _rep(Y[:, 0]).astype(np.float32)
+        L_rx_full   = _rep(Y[:, 1]).astype(np.float32)
+        M_full      = _rep(Y[:, 2]).astype(np.float32)
+        R_tx_full   = _rep(Y[:, 3]).astype(np.float32)
+        R_rx_full   = _rep(Y[:, 4]).astype(np.float32)
+        DCR_tx_full = _rep(DCR_tx_np)
+        DCR_rx_full = _rep(DCR_rx_np)
+
+        # freq and C_rx: for each geometry, tile (freq × cap) in row-major order.
+        # crx_mat row i → repeat each element n_caps_tx times, then tile.
+        # Shape target: (bs_v, n_freqs, n_caps_tx) → flatten.
+        # For each freq, n_caps_tx cap values: repeat each freq entry n_caps_tx times.
+        freq_tile   = np.repeat(freq_sweep_hz, n_caps_tx)        # (n_freqs*n_caps_tx,)
+        ctx_tile    = np.tile(ctx_arr, n_freqs)                   # (n_freqs*n_caps_tx,)
+        # crx per (geom,freq): crx_mat[g, f] tiled n_caps_tx times each freq block.
+        # crx_mat shape (bs_v, n_freqs) → repeat each freq entry n_caps_tx times
+        crx_per_geom_freq = np.repeat(crx_mat, n_caps_tx, axis=1)  # (bs_v, n_freqs*n_caps_tx)
+
+        freq_full = np.tile(freq_tile, bs_v).astype(np.float64)          # (n_combos_batch,)
+        ctx_full  = np.tile(ctx_tile, bs_v).astype(np.float64)           # (n_combos_batch,)
+        crx_full  = crx_per_geom_freq.ravel().astype(np.float64)         # (n_combos_batch,)
+
+        f_drive_min_full = np.maximum(freq_full - dither_amp_hz, 1.0)
+
+        eta_sys, score_arr, feasible, feasible_relaxed, D_vmax, D_vmin, V_dc_min, f0_tx_arr, f0_rx_arr, f_op_lo_arr, I_tx_pk_arr, V_Crx_pk_arr = _score_batch(
             L_tx_full, L_rx_full, M_full, R_tx_full, R_rx_full,
             DCR_tx_full, DCR_rx_full,
             ctx_full, crx_full,
-            freq_ref_hz, freq_ref_hz, f_drive_min_hz, f_drive_max_hz,
-            V_min, V_max, P_target, D_min,
+            freq_ref_hz, freq_full, f_drive_min_full,
+            V_min, V_max, P_target, D_min, D_max,
             zvs_margin, _V_MIN_INDUCED_DC, _V_ZENER_DC,
+            V_cap_target, V_ldo_out, V_rx_cap_rating,
         )
-        eta_sys = np.where(feasible, eta_sys, np.float32(0.0))
+        # Don't zero eta_sys here — store raw, and apply strict-or-relaxed mask
+        # after the full sweep so the D_min preference can be relaxed globally.
 
         n_ok += n_combos_batch
 
-        accs["tx_turns"].append(np.repeat(tx_turns_s, n_pairs))
-        accs["tx_width"].append(np.repeat(tx_width_s, n_pairs))
-        accs["tx_od_mm"].append(np.repeat(tx_od_s, n_pairs))
-        accs["rx_od_mm"].append(np.repeat(rx_od_s, n_pairs))
-        accs["rx_turns"].append(np.repeat(rx_turns_s, n_pairs))
-        accs["rx_width"].append(np.repeat(rx_width_s, n_pairs))
-        accs["tx_topo"].append(np.repeat(tx_topo_idx_s.astype(np.uint8), n_pairs))
-        accs["rx_topo"].append(np.repeat(rx_topo_idx_s.astype(np.uint8), n_pairs))
-        accs["tx_port_inside"].append(np.repeat(tx_port_in_s, n_pairs))
-        accs["rx_port_inside"].append(np.repeat(rx_port_in_s, n_pairs))
-        accs["gc_dia_mm"].append(np.repeat(gc_s, n_pairs))
+        accs["tx_turns"].append(_rep(tx_turns_s))
+        accs["tx_width"].append(_rep(tx_width_s))
+        accs["tx_od_mm"].append(_rep(tx_od_s))
+        accs["rx_od_mm"].append(_rep(rx_od_s))
+        accs["rx_turns"].append(_rep(rx_turns_s))
+        accs["rx_width"].append(_rep(rx_width_s))
+        accs["tx_topo"].append(_rep(tx_topo_idx_s.astype(np.uint8)))
+        accs["rx_topo"].append(_rep(rx_topo_idx_s.astype(np.uint8)))
+        accs["tx_port_inside"].append(_rep(tx_port_in_s))
+        accs["rx_port_inside"].append(_rep(rx_port_in_s))
+        accs["gc_dia_mm"].append(_rep(gc_s))
         accs["L_tx"].append(L_tx_full)
         accs["L_rx"].append(L_rx_full)
         accs["M"].append(M_full)
@@ -682,16 +873,23 @@ def _nn_sweep(params, log_cb, cancel_flag):
         accs["R_rx"].append(R_rx_full)
         accs["DCR_tx"].append(DCR_tx_full)
         accs["DCR_rx"].append(DCR_rx_full)
-        accs["tx_id_mm"].append(np.repeat(tx_id_s, n_pairs))
-        accs["rx_id_mm"].append(np.repeat(rx_id_s, n_pairs))
+        accs["tx_id_mm"].append(_rep(tx_id_s))
+        accs["rx_id_mm"].append(_rep(rx_id_s))
         accs["eta_sys"].append(eta_sys)
+        accs["score"].append(score_arr)
+        accs["feasible"].append(feasible)
+        accs["feasible_relaxed"].append(feasible_relaxed)
+        accs["D_vmax"].append(D_vmax)
         accs["D_vmin"].append(D_vmin)
         accs["V_dc_min"].append(V_dc_min)
         accs["f0_tx_hz"].append(f0_tx_arr)
         accs["f0_rx_hz"].append(f0_rx_arr)
-        accs["f_op_lo_hz"].append(f_op_lo_arr)
+        accs["f_op_lo_hz"].append(f_op_lo_arr.astype(np.float32))
+        accs["I_tx_pk_vmax"].append(I_tx_pk_arr)
+        accs["V_Crx_pk"].append(V_Crx_pk_arr)
         accs["c_tx_nf"].append((ctx_full * 1e9).astype(np.float32))
         accs["c_rx_nf"].append((crx_full * 1e9).astype(np.float32))
+        accs["freq_hz"].append(freq_full.astype(np.float32))
 
     concat = {k: np.concatenate(v) for k, v in accs.items()}
     concat["_tx_topologies"] = np.array(tx_topologies)
@@ -700,9 +898,21 @@ def _nn_sweep(params, log_cb, cancel_flag):
     concat["_freq_min_hz"]   = np.float64(freq_min_hz)
     concat["_freq_max_hz"]   = np.float64(freq_max_hz)
 
-    n_feasible = int(np.count_nonzero(concat["eta_sys"]))
+    # Hard gates (P_min, D_max, ZVS, V_floor) define the relaxed mask. The D_min
+    # preference is folded into `score` as a soft penalty, so we mask `score`
+    # (the ranking metric) by the relaxed mask and leave `eta_sys` (the displayed
+    # physical efficiency) untouched.
+    relaxed_mask = concat["feasible_relaxed"]
+    strict_mask  = concat["feasible"]
+    n_strict     = int(np.count_nonzero(strict_mask))
+    n_feasible   = int(np.count_nonzero(relaxed_mask))
+    concat["score"]   = np.where(relaxed_mask, concat["score"],   np.float32(0.0))
+    concat["eta_sys"] = np.where(relaxed_mask, concat["eta_sys"], np.float32(0.0))
+    del concat["feasible"], concat["feasible_relaxed"]
+
+    relaxed_note = "" if n_strict > 0 else "  [D_min preference unmet by every design — best-effort fallback]"
     log_cb(f"  Sweep done: {n_ok:,} combos scored "
-           f"({n_feasible:,} feasible, {n_rej:,} geometry-rejected)")
+           f"({n_feasible:,} feasible incl. {n_strict:,} strict, {n_rej:,} geometry-rejected){relaxed_note}")
     return concat
 
 
@@ -717,13 +927,14 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
     Dedup key includes both topologies and port_inside booleans, since these
     materially affect FastHenry results and the surrogate sees them as inputs.
     """
+    score = result["score"]
     eta   = result["eta_sys"]
-    order = np.argsort(eta)[::-1]
+    order = np.argsort(score)[::-1]
 
     winners = []
     seen    = set()
     for i in order:
-        if eta[i] <= 0.0:
+        if score[i] <= 0.0:
             break
         tx_t  = int(result["tx_turns"][i])
         tx_od = round(float(result["tx_od_mm"][i]), 1)
@@ -738,8 +949,9 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
         tx_port  = bool(result["tx_port_inside"][i])
         rx_port  = bool(result["rx_port_inside"][i])
         gc       = round(float(result["gc_dia_mm"][i]), 1)
+        f_op_khz = round(float(result["freq_hz"][i]) / 1e3, 1)
         key = (tx_t, tx_od, tx_w, rx_t, rx_od, rx_w,
-               tx_topo, rx_topo, tx_port, rx_port, gc)
+               tx_topo, rx_topo, tx_port, rx_port, gc, f_op_khz)
         if key in seen:
             continue
         seen.add(key)
@@ -756,15 +968,24 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
             "rx_port_inside": rx_port,
             "gc_dia_mm":      float(result["gc_dia_mm"][i]),
             "eta_sys":        float(eta[i]),
+            "score":          float(score[i]),
+            "I_tx_pk_vmax":   float(result["I_tx_pk_vmax"][i]),
+            "V_Crx_pk":       float(result["V_Crx_pk"][i]),
             "L_tx_uH":        float(result["L_tx"][i]),
             "L_rx_uH":        float(result["L_rx"][i]),
             "c_tx_nf":        float(result["c_tx_nf"][i]),
             "c_rx_nf":        float(result["c_rx_nf"][i]),
+            "D_vmax":         float(result["D_vmax"][i]),
             "D_vmin":         float(result["D_vmin"][i]),
             "V_dc_min":       float(result["V_dc_min"][i]),
             "f0_tx_hz":       float(result["f0_tx_hz"][i]),
             "f0_rx_hz":       float(result["f0_rx_hz"][i]),
             "f_op_lo_hz":     float(result["f_op_lo_hz"][i]),
+            "freq_hz":        float(result["freq_hz"][i]),
+            "M_uH":           float(result["M"][i]),
+            "k":              float(result["M"][i]) / max(
+                                  math.sqrt(float(result["L_tx"][i]) *
+                                            float(result["L_rx"][i])), 1e-12),
         })
         if len(winners) >= k:
             break
@@ -789,9 +1010,6 @@ def _build_sim_params(winners, params, timeout_sec):
 
     domain     = params["domain"]
     glb        = domain.get("global", {})
-    freq_range = glb.get("freq_hz", [340000.0, 380000.0])
-    freq_hz    = 0.5 * (freq_range[0] + freq_range[1])
-    freq_hz    = round(_snap(freq_hz, _GRID_FREQ_HZ_STEP), 1)
 
     tx_d = domain.get("tx", {})
     rx_d = domain.get("rx", {})
@@ -802,6 +1020,10 @@ def _build_sim_params(winners, params, timeout_sec):
 
     params_list = []
     for w in winners:
+        # Use the winner's own operating frequency for FastHenry so the sim
+        # runs at the actual frequency the optimizer chose, not the training centre.
+        w_freq_hz = round(_snap(float(w.get("freq_hz", glb.get("freq_hz", [360000.0])[0])),
+                                _GRID_FREQ_HZ_STEP), 1)
         p = SimParams(
             tx_turns          = int(w["tx_turns"]),
             tx_trace_width_mm = round(float(w["tx_width"]), 4),
@@ -829,9 +1051,9 @@ def _build_sim_params(winners, params, timeout_sec):
             rx_nwinc          = int(rx_d.get("nwinc", 3)),
 
             pcb_gap_mm        = pcb_gap_mm,
-            freq_hz           = freq_hz,
-            fmin_hz           = freq_hz,
-            fmax_hz           = freq_hz,
+            freq_hz           = w_freq_hz,
+            fmin_hz           = w_freq_hz,
+            fmax_hz           = w_freq_hz,
             resolution_mm     = float(glb.get("resolution_mm", 1.5)),
             timeout_sec       = timeout_sec,
             ground_circle_dia_mm = round(float(w.get("gc_dia_mm", 0.0)), 1),
@@ -907,7 +1129,6 @@ def _retrain(model_dir, refined_path, train_params, log_cb, cancel_flag):
     env["SURROGATE_LR"]         = str(train_params["lr"])
     env["SURROGATE_VAL_SPLIT"]  = str(train_params["val_split"])
 
-    log_cb("  Retraining model…")
     try:
         proc = subprocess.Popen(
             [sys.executable, "-u", _TRAIN_SCRIPT],
@@ -917,7 +1138,10 @@ def _retrain(model_dir, refined_path, train_params, log_cb, cancel_flag):
             if cancel_flag.is_set():
                 proc.terminate()
                 return False
-            log_cb("    " + line.rstrip())
+            stripped = line.rstrip()
+            if stripped.startswith("Using device:"):
+                continue
+            log_cb("    " + stripped)
         proc.wait()
         if proc.returncode != 0:
             log_cb(f"  Training exited with code {proc.returncode}")
@@ -977,6 +1201,7 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
             log_cb(f"Phase 1: NN sweep ({params['n_combos']:,} combinations)…")
             sweep_seed_params = dict(params)
             sweep_seed_params["rng_seed"] = 42 + iteration
+            sweep_seed_params["log_header"] = (iteration == 1)
             sweep_result = _nn_sweep(sweep_seed_params, log_cb, cancel_flag)
             if sweep_result is None:
                 log_cb("Cancelled during sweep.")
@@ -990,27 +1215,33 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                 break
 
             top1     = winners[0]
+            _f_op     = top1.get("freq_hz", 0.0)
             _f0_tx    = top1.get("f0_tx_hz", 0.0)
             _f0_rx    = top1.get("f0_rx_hz", 0.0)
             _f_op_lo  = top1.get("f_op_lo_hz", 0.0)
             _zvs_x    = (_f_op_lo / _f0_tx) if _f0_tx > 0 else 0.0
-            _rx_off   = ((_f0_rx - _f_op_lo) / 1e3) if (_f0_rx > 0 and _f_op_lo > 0) else 0.0
+            _rx_off   = ((_f0_rx - _f_op) / 1e3) if (_f0_rx > 0 and _f_op > 0) else 0.0
+            _M_uH     = top1.get("M_uH", 0.0)
+            _k        = top1.get("k", 0.0)
             log_cb(f"\nTop winner: TX {top1['tx_od_mm']:.1f}mm {top1['tx_turns']}t "
                    f"w={top1['tx_width']:.2f}  |  "
                    f"RX {top1['rx_od_mm']:.1f}mm {top1['rx_turns']}t "
                    f"w={top1['rx_width']:.2f} {top1['rx_topology']}")
             log_cb(f"  η={top1['eta_sys']*100:.1f}%  "
+                   f"D@Vmax={min(top1.get('D_vmax', 1.0), 1.0)*100:.0f}%  "
                    f"D@Vmin={min(top1.get('D_vmin', 1.0), 1.0)*100:.0f}%  "
-                   f"V_dc(Vmin,D=1)={top1.get('V_dc_min', 0.0):.2f}V")
+                   f"I_tx_pk@Vmax={top1.get('I_tx_pk_vmax', 0.0)*1000:.0f}mA  "
+                   f"V_dc(Vmin,D=1)={top1.get('V_dc_min', 0.0):.2f}V  "
+                   f"V_Crx_pk={top1.get('V_Crx_pk', 0.0):.0f}V")
             log_cb(f"  L_tx={top1.get('L_tx_uH',0):.2f}µH  "
                    f"L_rx={top1.get('L_rx_uH',0):.2f}µH  "
                    f"C_tx={top1.get('c_tx_nf',0):.1f}nF  "
                    f"C_rx={top1.get('c_rx_nf',0):.1f}nF")
-            log_cb(f"  f0_tx={_f0_tx/1e3:.1f}kHz  f_op_lo={_f_op_lo/1e3:.1f}kHz "
+            log_cb(f"  M={_M_uH:.3f}µH  k={_k:.4f}")
+            log_cb(f"  f_op={_f_op/1e3:.1f}kHz  "
+                   f"f0_tx={_f0_tx/1e3:.1f}kHz  f_op_lo={_f_op_lo/1e3:.1f}kHz "
                    f"(ZVS×{_zvs_x:.2f})  |  "
-                   f"f0_rx={_f0_rx/1e3:.1f}kHz  Δf_rx={_rx_off:+.1f}kHz")
-            log_cb(f"  Top {len(winners)} sent to FastHenry.")
-
+                   f"f0_rx={_f0_rx/1e3:.1f}kHz  Δf_rx(vs f_op)={_rx_off:+.1f}kHz")
             # Check convergence: same winner 3 times in a row
             if prev_winners and _same_config(top1, prev_winners[0]):
                 win_streak += 1
@@ -1023,7 +1254,7 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                 break
 
             # --- FastHenry ---
-            log_cb(f"\nPhase 2: FastHenry ({len(winners)} sims, {fh_workers} workers)…")
+            log_cb(f"\nPhase 2: Running physics simulation on top {len(winners)} results")
             sim_params_list = _build_sim_params(winners, params, fh_timeout)
 
             from parallel_sim import run_batch as _run_batch
@@ -1054,6 +1285,46 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                 done_cb(None)
                 return
 
+        # --- Final sweep with the fully refined model ---
+        log_cb(f"\n{'='*60}")
+        log_cb("FINAL SWEEP (refined model)")
+        log_cb(f"{'='*60}")
+        final_seed_params = dict(params)
+        final_seed_params["rng_seed"] = 42 + max_iters + 1
+        final_result = _nn_sweep(final_seed_params, log_cb, cancel_flag)
+        if final_result is not None and not cancel_flag.is_set():
+            final_winners = _top_k(final_result, tx_topologies, rx_topologies, k=top_k)
+            if final_winners:
+                prev_winners = final_winners
+                top1 = final_winners[0]
+                _f_op    = top1.get("freq_hz", 0.0)
+                _f0_tx   = top1.get("f0_tx_hz", 0.0)
+                _f0_rx   = top1.get("f0_rx_hz", 0.0)
+                _f_op_lo = top1.get("f_op_lo_hz", 0.0)
+                _zvs_x   = (_f_op_lo / _f0_tx) if _f0_tx > 0 else 0.0
+                _rx_off  = ((_f0_rx - _f_op) / 1e3) if (_f0_rx > 0 and _f_op > 0) else 0.0
+                _M_uH    = top1.get("M_uH", 0.0)
+                _k       = top1.get("k", 0.0)
+                log_cb(f"\nFinal top winner: TX {top1['tx_od_mm']:.1f}mm {top1['tx_turns']}t "
+                       f"w={top1['tx_width']:.2f}  |  "
+                       f"RX {top1['rx_od_mm']:.1f}mm {top1['rx_turns']}t "
+                       f"w={top1['rx_width']:.2f} {top1['rx_topology']}")
+                log_cb(f"  η={top1['eta_sys']*100:.1f}%  "
+                       f"D@Vmax={min(top1.get('D_vmax', 1.0), 1.0)*100:.0f}%  "
+                       f"D@Vmin={min(top1.get('D_vmin', 1.0), 1.0)*100:.0f}%  "
+                       f"I_tx_pk@Vmax={top1.get('I_tx_pk_vmax', 0.0)*1000:.0f}mA  "
+                       f"V_dc(Vmin,D=1)={top1.get('V_dc_min', 0.0):.2f}V  "
+                       f"V_Crx_pk={top1.get('V_Crx_pk', 0.0):.0f}V")
+                log_cb(f"  L_tx={top1.get('L_tx_uH',0):.2f}µH  "
+                       f"L_rx={top1.get('L_rx_uH',0):.2f}µH  "
+                       f"C_tx={top1.get('c_tx_nf',0):.1f}nF  "
+                       f"C_rx={top1.get('c_rx_nf',0):.1f}nF")
+                log_cb(f"  M={_M_uH:.3f}µH  k={_k:.4f}")
+                log_cb(f"  f_op={_f_op/1e3:.1f}kHz  "
+                       f"f0_tx={_f0_tx/1e3:.1f}kHz  f_op_lo={_f_op_lo/1e3:.1f}kHz "
+                       f"(ZVS×{_zvs_x:.2f})  |  "
+                       f"f0_rx={_f0_rx/1e3:.1f}kHz  Δf_rx(vs f_op)={_rx_off:+.1f}kHz")
+
         progress_cb(1.0)
         log_cb(f"\nOptimisation complete after {min(iteration, max_iters)} iteration(s).")
         done_cb({"winner": prev_winners[0] if prev_winners else None,
@@ -1071,7 +1342,8 @@ def _same_config(a, b):
             and round(a["rx_od_mm"], 1) == round(b["rx_od_mm"], 1)
             and round(a["tx_width"], 2) == round(b["tx_width"], 2)
             and round(a["rx_width"], 2) == round(b["rx_width"], 2)
-            and a["rx_topology"] == b["rx_topology"])
+            and a["rx_topology"] == b["rx_topology"]
+            and round(a.get("freq_hz", 0.0) / 1e3, 1) == round(b.get("freq_hz", 0.0) / 1e3, 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1090,6 +1362,7 @@ class NNOptimisationTab(ttk.Frame):
         self._last_run_params = {}
         self._domain          = None
         self._build()
+        self.after(100, self._post_build_init)
 
     # ─────────────────────────────────────────────────────────────────────────
     # UI construction
@@ -1125,19 +1398,34 @@ class NNOptimisationTab(ttk.Frame):
         self._rx_od_max = self._row(rx_f, "OD max (mm):", "")
         self._rx_id_min = self._row(rx_f, "ID min (mm):", "")
 
+        # ── RX topology selection ─────────────────────────────────────────────
+        rx_topo_f = ttk.LabelFrame(col_l, text="RX Topologies to Consider")
+        rx_topo_f.pack(fill="x", pady=(0, 6))
+        self._rx_topo_parallel     = tk.BooleanVar(value=True)
+        self._rx_topo_series       = tk.BooleanVar(value=True)
+        self._rx_topo_par_ser_pairs = tk.BooleanVar(value=True)
+        rx_topo_row = ttk.Frame(rx_topo_f)
+        rx_topo_row.pack(anchor="w", padx=6, pady=(4, 4))
+        ttk.Checkbutton(rx_topo_row, text="All Parallel",
+                        variable=self._rx_topo_parallel).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(rx_topo_row, text="All Series",
+                        variable=self._rx_topo_series).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(rx_topo_row, text="Parallel-Series Pairs",
+                        variable=self._rx_topo_par_ser_pairs).pack(side="left")
+
         # ── Ground circle ────────────────────────────────────────────────────
         gc_f = ttk.LabelFrame(col_l, text="Ground Circle")
         gc_f.pack(fill="x", pady=(0, 6))
         self._gc_enabled = tk.BooleanVar(value=DEFAULT_GC_ENABLED)
-        ttk.Checkbutton(gc_f, text="Enable Ground Circle (fixed diameter)",
-                        variable=self._gc_enabled,
-                        command=self._on_gc_toggle).pack(anchor="w", padx=6, pady=(4, 2))
         gc_row = ttk.Frame(gc_f)
-        gc_row.pack(fill="x", padx=6, pady=(0, 4))
-        ttk.Label(gc_row, text="GC diameter (mm):", width=22, anchor="w").pack(side="left")
+        gc_row.pack(fill="x", padx=6, pady=(4, 4))
+        ttk.Checkbutton(gc_row, text="Enable Ground Circle (fixed diameter)",
+                        variable=self._gc_enabled,
+                        command=self._on_gc_toggle).pack(side="left")
         self._gc_dia = tk.StringVar(value="")
+        ttk.Label(gc_row, text="  GC diameter (mm):", anchor="w").pack(side="left")
         self._gc_dia_entry = ttk.Entry(gc_row, textvariable=self._gc_dia, width=8)
-        self._gc_dia_entry.pack(side="left")
+        self._gc_dia_entry.pack(side="left", padx=(2, 0))
         self._on_gc_toggle()
 
         # ── Fixed stackup & PCB gap for this run ─────────────────────────────
@@ -1179,8 +1467,11 @@ class NNOptimisationTab(ttk.Frame):
                   foreground="#1a6fcc", font=("Consolas", 8),
                   wraplength=340, justify="left").pack(side="left", padx=6)
 
-        ttk.Button(col_l, text="Next Tab →  (NN Analysis)",
-                   command=self._on_next_tab_click).pack(fill="x", pady=(0, 6))
+        nav_row = ttk.Frame(col_l); nav_row.pack(fill="x", pady=(0, 6))
+        ttk.Button(nav_row, text="Reset to Defaults",
+                   command=self._on_reset_defaults).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ttk.Button(nav_row, text="Next Tab →  (NN Analysis)",
+                   command=self._on_next_tab_click).pack(side="left", expand=True, fill="x", padx=(3, 0))
 
         log_lf = ttk.LabelFrame(col_l, text="Log")
         log_lf.pack(fill="both", expand=True)
@@ -1200,15 +1491,33 @@ class NNOptimisationTab(ttk.Frame):
         # ── Evaluation parameters ─────────────────────────────────────────────
         ev_f = ttk.LabelFrame(col_r, text="Evaluation Parameters")
         ev_f.pack(fill="x", pady=(0, 6))
-        self._p_target_mw = self._row(ev_f, "Target RX power (mW):", DEFAULT_P_TARGET_MW)
+        self._p_target_mw = self._row_inline(ev_f, "Target RX power (mW):",
+                                             DEFAULT_P_TARGET_MW, "Post Figure LDO Power")
+        self._v_cap_target = self._row(ev_f, "Cap target voltage (V):", DEFAULT_V_CAP_TARGET)
+        ttk.Separator(ev_f, orient="horizontal").pack(fill="x", padx=6, pady=(2, 2))
         self._v_min       = self._row(ev_f, "TX V_min (V):", DEFAULT_V_MIN)
         self._v_max       = self._row(ev_f, "TX V_max (V):", DEFAULT_V_MAX)
+        ttk.Separator(ev_f, orient="horizontal").pack(fill="x", padx=6, pady=(2, 2))
         self._d_min_pct   = self._row(ev_f, "Min duty cycle (%):", DEFAULT_D_MIN_PCT)
-        ttk.Label(ev_f, text="Blank = no minimum duty floor.",
-                  foreground="gray", font=("TkDefaultFont", 8)
+        self._d_max_pct   = self._row(ev_f, "Max duty cycle (%):", DEFAULT_D_MAX_PCT)
+        ttk.Label(ev_f, text="Min@Vmax: power-limiting floor. Max@Vmin: envelope-mod headroom. Blank = no limit.",
+                  foreground="gray", font=("TkDefaultFont", 8),
+                  wraplength=340, justify="left"
+                  ).pack(anchor="w", padx=6, pady=(0, 2))
+        self._freq_min_khz   = self._row(ev_f, "Freq range min (kHz):", DEFAULT_FREQ_MIN_KHZ)
+        self._freq_max_khz   = self._row(ev_f, "Freq range max (kHz):", DEFAULT_FREQ_MAX_KHZ)
+        ttk.Label(ev_f, text="Operating freq range swept at 1 kHz steps. NN queries at domain centre.",
+                  foreground="gray", font=("TkDefaultFont", 8),
+                  wraplength=340, justify="left"
                   ).pack(anchor="w", padx=6, pady=(0, 2))
         self._dither_amp_khz = self._row(ev_f, "Dither amplitude ±(kHz):", DEFAULT_DITHER_AMP_KHZ)
         self._zvs_margin_pct = self._row(ev_f, "ZVS margin (%):", DEFAULT_ZVS_MARGIN_PCT)
+        ttk.Label(ev_f,
+                  text="TX: ZVS gate (f_drive_min > f₀·(1+margin)). "
+                       "RX: closest to series resonance. 0 dither = ZVS disabled.",
+                  foreground="gray", font=("TkDefaultFont", 8),
+                  wraplength=340, justify="left"
+                  ).pack(anchor="w", padx=6, pady=(0, 2))
         _cap_default = ", ".join(f"{c:g}" for c in E_VALUES_NF)
         for _cap_label, _cap_attr in [("TX caps (nF):", "_tx_caps_nf"),
                                        ("RX caps (nF):", "_rx_caps_nf")]:
@@ -1218,12 +1527,7 @@ class NNOptimisationTab(ttk.Frame):
             _cap_var = tk.StringVar(value=_cap_default)
             setattr(self, _cap_attr, _cap_var)
             ttk.Entry(_cap_row, textvariable=_cap_var).pack(side="left", padx=4, fill="x", expand=True)
-        ttk.Label(ev_f,
-                  text="TX: ZVS gate (f_drive_min > f₀·(1+margin)). "
-                       "RX: closest to series resonance. 0 dither = ZVS disabled.",
-                  foreground="gray", font=("TkDefaultFont", 8),
-                  wraplength=340, justify="left"
-                  ).pack(anchor="w", padx=6, pady=(0, 4))
+        self._rx_cap_vrating = self._row(ev_f, "C_rx rated voltage (V):", DEFAULT_RX_CAP_VRATING)
 
         # ── Iteration & sweep settings ────────────────────────────────────────
         it_f = ttk.LabelFrame(col_r, text="Optimisation Settings")
@@ -1237,15 +1541,25 @@ class NNOptimisationTab(ttk.Frame):
         # ── Training hyperparams ──────────────────────────────────────────────
         tr_f = ttk.LabelFrame(col_r, text="Retrain Hyperparameters")
         tr_f.pack(fill="x", pady=(0, 6))
-        self._tr_epochs    = self._row(tr_f, "Epochs:", DEFAULT_TR_EPOCHS)
-        self._tr_batch     = self._row(tr_f, "Batch size:", DEFAULT_TR_BATCH)
-        self._tr_lr        = self._row(tr_f, "LR:", DEFAULT_TR_LR)
-        self._tr_val_split = self._row(tr_f, "Val split:", DEFAULT_TR_VAL_SPLIT)
+        tr_row1 = ttk.Frame(tr_f); tr_row1.pack(fill="x", padx=6, pady=3)
+        ttk.Label(tr_row1, text="Epochs:", width=12, anchor="w").pack(side="left")
+        self._tr_epochs = tk.StringVar(value=DEFAULT_TR_EPOCHS)
+        ttk.Entry(tr_row1, textvariable=self._tr_epochs, width=8).pack(side="left", padx=(0, 12))
+        ttk.Label(tr_row1, text="Batch size:", width=12, anchor="w").pack(side="left")
+        self._tr_batch = tk.StringVar(value=DEFAULT_TR_BATCH)
+        ttk.Entry(tr_row1, textvariable=self._tr_batch, width=8).pack(side="left")
+        tr_row2 = ttk.Frame(tr_f); tr_row2.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(tr_row2, text="LR:", width=12, anchor="w").pack(side="left")
+        self._tr_lr = tk.StringVar(value=DEFAULT_TR_LR)
+        ttk.Entry(tr_row2, textvariable=self._tr_lr, width=8).pack(side="left", padx=(0, 12))
+        ttk.Label(tr_row2, text="Val split:", width=12, anchor="w").pack(side="left")
+        self._tr_val_split = tk.StringVar(value=DEFAULT_TR_VAL_SPLIT)
+        ttk.Entry(tr_row2, textvariable=self._tr_val_split, width=8).pack(side="left")
 
         # ── Control / progress / log ──────────────────────────────────────────
         run_lf = ttk.LabelFrame(col_r, text="Optimisation Control")
         run_lf.pack(fill="x", pady=(0, 6))
-        btn_row = ttk.Frame(run_lf); btn_row.pack(fill="x", padx=6, pady=6)
+        btn_row = ttk.Frame(run_lf); btn_row.pack(fill="x", padx=6, pady=(6, 2))
         self._run_btn = ttk.Button(btn_row, text="▶  Start Optimisation",
                                    command=self._on_run)
         self._run_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
@@ -1263,6 +1577,10 @@ class NNOptimisationTab(ttk.Frame):
                   foreground="gray", wraplength=600, justify="left"
                   ).pack(fill="x", padx=6, pady=(0, 6))
 
+    def _post_build_init(self):
+        self._restore_from_savestate()
+        for _, _var in self._savestate_vars():
+            _var.trace_add("write", lambda *_, s=self: s._save_state())
 
     # ── Widget helpers ────────────────────────────────────────────────────────
 
@@ -1272,6 +1590,16 @@ class NNOptimisationTab(ttk.Frame):
         ttk.Label(row, text=label, width=label_width, anchor="w").pack(side="left")
         var = tk.StringVar(value=default)
         ttk.Entry(row, textvariable=var, width=10).pack(side="left", padx=4)
+        return var
+
+    def _row_inline(self, parent, label, default, inline_text, label_width=24):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=6, pady=3)
+        ttk.Label(row, text=label, width=label_width, anchor="w").pack(side="left")
+        var = tk.StringVar(value=default)
+        ttk.Entry(row, textvariable=var, width=10).pack(side="left", padx=4)
+        ttk.Label(row, text=inline_text,
+                  foreground="gray", font=("TkDefaultFont", 8)).pack(side="left", padx=(4, 0))
         return var
 
     def _bind_cap(self, var, coil, key, is_min=False):
@@ -1382,6 +1710,115 @@ class NNOptimisationTab(ttk.Frame):
         except Exception:
             pass
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Savestate
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _savestate_vars(self):
+        """Return list of (key, StringVar/BooleanVar) pairs for all persistent inputs."""
+        return [
+            ("p_target_mw",     self._p_target_mw),
+            ("v_cap_target",    self._v_cap_target),
+            ("rx_cap_vrating",  self._rx_cap_vrating),
+            ("v_min",           self._v_min),
+            ("v_max",           self._v_max),
+            ("d_min_pct",       self._d_min_pct),
+            ("d_max_pct",       self._d_max_pct),
+            ("freq_min_khz",    self._freq_min_khz),
+            ("freq_max_khz",    self._freq_max_khz),
+            ("dither_amp_khz",  self._dither_amp_khz),
+            ("zvs_margin_pct",  self._zvs_margin_pct),
+            ("tx_caps_nf",      self._tx_caps_nf),
+            ("rx_caps_nf",      self._rx_caps_nf),
+            ("n_combos",        self._n_combos),
+            ("max_iters",       self._max_iters),
+            ("top_k",           self._top_k),
+            ("fh_workers",      self._fh_workers),
+            ("fh_timeout",      self._fh_timeout),
+            ("tr_epochs",       self._tr_epochs),
+            ("tr_batch",        self._tr_batch),
+            ("tr_lr",           self._tr_lr),
+            ("tr_val_split",    self._tr_val_split),
+            ("pcb_gap_mm",      self._pcb_gap_mm),
+            ("gc_enabled",      self._gc_enabled),
+            ("gc_dia",          self._gc_dia),
+            ("tx_od_max",       self._tx_od_max),
+            ("tx_id_min",       self._tx_id_min),
+            ("rx_od_max",       self._rx_od_max),
+            ("rx_id_min",       self._rx_id_min),
+            ("rx_topo_parallel",      self._rx_topo_parallel),
+            ("rx_topo_series",        self._rx_topo_series),
+            ("rx_topo_par_ser_pairs", self._rx_topo_par_ser_pairs),
+        ] + [(f"tx_oz_{i}", self._tx_oz_vars[i]) for i in range(4)] \
+          + [(f"rx_oz_{i}", self._rx_oz_vars[i]) for i in range(4)]
+
+    def _save_state(self):
+        if self.app is None:
+            return
+        st = {}
+        for key, var in self._savestate_vars():
+            st[key] = var.get()
+        self.app.persist_nn_optim_tab(st)
+
+    def _restore_from_savestate(self):
+        if self.app is None:
+            return
+        st = self.app.load_nn_optim_tab_state()
+        if not st:
+            return
+        try:
+            for key, var in self._savestate_vars():
+                if key in st:
+                    var.set(st[key])
+        except Exception:
+            pass
+        self._on_gc_toggle()
+
+    def _on_reset_defaults(self):
+        _cap_default = ", ".join(f"{c:g}" for c in E_VALUES_NF)
+        defaults = {
+            "p_target_mw":     DEFAULT_P_TARGET_MW,
+            "v_cap_target":    DEFAULT_V_CAP_TARGET,
+            "rx_cap_vrating":  DEFAULT_RX_CAP_VRATING,
+            "v_min":           DEFAULT_V_MIN,
+            "v_max":           DEFAULT_V_MAX,
+            "d_min_pct":       DEFAULT_D_MIN_PCT,
+            "d_max_pct":       DEFAULT_D_MAX_PCT,
+            "freq_min_khz":    DEFAULT_FREQ_MIN_KHZ,
+            "freq_max_khz":    DEFAULT_FREQ_MAX_KHZ,
+            "dither_amp_khz":  DEFAULT_DITHER_AMP_KHZ,
+            "zvs_margin_pct":  DEFAULT_ZVS_MARGIN_PCT,
+            "tx_caps_nf":      _cap_default,
+            "rx_caps_nf":      _cap_default,
+            "n_combos":        DEFAULT_N_COMBOS_M,
+            "max_iters":       DEFAULT_MAX_ITERS,
+            "top_k":           DEFAULT_TOP_K,
+            "fh_workers":      DEFAULT_FH_WORKERS,
+            "fh_timeout":      DEFAULT_FH_TIMEOUT_S,
+            "tr_epochs":       DEFAULT_TR_EPOCHS,
+            "tr_batch":        DEFAULT_TR_BATCH,
+            "tr_lr":           DEFAULT_TR_LR,
+            "tr_val_split":    DEFAULT_TR_VAL_SPLIT,
+            "pcb_gap_mm":      DEFAULT_PCB_GAP_MM,
+            "gc_enabled":      DEFAULT_GC_ENABLED,
+            "gc_dia":          "",
+            "tx_od_max":       "",
+            "tx_id_min":       "",
+            "rx_od_max":       "",
+            "rx_id_min":       "",
+            "rx_topo_parallel":      True,
+            "rx_topo_series":        True,
+            "rx_topo_par_ser_pairs": True,
+        }
+        for i in range(4):
+            defaults[f"tx_oz_{i}"] = DEFAULT_TX_LAYER_OZ[i]
+            defaults[f"rx_oz_{i}"] = DEFAULT_RX_LAYER_OZ[i]
+        for key, var in self._savestate_vars():
+            if key in defaults:
+                var.set(defaults[key])
+        self._on_gc_toggle()
+        self._save_state()
+
     def _get_model_dir(self) -> str:
         if self.app is not None and hasattr(self.app, "auto_tab"):
             return self.app.auto_tab.get_model_folder()
@@ -1484,7 +1921,16 @@ class NNOptimisationTab(ttk.Frame):
         dom_tx_turns  = tx.get("turns", [3, 99])
         dom_rx_turns  = rx.get("turns", [3, 99])
         dom_freq      = glb.get("freq_hz", [340000.0, 380000.0])
-        rx_topos      = rx.get("allowed_topologies") or ["parallel", "series", "parallel_pairs_ser"]
+        rx_topos_dom  = rx.get("allowed_topologies") or ["parallel", "series", "parallel_pairs_ser"]
+        _rx_topo_map  = [
+            ("parallel",          self._rx_topo_parallel),
+            ("series",            self._rx_topo_series),
+            ("parallel_pairs_ser", self._rx_topo_par_ser_pairs),
+        ]
+        rx_topos = [t for t, var in _rx_topo_map if var.get() and t in rx_topos_dom]
+        if not rx_topos:
+            raise ValueError(
+                "At least one RX topology must be selected.")
 
         tx_od_max = min(flt(self._tx_od_max, "TX OD max", lo=10.0), dom_tx_od_max)
         tx_id_min = max(flt(self._tx_id_min, "TX ID min", lo=0.0), dom_tx_id_min)
@@ -1499,11 +1945,24 @@ class NNOptimisationTab(ttk.Frame):
         gc_enabled = self._gc_enabled.get()
         gc_dia_mm  = flt(self._gc_dia, "GC diameter", lo=0.0) if gc_enabled else 0.0
 
-        p_target_w = flt(self._p_target_mw, "Target RX power", lo=0.001) / 1000.0
-        v_min      = flt(self._v_min, "V_min", lo=0.1)
-        v_max      = flt(self._v_max, "V_max", lo=v_min)
+        p_target_w     = flt(self._p_target_mw, "Target RX power", lo=0.001) / 1000.0
+        v_cap_target_dc  = flt(self._v_cap_target,   "Cap target voltage",
+                               lo=_V_MIN_INDUCED_DC, hi=_V_ZENER_DC)
+        v_rx_cap_rating  = flt(self._rx_cap_vrating, "C_rx rated voltage", lo=5.0, hi=1000.0)
+        v_min          = flt(self._v_min, "V_min", lo=0.1)
+        v_max          = flt(self._v_max, "V_max", lo=v_min)
         d_min_pct  = flt(self._d_min_pct, "Min duty %", lo=0.0, allow_empty=True)
         d_min      = d_min_pct / 100.0
+        d_max_pct  = flt(self._d_max_pct, "Max duty %", lo=0.0, hi=100.0, allow_empty=True)
+        d_max      = (d_max_pct / 100.0) if d_max_pct < 100.0 else 1.0
+
+        # User-specified operating frequency range (independent of training domain).
+        # The NN is always queried at freq_ref_hz = centre of dom_freq (training freq).
+        # The sweep runs at 1 kHz steps between freq_min_hz and freq_max_hz.
+        freq_min_hz = flt(self._freq_min_khz, "Freq min", lo=1.0) * 1e3
+        freq_max_hz = flt(self._freq_max_khz, "Freq max", lo=freq_min_hz / 1e3) * 1e3
+        if freq_max_hz <= freq_min_hz:
+            raise ValueError("Freq range max must be > min.")
 
         def _parse_cap_list(var, name):
             opts = []
@@ -1582,10 +2041,15 @@ class NNOptimisationTab(ttk.Frame):
             rx_turns_min=dom_rx_turns[0],
             tx_topologies=tx_topos_dom,
             rx_topologies=rx_topos,
-            freq_min_hz=dom_freq[0], freq_max_hz=dom_freq[1],
+            freq_min_hz=freq_min_hz, freq_max_hz=freq_max_hz,
+            freq_ref_hz=round(_snap(0.5 * (dom_freq[0] + dom_freq[1]),
+                                   _GRID_FREQ_HZ_STEP), 1),
             gc_enabled=gc_enabled, gc_dia_mm=gc_dia_mm,
             p_target_w=p_target_w, v_min=v_min, v_max=v_max,
-            d_min=d_min,
+            v_cap_target_dc=v_cap_target_dc,
+            v_ldo_out=_V_LDO_OUT,
+            v_rx_cap_rating=v_rx_cap_rating,
+            d_min=d_min, d_max=d_max,
             c_tx_options_f=c_tx_options_f,
             c_rx_options_f=c_rx_options_f,
             dither_amp_hz=dither_amp_hz,
@@ -1707,8 +2171,10 @@ class NNOptimisationTab(ttk.Frame):
 
     def _log_append(self, msg):
         self._log_text.configure(state="normal")
+        at_end = self._log_text.yview()[1] >= 0.999
         self._log_text.insert("end", msg + "\n")
-        self._log_text.see("end")
+        if at_end:
+            self._log_text.see("end")
         self._log_text.configure(state="disabled")
 
     def _set_status(self, msg, color="gray"):

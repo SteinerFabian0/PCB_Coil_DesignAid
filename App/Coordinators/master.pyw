@@ -193,6 +193,13 @@ class CoilApp(tk.Tk):
     def load_nn_setup_folder(self) -> str:
         return self._state.get("nn_setup", {}).get("folder", "")
 
+    def persist_nn_optim_tab(self, state_dict):
+        self._state.setdefault("nn_optim", {}).update(state_dict)
+        savestate.save(PROJECT_ROOT, self._state)
+
+    def load_nn_optim_tab_state(self):
+        return self._state.get("nn_optim", {})
+
     def set_nn_optim_tab_visible(self, visible: bool):
         """Show or hide (disable) the NN Optimisation tab."""
         try:

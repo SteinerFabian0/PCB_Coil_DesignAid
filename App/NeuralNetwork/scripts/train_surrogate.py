@@ -45,7 +45,7 @@ BATCH_SIZE  = int(os.environ.get("SURROGATE_BATCH_SIZE", "128"))
 LR          = float(os.environ.get("SURROGATE_LR",       "1e-3"))
 VAL_SPLIT   = float(os.environ.get("SURROGATE_VAL_SPLIT", "0.20"))
 RANDOM_SEED = 42
-PRINT_EVERY = max(1, EPOCHS // 20)
+PRINT_EVERY = 50
 
 # Numeric input columns — every entry must be linearly independent of the
 # rest and present (or derivable) in each simulation record. Constant columns
@@ -195,10 +195,10 @@ class CoilSurrogateNN(nn.Module):
 # 4. Training loop
 # ---------------------------------------------------------------------------
 
-def make_loader(X, y, batch_size: int, shuffle: bool) -> DataLoader:
+def make_loader(X, y, batch_size: int, shuffle: bool, drop_last: bool = False) -> DataLoader:
     X_t = torch.tensor(X, dtype=torch.float32)
     y_t = torch.tensor(y, dtype=torch.float32)
-    return DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=shuffle)
+    return DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=shuffle, drop_last=drop_last)
 
 
 def train(model, train_loader, val_loader, device):
@@ -279,10 +279,7 @@ def save_artifacts(model, x_scaler, y_scaler, train_losses, val_losses):
     plt.savefig(plot_path, dpi=150)
     plt.close()
 
-    print(f"\nSaved model    -> {model_path}")
-    print(f"Saved x_scaler -> {x_scaler_path}")
-    print(f"Saved y_scaler -> {y_scaler_path}")
-    print(f"Saved plot     -> {plot_path}")
+    print("\nTraining complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +299,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {total_params:,} parameters  |  Input dim: {n_inputs}\n")
 
-    train_loader = make_loader(X_train, y_train, BATCH_SIZE, shuffle=True)
+    train_loader = make_loader(X_train, y_train, BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader   = make_loader(X_val,   y_val,   BATCH_SIZE, shuffle=False)
 
     print(f"Training {EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}\n")
