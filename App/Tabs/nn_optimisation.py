@@ -16,6 +16,7 @@ Domain bounds are read from the selected model's domain.json.
 User inputs on the left narrow the domain further.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -60,7 +61,7 @@ DEFAULT_TOP_K          = "30"
 DEFAULT_FH_WORKERS     = "15"
 DEFAULT_FH_TIMEOUT_S   = "360"
 DEFAULT_TR_EPOCHS    = "300"
-DEFAULT_TR_BATCH     = "256"
+DEFAULT_TR_BATCH     = "1024"   # bigger batches saturate the 4070 Ti and cut DataLoader overhead
 DEFAULT_TR_LR        = "0.0005"
 DEFAULT_TR_VAL_SPLIT = "0.2"
 
@@ -167,165 +168,134 @@ def _load_nn(model_dir):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Vectorised physics evaluation (mirrors nn_analysis_tab logic)
+# Vectorised physics evaluation (GPU broadcast — geometry × cap pair)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _score_batch(L_tx, L_rx, M, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
-                 C_tx, C_rx,
-                 freq_ref_hz, freq_hz, f_drive_min_hz, f_drive_max_hz,
+def _score_torch(L_tx_uH, L_rx_uH, M_uH, R_tx_nn, R_rx_nn, DCR_tx, DCR_rx,
+                 C_tx, C_rx, omega,
+                 f_drive_min_hz, f_drive_max_hz,
                  V_min, V_max, P_target_w, D_min,
-                 zvs_margin, V_min_induced_dc, V_zener_dc):
+                 zvs_margin, V_min_induced_dc, V_zener_dc, torch):
     """
-    Returns (eta_sys, feasible, D_vmin, V_dc_min, f0_tx_hz, f0_rx_hz, f_op_lo_hz).
+    GPU port of the CPU `_score_batch`.  Geometry-only quantities are computed
+    as (bs_v,) tensors; quantities depending on the cap pair are broadcast to
+    (bs_v, n_pairs) via .unsqueeze().  All math is float32.
 
-    Control model:
-      • At heavy load (V_min) the controller drives near f0_tx, just enough above
-        to maintain ZVS — small *operational* margin, not the full safety margin.
-        Gates and ranking use matched-load values at this op point.
-      • At light load (V_max) the controller can detune to f_drive_max to throttle.
-        TX-tank power gain G(f) = 1 / (1 + (Q_tx · (f/f0 - f0/f))²) reduces P,
-        giving the system room to back off without violating duty floor.
-
-    The user-set zvs_margin is treated as a *feasibility safety buffer* — the
-    combo must support ZVS across the full sweep with that margin — but the
-    heavy-load steady-state op point is assumed close to matched-load.
-
-    Hard gates:
-      • ZVS:       f_drive_min ≥ f0_tx · (1 + zvs_margin)
-      • P_min:     P_matched(V_min) ≥ P_target
-      • P_max:     P_matched(V_max) · G_min_tx · D_min ≤ P_target
-                   (light-load throttle via detuning + duty)
-      • V_floor:   V_pk_matched(V_min) − V_drop ≥ V_min_induced_dc
-
-    eta_sys (ranking metric, at heavy-load matched-load):
-      eta_link · eta_rect_matched · zener_clip(V_dc_min) · detune_rx(f_drive_min)
-
-    The zener clip term penalises designs whose natural V_dc exceeds the
-    6.8 V TVS rail — that excess is dumped to ground as heat, not useful
-    power, and has to be reflected in the ranking.
+    Inputs (all GPU tensors unless noted):
+      L_tx_uH, L_rx_uH, M_uH : (bs_v,)   µH
+      R_tx_nn, R_rx_nn       : (bs_v,)   Ω  (network output)
+      DCR_tx, DCR_rx         : (bs_v,)   Ω
+      C_tx, C_rx             : (n_pairs,) F
+      omega                  : 2π · freq_ref_hz (Python float)
+    Returns:
+      eta_2d      : (bs_v, n_pairs) ranking metric (pre-feasibility mask)
+      feasible_2d : (bs_v, n_pairs) bool
+      D_vmin      : (bs_v,)
+      V_dc_min    : (bs_v,) — zener-clamped
+      f0_tx_2d    : (bs_v, n_pairs)
+      f0_rx_2d    : (bs_v, n_pairs)
     """
-    omega   = 2.0 * math.pi * freq_hz
-    skin_sc = math.sqrt(freq_hz / freq_ref_hz)
+    pi = math.pi
 
-    L_tx = np.maximum(L_tx.astype(np.float64) * 1e-6, 1e-9)
-    L_rx = np.maximum(L_rx.astype(np.float64) * 1e-6, 1e-9)
-    M    = np.maximum(M.astype(np.float64)    * 1e-6, 0.0)
-    C_tx = np.maximum(np.asarray(C_tx, dtype=np.float64), 1e-15)
-    C_rx = np.maximum(np.asarray(C_rx, dtype=np.float64), 1e-15)
+    L_tx = torch.clamp(L_tx_uH * 1e-6, min=1e-9)
+    L_rx = torch.clamp(L_rx_uH * 1e-6, min=1e-9)
+    M    = torch.clamp(M_uH    * 1e-6, min=0.0)
 
-    R_tx_ac = DCR_tx.astype(np.float64) + np.maximum(
-        0.0, R_tx_nn.astype(np.float64) - DCR_tx.astype(np.float64)) * skin_sc
-    R_rx_ac = DCR_rx.astype(np.float64) + np.maximum(
-        0.0, R_rx_nn.astype(np.float64) - DCR_rx.astype(np.float64)) * skin_sc
+    # Caller passes freq_hz == freq_ref_hz at this site, so skin_sc = 1 and
+    # the skin-scaling term collapses to the original AC-R model.
+    R_tx_ac = DCR_tx + torch.clamp(R_tx_nn - DCR_tx, min=0.0)
+    R_rx_ac = DCR_rx + torch.clamp(R_rx_nn - DCR_rx, min=0.0)
 
-    Q_tx = omega * L_tx / np.maximum(R_tx_ac, 1e-12)
-    Q_rx = omega * L_rx / np.maximum(R_rx_ac, 1e-12)
-    k    = np.clip(M / np.sqrt(L_tx * L_rx), 0.0, 1.0)
-    U    = k * np.sqrt(np.maximum(Q_tx * Q_rx, 0.0))
+    Q_tx = omega * L_tx / torch.clamp(R_tx_ac, min=1e-12)
+    Q_rx = omega * L_rx / torch.clamp(R_rx_ac, min=1e-12)
+    k    = torch.clamp(M / torch.sqrt(L_tx * L_rx), 0.0, 1.0)
+    U    = k * torch.sqrt(torch.clamp(Q_tx * Q_rx, min=0.0))
 
-    sq       = np.sqrt(1.0 + U * U)
-    eta_link = U * U / np.maximum((1.0 + sq) ** 2, 1e-18)
-    Z_tx_opt = np.maximum(R_tx_ac * sq, 1e-12)
+    sq        = torch.sqrt(1.0 + U * U)
+    eta_link  = U * U / torch.clamp((1.0 + sq) ** 2, min=1e-18)
+    Z_tx_opt  = torch.clamp(R_tx_ac * sq, min=1e-12)
+    sq_p1_inv = 1.0 / torch.clamp(1.0 + sq, min=1e-12)
+    R_ratio   = torch.sqrt(torch.clamp(R_rx_ac / torch.clamp(R_tx_ac, min=1e-12), min=0.0))
 
-    # ── Resonances (per-row, given the sampled C_tx, C_rx) ────────────────
-    f0_tx = 1.0 / (2.0 * math.pi * np.sqrt(L_tx * C_tx))
-    f0_rx = 1.0 / (2.0 * math.pi * np.sqrt(L_rx * C_rx))
+    # Resonances (broadcast L (bs_v,1) × C (1,n_pairs) → (bs_v, n_pairs))
+    L_tx_2  = L_tx.unsqueeze(1)
+    L_rx_2  = L_rx.unsqueeze(1)
+    C_tx_2  = C_tx.unsqueeze(0)
+    C_rx_2  = C_rx.unsqueeze(0)
+    f0_tx_2d = 1.0 / (2.0 * pi * torch.sqrt(L_tx_2 * C_tx_2))
+    f0_rx_2d = 1.0 / (2.0 * pi * torch.sqrt(L_rx_2 * C_rx_2))
 
-    # ── ZVS feasibility (safety-margin gate) ──────────────────────────────
-    zvs_ok  = f_drive_min_hz >= f0_tx * (1.0 + zvs_margin)
+    zvs_ok = f_drive_min_hz >= f0_tx_2d * (1.0 + zvs_margin)
 
-    # ── Light-load detune for throttling (drive at top of sweep) ──────────
-    f_op_hi = f_drive_max_hz
-    x_hi    = f_op_hi / f0_tx - f0_tx / f_op_hi
-    G_tx_min = 1.0 / (1.0 + (Q_tx * x_hi) ** 2)   # min gain at light load
+    x_hi     = f_drive_max_hz / f0_tx_2d - f0_tx_2d / f_drive_max_hz
+    G_tx_min = 1.0 / (1.0 + (Q_tx.unsqueeze(1) * x_hi) ** 2)
 
-    # Heavy-load reporting frequency = bottom of sweep (where controller
-    # operates for max gain). Used for RX detune calc and diagnostics.
-    f_op_lo = np.full_like(f0_tx, f_drive_min_hz)
+    V_rms_min = V_min * (math.sqrt(2.0) / pi)
+    V_rms_max = V_max * (math.sqrt(2.0) / pi)
 
-    V_rms_min = V_min * math.sqrt(2.0) / math.pi
-    V_rms_max = V_max * math.sqrt(2.0) / math.pi
-
-    # Matched-load reference (heavy-load assumption).
-    P_rx_min_m = eta_link * (V_rms_min ** 2) / Z_tx_opt
+    P_rx_min_m = eta_link * (V_rms_min ** 2) / Z_tx_opt                  # (bs_v,)
     P_rx_max_m = eta_link * (V_rms_max ** 2) / Z_tx_opt
 
-    R_ratio = np.sqrt(np.maximum(R_rx_ac / np.maximum(R_tx_ac, 1e-12), 0.0))
+    V_pk_min_m  = U * V_rms_min * R_ratio * sq_p1_inv * math.sqrt(2.0)   # (bs_v,)
+    V_pk_max_m  = U * V_rms_max * R_ratio * sq_p1_inv * math.sqrt(2.0)
+    V_pk_max_op = V_pk_max_m.unsqueeze(1) * torch.sqrt(G_tx_min)         # (bs_v, n_pairs)
 
-    def _v_pk_matched(V_rms):
-        return (U * V_rms * R_ratio
-                / np.maximum(1.0 + sq, 1e-12) * math.sqrt(2.0))
+    V_dc_min_m  = torch.clamp(V_pk_min_m  - _V_DROP, min=0.0)            # (bs_v,)
+    V_dc_max_op = torch.clamp(V_pk_max_op - _V_DROP, min=0.0)            # (bs_v, n_pairs)
 
-    V_pk_min_m = _v_pk_matched(V_rms_min)        # heavy load, matched
-    V_pk_max_m = _v_pk_matched(V_rms_max)        # light load, matched
-    V_pk_max_op = V_pk_max_m * np.sqrt(G_tx_min)  # light load with detune throttle
+    eta_rect_min = torch.where(V_pk_min_m > _V_DROP,
+                               V_dc_min_m  / torch.clamp(V_pk_min_m,  min=1e-12),
+                               torch.zeros_like(V_pk_min_m))
+    eta_rect_max = torch.where(V_pk_max_op > _V_DROP,
+                               V_dc_max_op / torch.clamp(V_pk_max_op, min=1e-12),
+                               torch.zeros_like(V_pk_max_op))
 
-    V_dc_min_m  = np.maximum(V_pk_min_m  - _V_DROP, 0.0)
-    V_dc_max_op = np.maximum(V_pk_max_op - _V_DROP, 0.0)
+    P_dc_min    = P_rx_min_m * eta_rect_min                              # (bs_v,)
+    P_dc_max_op = P_rx_max_m.unsqueeze(1) * G_tx_min * eta_rect_max      # (bs_v, n_pairs)
 
-    eta_rect_min = np.where(V_pk_min_m > _V_DROP,
-                            V_dc_min_m / np.maximum(V_pk_min_m, 1e-12), 0.0)
-    eta_rect_max = np.where(V_pk_max_op > _V_DROP,
-                            V_dc_max_op / np.maximum(V_pk_max_op, 1e-12), 0.0)
+    # Zener clamp on the RX cap rail (6.8 V TVS): excess natural V_dc is shed
+    # to ground via the TVS, so useful DC power scales by V_zener/V_dc_natural.
+    zener_clip_min = torch.where(V_dc_min_m  > V_zener_dc,
+                                 V_zener_dc / torch.clamp(V_dc_min_m,  min=1e-12),
+                                 torch.ones_like(V_dc_min_m))
+    zener_clip_max = torch.where(V_dc_max_op > V_zener_dc,
+                                 V_zener_dc / torch.clamp(V_dc_max_op, min=1e-12),
+                                 torch.ones_like(V_dc_max_op))
 
-    P_dc_min   = P_rx_min_m * eta_rect_min                # max at V_min (matched)
-    P_dc_max_op = P_rx_max_m * G_tx_min * eta_rect_max    # min at V_max (detuned)
+    P_dc_min_eff    = P_dc_min    * zener_clip_min                       # (bs_v,)
+    P_dc_max_op_eff = P_dc_max_op * zener_clip_max                       # (bs_v, n_pairs)
 
-    # ── Zener clamp (6.8 V TVS to ground on RX cap) ──────────────────────
-    # When the natural rectified V_dc exceeds V_zener, the TVS shunts the
-    # excess current to ground at V=V_zener.  The cap voltage is held at
-    # V_zener, so:
-    #   • useful DC power into the load = V_zener · I_dc_natural
-    #     ≈ P_dc_natural · (V_zener / V_dc_natural)   (current-source-like)
-    #   • the (1 − V_zener / V_dc_natural) fraction is wasted as heat in
-    #     the TVS — that has to flow into the system efficiency.
-    # This applies at BOTH the heavy- and light-load op points.  Without
-    # this, designs that produce huge V_dc (e.g. 16 V into a 6.8 V rail)
-    # were ranked as if all that voltage were useful.
-    zener_clip_min = np.where(V_dc_min_m  > V_zener_dc,
-                              V_zener_dc / np.maximum(V_dc_min_m,  1e-12), 1.0)
-    zener_clip_max = np.where(V_dc_max_op > V_zener_dc,
-                              V_zener_dc / np.maximum(V_dc_max_op, 1e-12), 1.0)
+    inf_t = torch.full_like(P_dc_min_eff, float("inf"))
+    D_vmin = torch.where(P_dc_min_eff > 1e-18, P_target_w / P_dc_min_eff, inf_t)
 
-    # Effective DC power delivered to the load after the zener clamp.
-    P_dc_min_eff    = P_dc_min    * zener_clip_min
-    P_dc_max_op_eff = P_dc_max_op * zener_clip_max
-
-    # D_vmin and feasibility gates use the *post-clamp* deliverable power:
-    # if the clamp is the only thing that lets the design be "in spec",
-    # we still have to supply the load below the clamp, so the
-    # P_dc that matters is the clamped value.
-    D_vmin = np.where(P_dc_min_eff > 1e-18, P_target_w / P_dc_min_eff, np.inf)
-
-    # ── Hard gates ────────────────────────────────────────────────────────
     pmin_ok = P_dc_min_eff >= P_target_w
     if D_min > 0.0:
         pmax_ok = P_dc_max_op_eff * D_min <= P_target_w
     else:
-        pmax_ok = np.ones_like(P_dc_min, dtype=bool)
-    # V_floor uses the clamped cap voltage (whichever is lower).
-    V_dc_min_eff = np.minimum(V_dc_min_m, V_zener_dc)
+        pmax_ok = torch.ones_like(P_dc_max_op_eff, dtype=torch.bool)
+
+    V_dc_min_eff = torch.minimum(V_dc_min_m,
+                                 torch.full_like(V_dc_min_m, V_zener_dc))
     vfloor_ok = V_dc_min_eff >= V_min_induced_dc
 
-    feasible = (zvs_ok & pmin_ok & pmax_ok & vfloor_ok
-                & (R_tx_ac > 0) & (R_rx_ac > 0) & (M > 0))
+    feasible_2d = (zvs_ok
+                   & pmin_ok.unsqueeze(1)
+                   & pmax_ok
+                   & vfloor_ok.unsqueeze(1)
+                   & (R_tx_ac > 0).unsqueeze(1)
+                   & (R_rx_ac > 0).unsqueeze(1)
+                   & (M > 0).unsqueeze(1))
 
-    # ── RX detune at the heavy-load drive frequency ──────────────────────
-    f0_rx_safe = np.maximum(f0_rx, 1.0)
-    x_rx       = f_op_lo / f0_rx_safe - f0_rx_safe / f_op_lo
-    detune_rx  = 1.0 / (1.0 + (Q_rx * x_rx) ** 2)
+    f0_rx_safe = torch.clamp(f0_rx_2d, min=1.0)
+    x_rx       = f_drive_min_hz / f0_rx_safe - f0_rx_safe / f_drive_min_hz
+    detune_rx  = 1.0 / (1.0 + (Q_rx.unsqueeze(1) * x_rx) ** 2)
 
-    # System efficiency at the heavy-load op point (this is the ranking
-    # metric — high V_dc designs get docked the same as low-V designs).
-    eta_sys = eta_link * eta_rect_min * zener_clip_min * detune_rx
+    eta_2d = (eta_link.unsqueeze(1)
+              * eta_rect_min.unsqueeze(1)
+              * zener_clip_min.unsqueeze(1)
+              * detune_rx)
 
-    return (eta_sys.astype(np.float32),
-            feasible,
-            D_vmin.astype(np.float32),
-            V_dc_min_eff.astype(np.float32),
-            f0_tx.astype(np.float32),
-            f0_rx.astype(np.float32),
-            f_op_lo.astype(np.float32))
+    return eta_2d, feasible_2d, D_vmin, V_dc_min_eff, f0_tx_2d, f0_rx_2d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,14 +340,20 @@ def _rx_h_total_for_topology(topology: str, h_per_layer_m: list) -> float:
 
 def _nn_sweep(params, log_cb, cancel_flag):
     """
-    Sample N combinations, evaluate via NN, score with physics kernel.
-    Returns dict of accumulator arrays for downstream ranking.
+    GPU-resident sweep:
+      • Geometry sampling stays on CPU (numpy — fast at this size).
+      • NN inference + scaling + feasibility scoring all run on GPU.
+      • Per-batch torch.topk merges into a running K-buffer, so total memory
+        stays O(K) instead of O(N) — no end-of-sweep concatenate over millions.
+      • AMP autocast (fp16 forward, fp32 master) on CUDA.
 
     All sampled geometry / frequency values are snapped to the physical grid
     before NN evaluation so the surrogate, the FastHenry refinement step,
     and the saved refined entries all agree on the same realisable values.
+
+    Returns a dict of numpy arrays in the same schema downstream code expects.
     """
-    model_dir    = params["model_dir"]
+    model_dir = params["model_dir"]
     model, x_scaler, y_scaler, feat_cols, torch, device = _load_nn(model_dir)
 
     if not feat_cols:
@@ -385,6 +361,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
             "Surrogate scaler has no feature_names_in_; retrain with the new "
             "trainer so the inference path can match the training schema.")
 
+    # ── Pull params ───────────────────────────────────────────────────────
     tx_od_max    = params["tx_od_max"]
     tx_id_min    = params["tx_id_min"]
     tx_width_min = params["tx_width_min"]
@@ -402,27 +379,24 @@ def _nn_sweep(params, log_cb, cancel_flag):
     n_tx_topos    = len(tx_topologies)
     n_rx_topos    = len(rx_topologies)
 
-    gc_enabled  = params["gc_enabled"]
-    gc_dia_mm   = round(_snap(params["gc_dia_mm"], _GRID_OD_MM_STEP), 4)
+    gc_enabled = params["gc_enabled"]
+    gc_dia_mm  = round(_snap(params["gc_dia_mm"], _GRID_OD_MM_STEP), 4)
+    gc_val     = float(gc_dia_mm if gc_enabled else 0.0)
 
     freq_min_hz = params["freq_min_hz"]
     freq_max_hz = params["freq_max_hz"]
     freq_ref_hz = round(_snap(0.5 * (freq_min_hz + freq_max_hz),
                               _GRID_FREQ_HZ_STEP), 1)
 
-    V_min      = params["v_min"]
-    V_max      = params["v_max"]
-    P_target   = params["p_target_w"]
-    D_min      = params["d_min"]
+    V_min    = params["v_min"]
+    V_max    = params["v_max"]
+    P_target = params["p_target_w"]
+    D_min    = params["d_min"]
 
-    # Run-fixed stackup constants (also used as NN inputs).
-    pcb_gap_mm     = float(params["pcb_gap_mm"])
-    tx_oz_layers   = list(params["tx_oz_per_layer"])
-    rx_oz_layers   = list(params["rx_oz_per_layer"])
-    tx_layers_full = list(params["tx_layers"])
-    rx_layers_full = list(params["rx_layers"])
+    pcb_gap_mm   = float(params["pcb_gap_mm"])
+    tx_oz_layers = list(params["tx_oz_per_layer"])
+    rx_oz_layers = list(params["rx_oz_per_layer"])
 
-    # Pull port_inside choices from domain (boolean field; sample if both allowed).
     domain = params.get("domain", {}) or {}
     tx_dom = domain.get("tx", {})
     rx_dom = domain.get("rx", {})
@@ -434,22 +408,14 @@ def _nn_sweep(params, log_cb, cancel_flag):
     tx_port_choices = _port_choices(tx_dom)
     rx_port_choices = _port_choices(rx_dom)
 
-    # Per-side per-layer copper thickness in metres (zero where inactive).
     tx_h_layers_m = [oz * _OZ_MM * 1e-3 for oz in tx_oz_layers]
     rx_h_layers_m = [oz * _OZ_MM * 1e-3 for oz in rx_oz_layers]
     tx_h_total_m  = sum(h for h in tx_h_layers_m if h > 0) or 1e-9
-
-    # Per-RX-topology effective copper height for DCR.
     rx_h_eff_per_topo = {
         t: _rx_h_total_for_topology(t, rx_h_layers_m) for t in rx_topologies
     }
 
-    log_cb(f"  NN features ({len(feat_cols)}): {feat_cols}")
-    log_cb(f"  TX topologies: {tx_topologies}  |  RX topologies: {rx_topologies}")
-    log_cb(f"  Fixed: pcb_gap={pcb_gap_mm:.2f}mm  "
-           f"TX oz={tx_oz_layers}  RX oz={rx_oz_layers}")
-
-    N              = params["n_combos"]
+    N              = int(params["n_combos"])
     dither_amp_hz  = params.get("dither_amp_hz", 0.0)
     zvs_margin     = params.get("zvs_margin", 0.0)
     c_tx_options_f = params.get("c_tx_options_f", [])
@@ -458,43 +424,142 @@ def _nn_sweep(params, log_cb, cancel_flag):
     if not c_tx_options_f or not c_rx_options_f:
         raise ValueError("Cap option lists must be non-empty for stratified sampling.")
 
-    ctx_arr      = np.array(c_tx_options_f, dtype=np.float64)
-    crx_arr      = np.array(c_rx_options_f, dtype=np.float64)
+    ctx_arr      = np.array(c_tx_options_f, dtype=np.float32)
+    crx_arr      = np.array(c_rx_options_f, dtype=np.float32)
     n_caps_tx    = ctx_arr.size
     n_caps_rx    = crx_arr.size
     n_pairs      = n_caps_tx * n_caps_rx
-    ctx_pair_arr = np.tile(ctx_arr, n_caps_rx)
+    ctx_pair_arr = np.tile(ctx_arr,   n_caps_rx)
     crx_pair_arr = np.repeat(crx_arr, n_caps_tx)
 
-    f_drive_min_hz = max(freq_min_hz - dither_amp_hz, 1.0)
-    f_drive_max_hz = freq_max_hz + dither_amp_hz
+    f_drive_min_hz = float(max(freq_min_hz - dither_amp_hz, 1.0))
+    f_drive_max_hz = float(freq_max_hz + dither_amp_hz)
+    omega          = 2.0 * math.pi * float(freq_ref_hz)
 
+    log_cb(f"  NN features ({len(feat_cols)}): {feat_cols}")
+    log_cb(f"  TX topologies: {tx_topologies}  |  RX topologies: {rx_topologies}")
+    log_cb(f"  Fixed: pcb_gap={pcb_gap_mm:.2f}mm  "
+           f"TX oz={tx_oz_layers}  RX oz={rx_oz_layers}")
     log_cb(f"  Cap pairs per geometry: {n_caps_tx} TX × {n_caps_rx} RX = {n_pairs}")
     log_cb(f"  Drive sweep: {f_drive_min_hz/1e3:.1f}–{f_drive_max_hz/1e3:.1f} kHz "
            f"(ZVS margin {zvs_margin*100:.0f}%)")
+    log_cb(f"  Device: {device}")
 
-    acc_keys = [
+    # ── GPU scaler tensors (replace sklearn CPU transform) ────────────────
+    x_mean_g  = torch.as_tensor(x_scaler.mean_,  dtype=torch.float32, device=device)
+    x_scale_g = torch.as_tensor(x_scaler.scale_, dtype=torch.float32, device=device)
+    y_mean_g  = torch.as_tensor(y_scaler.mean_,  dtype=torch.float32, device=device)
+    y_scale_g = torch.as_tensor(y_scaler.scale_, dtype=torch.float32, device=device)
+
+    # ── Feature schema: constants vs per-batch variables ──────────────────
+    const_vals = {
+        "tx_spacing_mm":         _SPACING_MM,
+        "tx_outer_gap_mm":       float(tx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
+        "tx_inner_gap_mm":       float(tx_dom.get("inner_gap_mm", [1.0, 1.0])[0]),
+        "rx_spacing_mm":         _SPACING_MM,
+        "rx_outer_gap_mm":       float(rx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
+        "rx_inner_gap_mm":       float(rx_dom.get("inner_gap_mm", [0.6, 0.6])[0]),
+        "freq_hz":               float(freq_ref_hz),
+        "pcb_gap_mm":            pcb_gap_mm,
+        "rx_ground_disc_dia_mm": gc_val,
+    }
+    for i in range(4):
+        const_vals[f"tx_layer{i+1}_oz"] = float(tx_oz_layers[i])
+        const_vals[f"rx_layer{i+1}_oz"] = float(rx_oz_layers[i])
+
+    var_cols = {
         "tx_turns", "tx_width", "tx_od_mm",
-        "rx_od_mm", "rx_turns", "rx_width",
-        "tx_topo", "rx_topo", "tx_port_inside", "rx_port_inside",
-        "gc_dia_mm",
-        "L_tx", "L_rx", "M",
-        "R_tx", "R_rx", "DCR_tx", "DCR_rx",
-        "tx_id_mm", "rx_id_mm",
-        "eta_sys", "D_vmin", "V_dc_min", "f0_tx_hz", "f0_rx_hz", "f_op_lo_hz",
-        "c_tx_nf", "c_rx_nf",
-    ]
-    accs = {k: [] for k in acc_keys}
+        "rx_turns", "rx_width", "rx_od_mm",
+        "tx_port_inside", "rx_port_inside",
+    }
+    for name in TOPOLOGY_VOCAB:
+        var_cols.add(f"tx_topo_{name}")
+        var_cols.add(f"rx_topo_{name}")
 
-    n_ok  = 0
-    n_rej = 0
-    b     = 0
-    rng   = np.random.default_rng(params.get("rng_seed", 42))
+    covered = set(const_vals) | var_cols
+    missing = [c for c in feat_cols if c not in covered]
+    if missing:
+        raise RuntimeError(
+            "Trained scaler expects feature columns the optimiser does not "
+            f"produce: {missing}. Retrain the model with the new trainer "
+            "or extend the const/var lists explicitly.")
 
-    # Pre-compute scaler stats so we can validate that every feature column is
-    # actually populated by row_map (catches the silent-zero-fill bug).
-    feat_cols_set = set(feat_cols)
+    col_idx = {c: feat_cols.index(c) for c in feat_cols}
+    n_feat  = len(feat_cols)
+
+    idx_tx_turns = col_idx["tx_turns"]
+    idx_tx_width = col_idx["tx_width"]
+    idx_tx_od    = col_idx["tx_od_mm"]
+    idx_rx_turns = col_idx["rx_turns"]
+    idx_rx_width = col_idx["rx_width"]
+    idx_rx_od    = col_idx["rx_od_mm"]
+    idx_tx_port  = col_idx["tx_port_inside"]
+    idx_rx_port  = col_idx["rx_port_inside"]
+    idx_tx_topo  = np.array([col_idx[f"tx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
+    idx_rx_topo  = np.array([col_idx[f"rx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
+    tx_vocab_pos = np.array([TOPOLOGY_VOCAB.index(t) for t in tx_topologies], dtype=np.int64)
+    rx_vocab_pos = np.array([TOPOLOGY_VOCAB.index(t) for t in rx_topologies], dtype=np.int64)
+
     geom_per_batch = max(1, BATCH_SIZE // n_pairs)
+    X_buf = np.zeros((geom_per_batch, n_feat), dtype=np.float32)
+    for c, val in const_vals.items():
+        X_buf[:, col_idx[c]] = val
+
+    # ── GPU cap-pair tensors ──────────────────────────────────────────────
+    ctx_g = torch.as_tensor(ctx_pair_arr, dtype=torch.float32, device=device)
+    crx_g = torch.as_tensor(crx_pair_arr, dtype=torch.float32, device=device)
+
+    # ── Running top-K buffer (GPU) ────────────────────────────────────────
+    # Over-keep by ~200× the user-requested top-K so post-dedup we have
+    # plenty of unique winners; K=5000 floor keeps memory trivial (<1 MB).
+    K_keep = max(int(params["top_k"]) * 200, 5000)
+    inf_neg = float("-inf")
+
+    def _kbuf(dtype=torch.float32):
+        return torch.zeros(K_keep, dtype=dtype, device=device)
+
+    keep_eta = torch.full((K_keep,), inf_neg, dtype=torch.float32, device=device)
+    keep = {
+        "tx_turns":       _kbuf(),
+        "tx_width":       _kbuf(),
+        "tx_od_mm":       _kbuf(),
+        "rx_turns":       _kbuf(),
+        "rx_width":       _kbuf(),
+        "rx_od_mm":       _kbuf(),
+        "tx_topo":        _kbuf(torch.int32),
+        "rx_topo":        _kbuf(torch.int32),
+        "tx_port_inside": _kbuf(),
+        "rx_port_inside": _kbuf(),
+        "gc_dia_mm":      _kbuf(),
+        "L_tx":           _kbuf(),
+        "L_rx":           _kbuf(),
+        "M":              _kbuf(),
+        "R_tx":           _kbuf(),
+        "R_rx":           _kbuf(),
+        "DCR_tx":         _kbuf(),
+        "DCR_rx":         _kbuf(),
+        "tx_id_mm":       _kbuf(),
+        "rx_id_mm":       _kbuf(),
+        "D_vmin":         _kbuf(),
+        "V_dc_min":       _kbuf(),
+        "f0_tx_hz":       _kbuf(),
+        "f0_rx_hz":       _kbuf(),
+        "f_op_lo_hz":     _kbuf(),
+        "c_tx_nf":        _kbuf(),
+        "c_rx_nf":        _kbuf(),
+    }
+
+    n_feasible_counter = torch.zeros(1, dtype=torch.int64, device=device)
+
+    use_amp = (device.type == "cuda")
+    def _amp_ctx():
+        return (torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+                if use_amp else contextlib.nullcontext())
+
+    n_ok = 0
+    n_rej = 0
+    b = 0
+    rng = np.random.default_rng(params.get("rng_seed", 42))
 
     while n_ok < N:
         if cancel_flag.is_set():
@@ -505,7 +570,7 @@ def _nn_sweep(params, log_cb, cancel_flag):
 
         bs = geom_per_batch
 
-        # ── Sample geometry, then snap to physical grid ───────────────────
+        # ── Sample geometry on CPU (numpy is plenty fast here) ───────────
         tx_od_s    = _snap(rng.uniform(tx_id_min + 2.0, tx_od_max, size=bs),
                            _GRID_OD_MM_STEP).astype(np.float32)
         tx_width_s = _snap(rng.uniform(tx_width_min, tx_width_max, size=bs),
@@ -532,13 +597,8 @@ def _nn_sweep(params, log_cb, cancel_flag):
 
         tx_topo_idx_s = rng.integers(0, n_tx_topos, size=bs)
         rx_topo_idx_s = rng.integers(0, n_rx_topos, size=bs)
-
         tx_port_idx_s = rng.integers(0, len(tx_port_choices), size=bs)
         rx_port_idx_s = rng.integers(0, len(rx_port_choices), size=bs)
-
-        gc_s = (np.full(bs, gc_dia_mm, dtype=np.float32)
-                if gc_enabled
-                else np.zeros(bs, dtype=np.float32))
 
         tx_id_s = _inner_diameter_mm(tx_od_s, tx_width_s, tx_turns_s)
         rx_id_s = _inner_diameter_mm(rx_od_s, rx_width_s, rx_turns_s)
@@ -552,34 +612,15 @@ def _nn_sweep(params, log_cb, cancel_flag):
         rx_turns_s = rx_turns_s[id_ok]; rx_width_s = rx_width_s[id_ok]
         tx_topo_idx_s = tx_topo_idx_s[id_ok]; rx_topo_idx_s = rx_topo_idx_s[id_ok]
         tx_port_idx_s = tx_port_idx_s[id_ok]; rx_port_idx_s = rx_port_idx_s[id_ok]
-        gc_s       = gc_s[id_ok]
         tx_id_s    = tx_id_s[id_ok];    rx_id_s    = rx_id_s[id_ok]
         bs_v = int(id_ok.sum())
 
-        tx_port_in_s = np.array([float(tx_port_choices[i]) for i in tx_port_idx_s],
-                                dtype=np.float32)
-        rx_port_in_s = np.array([float(rx_port_choices[i]) for i in rx_port_idx_s],
-                                dtype=np.float32)
+        tx_port_in_s = np.asarray(tx_port_choices, dtype=np.float32)[tx_port_idx_s]
+        rx_port_in_s = np.asarray(rx_port_choices, dtype=np.float32)[rx_port_idx_s]
 
-        # One-hot per fixed TOPOLOGY_VOCAB order so column names line up with
-        # the trainer regardless of which subset the domain allows here.
-        tx_topo_oh = {f"tx_topo_{name}": np.zeros(bs_v, dtype=np.float32)
-                      for name in TOPOLOGY_VOCAB}
-        rx_topo_oh = {f"rx_topo_{name}": np.zeros(bs_v, dtype=np.float32)
-                      for name in TOPOLOGY_VOCAB}
-        for ti, tname in enumerate(tx_topologies):
-            mask = (tx_topo_idx_s == ti)
-            if mask.any():
-                tx_topo_oh[f"tx_topo_{tname}"][mask] = 1.0
-        for ti, tname in enumerate(rx_topologies):
-            mask = (rx_topo_idx_s == ti)
-            if mask.any():
-                rx_topo_oh[f"rx_topo_{tname}"][mask] = 1.0
-
-        # ── DCR (TX uses lumped active-layer height; RX is per-topology) ──
+        # ── DCR (TX lumped active-layer; RX per-topology) ────────────────
         tx_len_m  = _spiral_length_m(tx_od_s, tx_width_s, tx_turns_s)
         DCR_tx_np = _dcr_ohm(tx_len_m, tx_width_s, tx_h_total_m).astype(np.float32)
-
         rx_len_m  = _spiral_length_m(rx_od_s, rx_width_s, rx_turns_s)
         DCR_rx_np = np.empty(bs_v, dtype=np.float32)
         for ti, tname in enumerate(rx_topologies):
@@ -589,120 +630,169 @@ def _nn_sweep(params, log_cb, cancel_flag):
             h_eff = rx_h_eff_per_topo[tname]
             DCR_rx_np[m] = _dcr_ohm(rx_len_m[m], rx_width_s[m], h_eff)
 
-        # ── Build feature row map covering EVERY trainer column ───────────
-        # Run-fixed scalars become full-length vectors for stacking.
-        row_map = {
-            # TX geometry
-            "tx_turns":       tx_turns_s,
-            "tx_width":       tx_width_s,
-            "tx_od_mm":       tx_od_s,
-            "tx_spacing_mm":  np.full(bs_v, _SPACING_MM,                dtype=np.float32),
-            "tx_outer_gap_mm": np.full(bs_v, float(tx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
-                                       dtype=np.float32),
-            "tx_inner_gap_mm": np.full(bs_v, float(tx_dom.get("inner_gap_mm", [1.0, 1.0])[0]),
-                                       dtype=np.float32),
-            # RX geometry
-            "rx_turns":       rx_turns_s,
-            "rx_width":       rx_width_s,
-            "rx_od_mm":       rx_od_s,
-            "rx_spacing_mm":  np.full(bs_v, _SPACING_MM,                dtype=np.float32),
-            "rx_outer_gap_mm": np.full(bs_v, float(rx_dom.get("outer_gap_mm", [0.2, 0.2])[0]),
-                                       dtype=np.float32),
-            "rx_inner_gap_mm": np.full(bs_v, float(rx_dom.get("inner_gap_mm", [0.6, 0.6])[0]),
-                                       dtype=np.float32),
-            # Global
-            "freq_hz":             np.full(bs_v, freq_ref_hz,  dtype=np.float32),
-            "pcb_gap_mm":          np.full(bs_v, pcb_gap_mm,   dtype=np.float32),
-            "rx_ground_disc_dia_mm": gc_s,
-            # Booleans
-            "tx_port_inside": tx_port_in_s,
-            "rx_port_inside": rx_port_in_s,
-        }
-        for i in range(4):
-            row_map[f"tx_layer{i+1}_oz"] = np.full(bs_v, tx_oz_layers[i], dtype=np.float32)
-            row_map[f"rx_layer{i+1}_oz"] = np.full(bs_v, rx_oz_layers[i], dtype=np.float32)
-        row_map.update(tx_topo_oh)
-        row_map.update(rx_topo_oh)
+        # ── Write variable cols into X_buf (constants already filled) ────
+        X = X_buf[:bs_v]
+        X[:, idx_tx_turns] = tx_turns_s
+        X[:, idx_tx_width] = tx_width_s
+        X[:, idx_tx_od]    = tx_od_s
+        X[:, idx_rx_turns] = rx_turns_s
+        X[:, idx_rx_width] = rx_width_s
+        X[:, idx_rx_od]    = rx_od_s
+        X[:, idx_tx_port]  = tx_port_in_s
+        X[:, idx_rx_port]  = rx_port_in_s
+        # Topology one-hot via vectorised fancy indexing (no per-vocab loop)
+        X[:, idx_tx_topo]  = 0.0
+        X[:, idx_rx_topo]  = 0.0
+        row_arange = np.arange(bs_v)
+        X[row_arange, idx_tx_topo[tx_vocab_pos[tx_topo_idx_s]]] = 1.0
+        X[row_arange, idx_rx_topo[rx_vocab_pos[rx_topo_idx_s]]] = 1.0
 
-        # Validate up front that no scaler column gets a silent zero-fill.
-        missing = [c for c in feat_cols if c not in row_map]
-        if missing:
-            raise RuntimeError(
-                "Trained scaler expects feature columns the optimiser does not "
-                f"produce: {missing}. Retrain the model with the new trainer "
-                "or extend row_map to populate these columns explicitly.")
+        # ── Inference: scale + forward + unscale, all on GPU ─────────────
+        X_t  = torch.from_numpy(X).to(device, non_blocking=True)
+        X_sc = (X_t - x_mean_g) / x_scale_g
+        with torch.no_grad(), _amp_ctx():
+            Y_sc = model(X_sc)
+        Y = Y_sc.float() * y_scale_g + y_mean_g     # (bs_v, 5)
 
-        X    = np.column_stack([row_map[c] for c in feat_cols]).astype(np.float32)
-        X_sc = x_scaler.transform(X).astype(np.float32)
-        with torch.no_grad():
-            Y_sc = model(torch.tensor(X_sc, device=device))
-        Y = y_scaler.inverse_transform(Y_sc.cpu().numpy())
+        L_tx_g    = Y[:, 0]
+        L_rx_g    = Y[:, 1]
+        M_g       = Y[:, 2]
+        R_tx_nn_g = Y[:, 3]
+        R_rx_nn_g = Y[:, 4]
+        DCR_tx_g  = torch.from_numpy(DCR_tx_np).to(device, non_blocking=True)
+        DCR_rx_g  = torch.from_numpy(DCR_rx_np).to(device, non_blocking=True)
 
-        # ── Stratified expansion: each geometry × every (C_tx, C_rx) pair ──
-        n_combos_batch = bs_v * n_pairs
-
-        L_tx_full   = np.repeat(Y[:, 0], n_pairs).astype(np.float32)
-        L_rx_full   = np.repeat(Y[:, 1], n_pairs).astype(np.float32)
-        M_full      = np.repeat(Y[:, 2], n_pairs).astype(np.float32)
-        R_tx_full   = np.repeat(Y[:, 3], n_pairs).astype(np.float32)
-        R_rx_full   = np.repeat(Y[:, 4], n_pairs).astype(np.float32)
-        DCR_tx_full = np.repeat(DCR_tx_np, n_pairs)
-        DCR_rx_full = np.repeat(DCR_rx_np, n_pairs)
-
-        ctx_full = np.tile(ctx_pair_arr, bs_v)
-        crx_full = np.tile(crx_pair_arr, bs_v)
-
-        eta_sys, feasible, D_vmin, V_dc_min, f0_tx_arr, f0_rx_arr, f_op_lo_arr = _score_batch(
-            L_tx_full, L_rx_full, M_full, R_tx_full, R_rx_full,
-            DCR_tx_full, DCR_rx_full,
-            ctx_full, crx_full,
-            freq_ref_hz, freq_ref_hz, f_drive_min_hz, f_drive_max_hz,
+        # ── Score (broadcast geometry × cap pair on GPU) ─────────────────
+        eta_2d, feas_2d, D_vmin_g, V_dc_min_g, f0_tx_2d, f0_rx_2d = _score_torch(
+            L_tx_g, L_rx_g, M_g, R_tx_nn_g, R_rx_nn_g, DCR_tx_g, DCR_rx_g,
+            ctx_g, crx_g, omega,
+            f_drive_min_hz, f_drive_max_hz,
             V_min, V_max, P_target, D_min,
-            zvs_margin, _V_MIN_INDUCED_DC, _V_ZENER_DC,
-        )
-        eta_sys = np.where(feasible, eta_sys, np.float32(0.0))
+            zvs_margin, _V_MIN_INDUCED_DC, _V_ZENER_DC, torch)
 
-        n_ok += n_combos_batch
+        n_feasible_counter += feas_2d.sum()
+        # Mask infeasible to -inf so they cannot displace real winners.
+        eta_2d = torch.where(feas_2d, eta_2d,
+                             torch.tensor(inf_neg, dtype=eta_2d.dtype, device=device))
 
-        accs["tx_turns"].append(np.repeat(tx_turns_s, n_pairs))
-        accs["tx_width"].append(np.repeat(tx_width_s, n_pairs))
-        accs["tx_od_mm"].append(np.repeat(tx_od_s, n_pairs))
-        accs["rx_od_mm"].append(np.repeat(rx_od_s, n_pairs))
-        accs["rx_turns"].append(np.repeat(rx_turns_s, n_pairs))
-        accs["rx_width"].append(np.repeat(rx_width_s, n_pairs))
-        accs["tx_topo"].append(np.repeat(tx_topo_idx_s.astype(np.uint8), n_pairs))
-        accs["rx_topo"].append(np.repeat(rx_topo_idx_s.astype(np.uint8), n_pairs))
-        accs["tx_port_inside"].append(np.repeat(tx_port_in_s, n_pairs))
-        accs["rx_port_inside"].append(np.repeat(rx_port_in_s, n_pairs))
-        accs["gc_dia_mm"].append(np.repeat(gc_s, n_pairs))
-        accs["L_tx"].append(L_tx_full)
-        accs["L_rx"].append(L_rx_full)
-        accs["M"].append(M_full)
-        accs["R_tx"].append(R_tx_full)
-        accs["R_rx"].append(R_rx_full)
-        accs["DCR_tx"].append(DCR_tx_full)
-        accs["DCR_rx"].append(DCR_rx_full)
-        accs["tx_id_mm"].append(np.repeat(tx_id_s, n_pairs))
-        accs["rx_id_mm"].append(np.repeat(rx_id_s, n_pairs))
-        accs["eta_sys"].append(eta_sys)
-        accs["D_vmin"].append(D_vmin)
-        accs["V_dc_min"].append(V_dc_min)
-        accs["f0_tx_hz"].append(f0_tx_arr)
-        accs["f0_rx_hz"].append(f0_rx_arr)
-        accs["f_op_lo_hz"].append(f_op_lo_arr)
-        accs["c_tx_nf"].append((ctx_full * 1e9).astype(np.float32))
-        accs["c_rx_nf"].append((crx_full * 1e9).astype(np.float32))
+        eta_flat = eta_2d.reshape(-1)            # (bs_v * n_pairs,)
+        n_ok += bs_v * n_pairs
 
-    concat = {k: np.concatenate(v) for k, v in accs.items()}
-    concat["_tx_topologies"] = np.array(tx_topologies)
-    concat["_rx_topologies"] = np.array(rx_topologies)
-    concat["_freq_ref_hz"]   = np.float64(freq_ref_hz)
-    concat["_freq_min_hz"]   = np.float64(freq_min_hz)
-    concat["_freq_max_hz"]   = np.float64(freq_max_hz)
+        # ── Merge with running top-K ─────────────────────────────────────
+        combined = torch.cat([keep_eta, eta_flat])
+        K_take   = min(K_keep, combined.numel())
+        top_vals, top_idx = torch.topk(combined, K_take)
 
-    n_feasible = int(np.count_nonzero(concat["eta_sys"]))
+        from_old = top_idx < K_keep
+        from_new = ~from_old
+        old_sel  = top_idx[from_old]                  # idx into keep buffers
+        new_sel  = top_idx[from_new] - K_keep         # idx into eta_flat
+
+        geom_idx = new_sel // n_pairs
+        cap_idx  = new_sel %  n_pairs
+
+        # Upload per-geometry arrays once (lazy — only when there are winners)
+        tx_turns_t = torch.from_numpy(tx_turns_s).to(device, non_blocking=True)
+        tx_width_t = torch.from_numpy(tx_width_s).to(device, non_blocking=True)
+        tx_od_t    = torch.from_numpy(tx_od_s).to(device, non_blocking=True)
+        rx_turns_t = torch.from_numpy(rx_turns_s).to(device, non_blocking=True)
+        rx_width_t = torch.from_numpy(rx_width_s).to(device, non_blocking=True)
+        rx_od_t    = torch.from_numpy(rx_od_s).to(device, non_blocking=True)
+        tx_topo_t  = torch.from_numpy(tx_topo_idx_s.astype(np.int32)).to(device, non_blocking=True)
+        rx_topo_t  = torch.from_numpy(rx_topo_idx_s.astype(np.int32)).to(device, non_blocking=True)
+        tx_port_t  = torch.from_numpy(tx_port_in_s).to(device, non_blocking=True)
+        rx_port_t  = torch.from_numpy(rx_port_in_s).to(device, non_blocking=True)
+        tx_id_t    = torch.from_numpy(tx_id_s).to(device, non_blocking=True)
+        rx_id_t    = torch.from_numpy(rx_id_s).to(device, non_blocking=True)
+
+        f0_tx_flat = f0_tx_2d.reshape(-1)
+        f0_rx_flat = f0_rx_2d.reshape(-1)
+
+        def _merge(field, new_vals):
+            out = torch.empty(K_take, dtype=field.dtype, device=device)
+            out[from_old] = field[old_sel]
+            out[from_new] = new_vals.to(field.dtype)
+            return out
+
+        keep_eta = top_vals
+        keep = {
+            "tx_turns":       _merge(keep["tx_turns"],       tx_turns_t[geom_idx]),
+            "tx_width":       _merge(keep["tx_width"],       tx_width_t[geom_idx]),
+            "tx_od_mm":       _merge(keep["tx_od_mm"],       tx_od_t[geom_idx]),
+            "rx_turns":       _merge(keep["rx_turns"],       rx_turns_t[geom_idx]),
+            "rx_width":       _merge(keep["rx_width"],       rx_width_t[geom_idx]),
+            "rx_od_mm":       _merge(keep["rx_od_mm"],       rx_od_t[geom_idx]),
+            "tx_topo":        _merge(keep["tx_topo"],        tx_topo_t[geom_idx]),
+            "rx_topo":        _merge(keep["rx_topo"],        rx_topo_t[geom_idx]),
+            "tx_port_inside": _merge(keep["tx_port_inside"], tx_port_t[geom_idx]),
+            "rx_port_inside": _merge(keep["rx_port_inside"], rx_port_t[geom_idx]),
+            "tx_id_mm":       _merge(keep["tx_id_mm"],       tx_id_t[geom_idx]),
+            "rx_id_mm":       _merge(keep["rx_id_mm"],       rx_id_t[geom_idx]),
+            "L_tx":           _merge(keep["L_tx"],           L_tx_g[geom_idx]),
+            "L_rx":           _merge(keep["L_rx"],           L_rx_g[geom_idx]),
+            "M":              _merge(keep["M"],              M_g[geom_idx]),
+            "R_tx":           _merge(keep["R_tx"],           R_tx_nn_g[geom_idx]),
+            "R_rx":           _merge(keep["R_rx"],           R_rx_nn_g[geom_idx]),
+            "DCR_tx":         _merge(keep["DCR_tx"],         DCR_tx_g[geom_idx]),
+            "DCR_rx":         _merge(keep["DCR_rx"],         DCR_rx_g[geom_idx]),
+            "D_vmin":         _merge(keep["D_vmin"],         D_vmin_g[geom_idx]),
+            "V_dc_min":       _merge(keep["V_dc_min"],       V_dc_min_g[geom_idx]),
+            "f0_tx_hz":       _merge(keep["f0_tx_hz"],       f0_tx_flat[new_sel]),
+            "f0_rx_hz":       _merge(keep["f0_rx_hz"],       f0_rx_flat[new_sel]),
+            "c_tx_nf":        _merge(keep["c_tx_nf"],        ctx_g[cap_idx] * 1e9),
+            "c_rx_nf":        _merge(keep["c_rx_nf"],        crx_g[cap_idx] * 1e9),
+            # gc_dia_mm + f_op_lo_hz are run-constants — just refill.
+            "gc_dia_mm":      torch.full((K_take,), gc_val, dtype=torch.float32, device=device),
+            "f_op_lo_hz":     torch.full((K_take,), f_drive_min_hz,
+                                         dtype=torch.float32, device=device),
+        }
+
+    # ── Gather final result to CPU ───────────────────────────────────────
+    def _to_np(t): return t.detach().cpu().numpy()
+
+    eta_np = _to_np(keep_eta)
+    eta_np = np.where(eta_np > inf_neg, eta_np, np.float32(0.0)).astype(np.float32)
+
+    concat = {
+        "tx_turns":       _to_np(keep["tx_turns"]),
+        "tx_width":       _to_np(keep["tx_width"]),
+        "tx_od_mm":       _to_np(keep["tx_od_mm"]),
+        "rx_turns":       _to_np(keep["rx_turns"]),
+        "rx_width":       _to_np(keep["rx_width"]),
+        "rx_od_mm":       _to_np(keep["rx_od_mm"]),
+        "tx_topo":        _to_np(keep["tx_topo"]).astype(np.uint8),
+        "rx_topo":        _to_np(keep["rx_topo"]).astype(np.uint8),
+        "tx_port_inside": _to_np(keep["tx_port_inside"]),
+        "rx_port_inside": _to_np(keep["rx_port_inside"]),
+        "gc_dia_mm":      _to_np(keep["gc_dia_mm"]),
+        "L_tx":           _to_np(keep["L_tx"]),
+        "L_rx":           _to_np(keep["L_rx"]),
+        "M":              _to_np(keep["M"]),
+        "R_tx":           _to_np(keep["R_tx"]),
+        "R_rx":           _to_np(keep["R_rx"]),
+        "DCR_tx":         _to_np(keep["DCR_tx"]),
+        "DCR_rx":         _to_np(keep["DCR_rx"]),
+        "tx_id_mm":       _to_np(keep["tx_id_mm"]),
+        "rx_id_mm":       _to_np(keep["rx_id_mm"]),
+        "eta_sys":        eta_np,
+        "D_vmin":         _to_np(keep["D_vmin"]),
+        "V_dc_min":       _to_np(keep["V_dc_min"]),
+        "f0_tx_hz":       _to_np(keep["f0_tx_hz"]),
+        "f0_rx_hz":       _to_np(keep["f0_rx_hz"]),
+        "f_op_lo_hz":     _to_np(keep["f_op_lo_hz"]),
+        "c_tx_nf":        _to_np(keep["c_tx_nf"]),
+        "c_rx_nf":        _to_np(keep["c_rx_nf"]),
+        "_tx_topologies": np.array(tx_topologies),
+        "_rx_topologies": np.array(rx_topologies),
+        "_freq_ref_hz":   np.float64(freq_ref_hz),
+        "_freq_min_hz":   np.float64(freq_min_hz),
+        "_freq_max_hz":   np.float64(freq_max_hz),
+    }
+
+    n_feasible = int(n_feasible_counter.item())
     log_cb(f"  Sweep done: {n_ok:,} combos scored "
-           f"({n_feasible:,} feasible, {n_rej:,} geometry-rejected)")
+           f"({n_feasible:,} feasible, {n_rej:,} geometry-rejected; "
+           f"top-{K_keep} retained)")
     return concat
 
 

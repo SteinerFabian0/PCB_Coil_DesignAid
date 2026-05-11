@@ -16,6 +16,7 @@ port_inside is encoded as 0/1.
 Outputs : L_tx_uH, L_rx_uH, M_uH, R_tx_ac, R_rx_ac
 """
 
+import contextlib
 import json
 import os
 
@@ -27,7 +28,6 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, TensorDataset
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,7 +41,7 @@ OUTPUT_DIR = os.environ.get("SURROGATE_OUTPUT_DIR", os.path.join(_NN_DIR, "NN_V5
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 EPOCHS      = int(os.environ.get("SURROGATE_EPOCHS",     "600"))
-BATCH_SIZE  = int(os.environ.get("SURROGATE_BATCH_SIZE", "128"))
+BATCH_SIZE  = int(os.environ.get("SURROGATE_BATCH_SIZE", "1024"))
 LR          = float(os.environ.get("SURROGATE_LR",       "1e-3"))
 VAL_SPLIT   = float(os.environ.get("SURROGATE_VAL_SPLIT", "0.20"))
 RANDOM_SEED = 42
@@ -195,19 +195,34 @@ class CoilSurrogateNN(nn.Module):
 # 4. Training loop
 # ---------------------------------------------------------------------------
 
-def make_loader(X, y, batch_size: int, shuffle: bool) -> DataLoader:
-    X_t = torch.tensor(X, dtype=torch.float32)
-    y_t = torch.tensor(y, dtype=torch.float32)
-    return DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=shuffle)
+def train(model, X_train, y_train, X_val, y_val, device):
+    """
+    Train with all data resident on GPU and AMP forward/backward.
 
+    For this surrogate (~30 input dims, ~3-5k records) the previous
+    DataLoader-on-CPU path was launch-overhead bound — moving the full
+    train/val tensors to GPU once eliminates per-batch host→device copies
+    and lets the 4070 Ti spend its time on actual compute.
+    """
+    Xt_train = torch.from_numpy(np.ascontiguousarray(X_train, dtype=np.float32)).to(device)
+    yt_train = torch.from_numpy(np.ascontiguousarray(y_train, dtype=np.float32)).to(device)
+    Xt_val   = torch.from_numpy(np.ascontiguousarray(X_val,   dtype=np.float32)).to(device)
+    yt_val   = torch.from_numpy(np.ascontiguousarray(y_val,   dtype=np.float32)).to(device)
 
-def train(model, train_loader, val_loader, device):
+    n_train = Xt_train.shape[0]
+    n_val   = Xt_val.shape[0]
+
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     criterion = nn.MSELoss()
-
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.1, patience=30
     )
+
+    use_amp = (device.type == "cuda")
+    scaler  = torch.amp.GradScaler("cuda") if use_amp else None
+    def _autocast():
+        return (torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+                if use_amp else contextlib.nullcontext())
 
     train_losses, val_losses = [], []
     best_val_loss = float("inf")
@@ -216,25 +231,31 @@ def train(model, train_loader, val_loader, device):
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
+        perm = torch.randperm(n_train, device=device)
         running = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            loss.backward()
-            optimizer.step()
-            running += loss.item() * len(xb)
-        train_loss = running / len(train_loader.dataset)
+        for start in range(0, n_train, BATCH_SIZE):
+            idx = perm[start:start + BATCH_SIZE]
+            xb  = Xt_train[idx]
+            yb  = yt_train[idx]
+            optimizer.zero_grad(set_to_none=True)
+            with _autocast():
+                pred = model(xb)
+                loss = criterion(pred, yb)
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            running += loss.item() * xb.shape[0]
+        train_loss = running / n_train
 
         model.eval()
         with torch.no_grad():
-            running = 0.0
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                pred = model(xb)
-                running += criterion(pred, yb).item() * len(xb)
-        val_loss = running / len(val_loader.dataset)
+            with _autocast():
+                pred = model(Xt_val)
+                val_loss = criterion(pred.float(), yt_val).item()
 
         scheduler.step(val_loss)
         train_losses.append(train_loss)
@@ -243,7 +264,7 @@ def train(model, train_loader, val_loader, device):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch    = epoch
-            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_state    = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         if epoch % PRINT_EVERY == 0 or epoch == 1:
             print(f"Epoch {epoch:>4}/{EPOCHS}  |  Train MSE: {train_loss:.6f}  |  Val MSE: {val_loss:.6f}")
@@ -302,11 +323,8 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {total_params:,} parameters  |  Input dim: {n_inputs}\n")
 
-    train_loader = make_loader(X_train, y_train, BATCH_SIZE, shuffle=True)
-    val_loader   = make_loader(X_val,   y_val,   BATCH_SIZE, shuffle=False)
-
     print(f"Training {EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}\n")
-    train_losses, val_losses = train(model, train_loader, val_loader, device)
+    train_losses, val_losses = train(model, X_train, y_train, X_val, y_val, device)
 
     final_train = train_losses[-1]
     final_val   = val_losses[-1]
