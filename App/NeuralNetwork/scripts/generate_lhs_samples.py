@@ -4,11 +4,14 @@ Generate Latin Hypercube Samples for the combined TX+RX design-space sweep.
 
 Fixed (not sampled, not NN inputs):
   TX: series topology, port outside, L1+L2 active, 1 oz outer / 0.5 oz inner
-  RX: all 4 layers active, port inside, 1 oz outer / 0.5 oz inner
+  RX: series topology across all 4 active layers, port inside,
+      1 oz outer (L1/L4) / 0.5 oz inner (L2/L3). Inner-layer trace width is
+      derived (endpoint-match to outer layers), not sampled.
 
 Free variables (sampled → NN inputs):
-  TX: od, turns (L1), l2_turns, trace_width, spacing, l1l2_gap, pcb_gap
-  RX: od (≥ TX od, within 1.4 mm), turns, trace_width, spacing, outer_gap, inner_gap, topology
+  TX: od, turns (L1), l2_turns, trace_width, spacing, l1l2_gap
+  RX: od (≥ TX od, within 1.4 mm), outer_turns, inner_turns (≤ outer_turns),
+      trace_width, spacing, outer_gap, inner_gap
   freq: linearly assigned across sample index (not an LHS dimension)
 
 CLI usage:
@@ -46,7 +49,8 @@ HARDCODED_SEED = 42
 
 _MIN_TX_TURNS   = 3
 _MIN_TX_L2_TURNS = 1
-_MIN_RX_TURNS   = 3
+_MIN_RX_TURNS   = 4   # outer-layer minimum
+_MIN_RX_INNER_TURNS = 1
 
 # Fixed stackup — never sampled, never NN inputs.
 _TX_OUTER_OZ  = 1.0
@@ -66,8 +70,8 @@ _RX_LAYERS    = [
     {"active": True, "copper_oz": _RX_OUTER_OZ},
 ]
 
-# RX topologies — encoded as int in samples (0=series, 1=parallel_pairs_ser).
-_RX_TOPOS = ["series", "parallel_pairs_ser"]
+# RX topology is fixed to series across all 4 layers — not sampled.
+_RX_TOPOLOGY = "series"
 
 DEFAULT_DOMAIN = {
     "tx": {
@@ -87,6 +91,7 @@ DEFAULT_DOMAIN = {
         "trace_width_mm":   [0.2, 1.2],
         "trace_spacing_mm": [0.16, 0.16],
         "turns":            [4, 25],
+        "inner_turns":      [1, 25],   # clamped to <= outer turns at decode time
         "outer_gap_mm":     [0.2104, 0.2104],
         "inner_gap_mm":     [0.6, 0.6],
         "ground_disc_dia_mm": 20.0,        # passive copper on both inner layers; 0 disables
@@ -109,8 +114,9 @@ DEFAULT_DOMAIN = {
 def sample_uuid(sample: dict) -> str:
     SIM_KEYS = [
         "tx_od", "tx_turns", "tx_l2_turns", "tx_w", "tx_s", "tx_l1l2_gap",
-        "rx_od", "rx_turns", "rx_w", "rx_s", "rx_outer_gap", "rx_inner_gap",
-        "rx_topo", "rx_ground_disc_dia",
+        "rx_od", "rx_turns", "rx_inner_turns",
+        "rx_w", "rx_s", "rx_outer_gap", "rx_inner_gap",
+        "rx_ground_disc_dia",
         "pcb_gap", "freq", "resolution",
     ]
     canonical = {k: sample[k] for k in SIM_KEYS if k in sample}
@@ -200,7 +206,7 @@ def _feasible_tx(tx_cfg, od, w, s, t, l1l2_gap, l2_turns) -> tuple:
     return True, ""
 
 
-def _feasible_rx(rx_cfg, od, w, s, t, og, ig) -> tuple:
+def _feasible_rx(rx_cfg, od, w, s, t, t_inner, og, ig) -> tuple:
     sp = pc.SpiralParams(od_mm=od, trace_width_mm=w, spacing_mm=s,
                          turns=t, resolution_mm=1.0)
     ok, msg = pc.validate_spiral(sp)
@@ -215,7 +221,16 @@ def _feasible_rx(rx_cfg, od, w, s, t, og, ig) -> tuple:
         outer_gap_mm=og, inner_gap_mm=ig,
     )
     ok, msg = pc.validate_stackup(stackup)
-    return ok, msg
+    if not ok:
+        return False, msg
+    # Inner-layer endpoint-match width must come out > 0.
+    try:
+        w_inner, _ = pc.compute_layer2_width(sp, int(round(t_inner)))
+    except Exception as e:
+        return False, f"RX inner: {e}"
+    if w_inner <= 0:
+        return False, f"RX inner-layer width {w_inner:.4f} mm <= 0"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -226,13 +241,13 @@ def _feasible_rx(rx_cfg, od, w, s, t, og, ig) -> tuple:
 #   3  tx_s
 #   4  tx_l1l2_gap
 #   5  tx_l2_turns / tx_l2_turns_frac
-#   6  rx_turns
+#   6  rx_turns        (outer-layer turns — L1 & L4)
 #   7  rx_w
 #   8  rx_od_offset  (0..1 → [tx_od, min(tx_od+1.4, rx_od_max)])
 #   9  rx_s
 #  10  rx_outer_gap
 #  11  rx_inner_gap
-#  12  rx_topo  (categorical)
+#  12  rx_inner_turns  (inner-layer turns — L2 & L3; clamped to <= rx_turns)
 # ---------------------------------------------------------------------------
 
 _LHS_DIMS = 13
@@ -280,8 +295,9 @@ def _decode(u_row, cfg, sample_index: int = 0, n_total: int = 1):
     rx_og    = _stackup_val(u_row[10], *rx["outer_gap_mm"])
     rx_ig    = _stackup_val(u_row[11], *rx["inner_gap_mm"])
 
-    n_topos  = len(_RX_TOPOS)
-    rx_topo  = min(int(u_row[12] * n_topos), n_topos - 1)  # 0 or 1
+    inner_lo, inner_hi = rx.get("inner_turns", [_MIN_RX_INNER_TURNS, rx_turns])
+    rx_inner = _round_int(_scale(u_row[12], inner_lo, inner_hi), inner_lo, inner_hi)
+    rx_inner = max(_MIN_RX_INNER_TURNS, min(rx_turns, rx_inner))
 
     # Frequency: linearly distributed across sample index, independent of LHS.
     freq_lo, freq_hi = glob["freq_hz"]
@@ -298,10 +314,9 @@ def _decode(u_row, cfg, sample_index: int = 0, n_total: int = 1):
     return {
         "tx_od": tx_od, "tx_turns": tx_turns, "tx_l2_turns": tx_l2_turns,
         "tx_w": tx_w, "tx_s": tx_s, "tx_l1l2_gap": tx_gap,
-        "rx_od": rx_od, "rx_turns": rx_turns,
+        "rx_od": rx_od, "rx_turns": rx_turns, "rx_inner_turns": rx_inner,
         "rx_w": rx_w, "rx_s": rx_s,
         "rx_outer_gap": rx_og, "rx_inner_gap": rx_ig,
-        "rx_topo": rx_topo,
         "rx_ground_disc_dia": rx_gdisc,
         "pcb_gap": pcb_gap, "freq": freq,
         "resolution": glob["resolution_mm"],
@@ -334,7 +349,8 @@ def generate_samples(cfg: dict, n_total: int, seed: int = HARDCODED_SEED,
 
         ok, _ = _feasible_rx(cfg["rx"],
                               c["rx_od"], c["rx_w"], c["rx_s"],
-                              c["rx_turns"], c["rx_outer_gap"], c["rx_inner_gap"])
+                              c["rx_turns"], c["rx_inner_turns"],
+                              c["rx_outer_gap"], c["rx_inner_gap"])
         if not ok:
             rejected += 1
             continue
@@ -356,12 +372,12 @@ def write_domain_master(cfg: dict, out_path: str, n_total: int, n_valid: int) ->
     canon["n_valid"]    = int(n_valid)
     canon["seed"]       = HARDCODED_SEED
     canon["fixed"] = {
-        "tx_topology":   "series",
+        "tx_topology":    "series",
         "tx_port_inside": False,
-        "tx_layers":     _TX_LAYERS,
+        "tx_layers":      _TX_LAYERS,
+        "rx_topology":    _RX_TOPOLOGY,
         "rx_port_inside": True,
-        "rx_layers":     _RX_LAYERS,
-        "rx_topos":      _RX_TOPOS,
+        "rx_layers":      _RX_LAYERS,
     }
     h = config_hash(cfg)
     canon["config_hash"] = h

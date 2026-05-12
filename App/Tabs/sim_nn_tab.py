@@ -43,8 +43,11 @@ TOPOLOGY_CHOICES = [
     ("1p2 -|- 3p4",   "parallel_pairs_ser"),
 ]
 
-# Stable topology vocabulary — must match TOPOLOGY_VOCAB in train_surrogate.py
-TOPOLOGY_VOCAB = ["parallel", "series", "parallel_pairs_ser"]
+# Stable RX topology vocabulary — must match RX_TOPOLOGY_VOCAB in
+# train_surrogate.py. TX topology is fixed to "series" on this branch and is
+# no longer an NN feature, but the input form still lets the user pick one
+# for completeness.
+RX_TOPOLOGY_VOCAB = ["series", "parallel_pairs_ser"]
 
 # NN output order must match train_surrogate.py OUTPUT_COLS
 # ["L_tx_uH", "L_rx_uH", "M_uH", "R_tx_ac", "R_rx_ac"]
@@ -715,11 +718,9 @@ class SimNNTab(ttk.Frame):
                 "All numeric inputs (spacings, gaps, copper oz, pcb gap) must be valid numbers."))
             return
 
-        tx_topo = self._tx_topo_var.get() or "parallel"
-        rx_topo = topo or "parallel"
+        rx_topo = topo or RX_TOPOLOGY_VOCAB[0]
 
         # Build a row that populates every column the trainer's scaler expects.
-        # Topology one-hots use the stable TOPOLOGY_VOCAB order.
         row = {
             "tx_turns":  vals["tx_turns"],
             "tx_width":  vals["tx_width"],
@@ -736,8 +737,8 @@ class SimNNTab(ttk.Frame):
         for i in range(4):
             row[f"tx_layer{i+1}_oz"] = tx_oz[i]
             row[f"rx_layer{i+1}_oz"] = rx_oz[i]
-        for t in TOPOLOGY_VOCAB:
-            row[f"tx_topo_{t}"] = 1.0 if tx_topo == t else 0.0
+        # TX topology is fixed in the trainer; only RX one-hots are NN inputs.
+        for t in RX_TOPOLOGY_VOCAB:
             row[f"rx_topo_{t}"] = 1.0 if rx_topo == t else 0.0
 
         # Hard-fail on schema mismatch — silent zero-fill caused the inference

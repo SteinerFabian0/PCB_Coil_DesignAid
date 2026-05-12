@@ -298,6 +298,66 @@ def active_layer_data_tx_independent(l1_params, stackup, n2_turns):
     return layer_data, w2
 
 
+def active_layer_data_rx_independent(outer_params, stackup, n_inner_turns):
+    """
+    RX-specific variant: 4 active layers in series. Outer layers (slots 1 & 4)
+    use `outer_params` directly. Inner layers (slots 2 & 3) share a trace
+    width computed so their inner endpoint matches the outer layers' inner
+    endpoint (analogous to TX L2 endpoint-match).
+
+    Inner layers wind the same spiral shape; alternating winding direction
+    for series B-field summation is handled later by
+    reverse_nodes_for_series_flow, so the geometry built here is the native
+    (un-mirrored) spiral on every slot.
+
+    Returns (layer_data, w_inner_mm). `layer_data` is the standard list of
+    {"slot","z","h_mm","w_mm","nodes"} dicts in ascending z order; each
+    entry carries a "w_mm" so the writer honours per-layer width.
+
+    Raises ValueError if n_inner_turns is invalid or w_inner_mm <= 0.
+    Requires exactly 4 active slots in `stackup`.
+    """
+    n_outer = int(round(outer_params.turns))
+    n_inner = int(round(n_inner_turns))
+    if n_inner < 1 or n_inner > n_outer:
+        raise ValueError(f"RX inner turns must be between 1 and N_outer={n_outer}.")
+
+    w_inner, _pitch_inner = compute_layer2_width(outer_params, n_inner)
+    if w_inner <= 0:
+        raise ValueError(
+            f"RX inner-layer width would be {w_inner:.4f} mm (≤ 0) — "
+            f"reduce inner turns or outer turns.")
+
+    inner_params = SpiralParams(
+        od_mm=outer_params.od_mm,
+        trace_width_mm=w_inner,
+        spacing_mm=outer_params.spacing_mm,
+        turns=n_inner,
+        resolution_mm=outer_params.resolution_mm,
+    )
+
+    zs = layer_z_positions(stackup.outer_gap_mm, stackup.inner_gap_mm)
+    active = [(i, s) for i, s in enumerate(stackup.slots) if s.active]
+    if len(active) != 4:
+        raise ValueError("RX independent layers requires exactly 4 active slots.")
+
+    # Slots 1 & 4 -> outer; slots 2 & 3 -> inner. Order remains ascending-z.
+    layer_data = []
+    for pos, (idx, slot) in enumerate(active):
+        if pos in (0, 3):     # outer slots
+            sp, w = outer_params, outer_params.trace_width_mm
+        else:                 # inner slots
+            sp, w = inner_params, w_inner
+        layer_data.append({
+            "slot":  idx + 1,
+            "z":     zs[idx],
+            "h_mm":  slot.copper_h_mm,
+            "w_mm":  w,
+            "nodes": generate_nodes(sp, z=zs[idx]),
+        })
+    return layer_data, w_inner
+
+
 # ---------------------------------------------------------------------------
 # .inp emission
 # ---------------------------------------------------------------------------

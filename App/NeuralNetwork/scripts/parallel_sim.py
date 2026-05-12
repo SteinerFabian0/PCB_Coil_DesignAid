@@ -2,13 +2,15 @@
 """
 Parallel FastHenry simulation worker — combined TX+RX 2-port sims.
 
-Fixed stackup (not NN inputs):
+Fixed stackup & topology (not NN inputs):
   TX: L1+L2 active, series, port outside, outer=1oz inner=0.5oz
-  RX: all 4 layers, port inside, outer=1oz inner=0.5oz
+  RX: all 4 layers active, series, port inside, outer=1oz inner=0.5oz.
+      Outer (L1 & L4) share rx_turns / rx_w; inner (L2 & L3) share
+      rx_inner_turns with auto-computed endpoint-matched width.
 
 Free variables (sampled, become NN features):
   TX: od, turns (L1), l2_turns, trace_width, spacing, l1l2_gap
-  RX: od, turns, trace_width, spacing, outer_gap, inner_gap, rx_topo (0/1)
+  RX: od, outer_turns, inner_turns, trace_width, spacing, outer_gap, inner_gap
   Global: pcb_gap, freq
 """
 
@@ -51,8 +53,8 @@ _RX_LAYERS = [
     {"active": True, "copper_oz": _RX_OUTER_OZ},
 ]
 
-# RX topology index → string name used by parametric_coil.
-_RX_TOPO_NAMES = ["series", "parallel_pairs_ser"]
+# RX topology is fixed to series across all 4 active layers — not an NN input.
+_RX_TOPOLOGY = "series"
 
 
 @dataclass
@@ -68,14 +70,14 @@ class SimParams:
     tx_l2_turns:    int   = 0      # 0 → same as tx_turns (no independent L2)
     tx_nwinc:       int   = 3
 
-    # RX free variables
-    rx_turns:       float = 10.0
+    # RX free variables (4-layer series; outer = L1&L4, inner = L2&L3)
+    rx_turns:       float = 10.0   # outer-layer turn count (L1 = L4)
+    rx_inner_turns: int   = 0      # inner-layer turn count (L2 = L3); 0 → equal to rx_turns
     rx_od_mm:       float = 50.0
-    rx_w_mm:        float = 0.5
+    rx_w_mm:        float = 0.5    # outer-layer trace width; inner width auto-computed
     rx_spacing_mm:  float = 0.16
     rx_outer_gap_mm: float = 0.2104
     rx_inner_gap_mm: float = 0.6
-    rx_topo:        int   = 0      # 0=series, 1=parallel_pairs_ser
     rx_nwinc:       int   = 3
 
     # Global
@@ -132,6 +134,13 @@ def _check_feasibility(p: SimParams) -> Optional[str]:
     ok, msg = pc.validate_stackup(stackup_rx)
     if not ok:
         return f"RX stackup: {msg}"
+    rx_inner_t = p.rx_inner_turns if p.rx_inner_turns > 0 else int(round(p.rx_turns))
+    try:
+        _, w_inner = pc.compute_layer2_width(sp_rx, rx_inner_t)
+    except Exception as e:
+        return f"RX inner: {e}"
+    if w_inner <= 0:
+        return f"RX inner-layer width {w_inner:.4f} mm <= 0"
     return None
 
 
@@ -152,25 +161,24 @@ def _write_inp(p: SimParams, inp_path: str) -> None:
     l2_t = p.tx_l2_turns if p.tx_l2_turns > 0 else int(round(p.tx_turns))
     tx_ld, _ = pc.active_layer_data_tx_independent(sp_tx, stackup_tx, l2_t)
 
-    # RX: standard 4-layer.
-    sp_rx = pc.SpiralParams(od_mm=p.rx_od_mm, trace_width_mm=p.rx_w_mm,
-                            spacing_mm=p.rx_spacing_mm, turns=p.rx_turns,
-                            resolution_mm=p.resolution_mm)
+    # RX: 4-layer series with independent inner-layer turns.
+    sp_rx_outer = pc.SpiralParams(od_mm=p.rx_od_mm, trace_width_mm=p.rx_w_mm,
+                                  spacing_mm=p.rx_spacing_mm, turns=p.rx_turns,
+                                  resolution_mm=p.resolution_mm)
     stackup_rx = pc.StackUp(
         slots=[pc.LayerSlot(active=l["active"], copper_oz=l["copper_oz"])
                for l in _RX_LAYERS],
         outer_gap_mm=p.rx_outer_gap_mm, inner_gap_mm=p.rx_inner_gap_mm,
     )
-    rx_ld = pc.active_layer_data(sp_rx, stackup_rx)
-
-    rx_topo_name = _RX_TOPO_NAMES[p.rx_topo] if 0 <= p.rx_topo < len(_RX_TOPO_NAMES) else "series"
+    rx_inner_t = p.rx_inner_turns if p.rx_inner_turns > 0 else int(round(p.rx_turns))
+    rx_ld, _ = pc.active_layer_data_rx_independent(sp_rx_outer, stackup_rx, rx_inner_t)
 
     pc.write_combined_tx_rx_inp(
         tx_ld, rx_ld, inp_path,
         tx_w_mm=p.tx_w_mm,
         rx_w_mm=p.rx_w_mm,
         tx_topology="series",
-        rx_topology=rx_topo_name,
+        rx_topology=_RX_TOPOLOGY,
         tx_port_inside=False,
         rx_port_inside=True,
         pcb_gap_mm=p.pcb_gap_mm,
@@ -270,10 +278,6 @@ def _parse_result(zc_path: str, p: SimParams, sample: dict) -> dict:
     Q_tx  = (omega * L_tx / R_tx) if R_tx > 0 else 0.0
     Q_rx  = (omega * L_rx / R_rx) if R_rx > 0 else 0.0
 
-    rx_topo_idx  = int(sample.get("rx_topo", p.rx_topo))
-    rx_topo_name = (_RX_TOPO_NAMES[rx_topo_idx]
-                    if 0 <= rx_topo_idx < len(_RX_TOPO_NAMES) else "series")
-
     def r5(v): return round(v, 5)
     def r4(v): return round(v, 4)
 
@@ -300,13 +304,14 @@ def _parse_result(zc_path: str, p: SimParams, sample: dict) -> dict:
         "tx_port_inside":  False,
         "tx_layers":       [dict(l) for l in _TX_LAYERS],
         # ---- RX geometry / stackup ----
-        "rx_turns":        float(sample.get("rx_turns",      p.rx_turns)),
-        "rx_width":        r4(float(sample.get("rx_w",       p.rx_w_mm))),
-        "rx_od_mm":        r4(float(sample.get("rx_od",      p.rx_od_mm))),
-        "rx_spacing_mm":   r4(float(sample.get("rx_s",       p.rx_spacing_mm))),
+        "rx_turns":        float(sample.get("rx_turns",       p.rx_turns)),
+        "rx_inner_turns":  int(sample.get("rx_inner_turns",   p.rx_inner_turns)),
+        "rx_width":        r4(float(sample.get("rx_w",        p.rx_w_mm))),
+        "rx_od_mm":        r4(float(sample.get("rx_od",       p.rx_od_mm))),
+        "rx_spacing_mm":   r4(float(sample.get("rx_s",        p.rx_spacing_mm))),
         "rx_outer_gap_mm": r4(float(sample.get("rx_outer_gap", p.rx_outer_gap_mm))),
         "rx_inner_gap_mm": r4(float(sample.get("rx_inner_gap", p.rx_inner_gap_mm))),
-        "rx_topology":     rx_topo_name,
+        "rx_topology":     _RX_TOPOLOGY,
         "rx_port_inside":  True,
         "rx_layers":       [dict(l) for l in _RX_LAYERS],
         # ---- global ----

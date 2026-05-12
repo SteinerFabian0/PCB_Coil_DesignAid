@@ -3,8 +3,10 @@
 Parametric coil tab (TX / RX).
 
 TX: layers 1+2 only, series topology, port on outside (all hardcoded).
-RX: all 4 layers, series OR parallel_pairs_ser (selectable), port on inside,
-    copper [1,0.5,0.5,1] (hardcoded).
+    Optional independent L2 turns (auto-computed L2 trace width).
+RX: all 4 layers in series, port on inside, copper [1,0.5,0.5,1] (hardcoded).
+    Optional independent inner-layer turns (slots 2&3 share auto-computed
+    endpoint-matched trace width; slots 1&4 use the outer turns/width).
 """
 
 import os, sys, math, threading, queue
@@ -51,10 +53,7 @@ _TX_TOPOLOGY    = "series"
 _TX_PORT_INSIDE = False
 _TX_ACTIVE_SLOTS = [True, True, False, False]
 
-_RX_TOPOLOGIES = [
-    ("All series",  "series"),
-    ("1p2 -|- 3p4", "parallel_pairs_ser"),
-]
+_RX_TOPOLOGY    = "series"
 _RX_PORT_INSIDE = True
 _RX_ACTIVE_SLOTS = [True, True, True, True]
 _RX_COPPER_OZ   = [1.0, 0.5, 0.5, 1.0]
@@ -91,11 +90,12 @@ class ParametricCoilTab(ttk.Frame):
         self._my_temp_files = set()
 
         self._true_scale = tk.BooleanVar(value=False)
-        # RX topology selector (TX is hardcoded "series").
-        self._rx_topology_var = tk.StringVar(value="series")
         # TX-only: independent layer 2 turns.
         self._tx_indep_l2 = tk.BooleanVar(value=False)
         self._tx_l2_turns_var = tk.StringVar(value="11")
+        # RX-only: independent inner-layer turns (slots 2&3).
+        self._rx_indep_inner = tk.BooleanVar(value=False)
+        self._rx_inner_turns_var = tk.StringVar(value="11")
 
         self._quicksim_value = None
         self._quicksim_stale = False
@@ -112,7 +112,7 @@ class ParametricCoilTab(ttk.Frame):
         return self.role == "TX"
 
     def _topology(self):
-        return _TX_TOPOLOGY if self._is_tx else self._rx_topology_var.get()
+        return _TX_TOPOLOGY if self._is_tx else _RX_TOPOLOGY
 
     def _port_inside(self):
         return _TX_PORT_INSIDE if self._is_tx else _RX_PORT_INSIDE
@@ -160,15 +160,7 @@ class ParametricCoilTab(ttk.Frame):
         self.turns_var = self._entry(sp, "Turns/layer:",        self.DEFAULT_TURNS)
         self.res_var   = self._entry(sp, "Resolution (mm):",    self.DEFAULT_RESOLUTION_MM)
 
-        # RX topology selector.
-        if not self._is_tx:
-            tf = ttk.LabelFrame(parent, text="Topology")
-            tf.pack(fill="x", pady=(0, 6))
-            for label, val in _RX_TOPOLOGIES:
-                ttk.Radiobutton(tf, text=label, variable=self._rx_topology_var,
-                                value=val,
-                                command=self._on_rx_topology_change
-                                ).pack(anchor="w", padx=6, pady=1)
+        # RX is fixed: series across all 4 layers, port inside.
 
         # Stack-up gap (role-specific label/count).
         zf = ttk.LabelFrame(parent, text="Stack-up gap")
@@ -239,6 +231,29 @@ class ParametricCoilTab(ttk.Frame):
                                              foreground="#404080")
             self._tx_l2_w_label.pack(anchor="w", padx=6, pady=(0, 4))
             self._update_l2_controls_state()
+
+        # RX-only: independent inner-layer turns (slots 2 & 3).
+        if not self._is_tx:
+            inf = ttk.LabelFrame(parent, text="Inner layers (independent)")
+            inf.pack(fill="x", pady=(0, 6))
+            ttk.Checkbutton(inf, text="Independent inner turns (L2 & L3)",
+                            variable=self._rx_indep_inner,
+                            command=self._on_rx_indep_inner_toggle
+                            ).pack(anchor="w", padx=6, pady=(4, 2))
+            self._rx_inner_controls_frame = ttk.Frame(inf)
+            self._rx_inner_controls_frame.pack(fill="x")
+            row = ttk.Frame(self._rx_inner_controls_frame)
+            row.pack(fill="x", padx=4, pady=2)
+            ttk.Label(row, text="Inner turns:", width=22, anchor="w").pack(side="left")
+            ttk.Entry(row, textvariable=self._rx_inner_turns_var, width=10
+                      ).pack(side="left")
+            self._rx_inner_turns_var.trace_add(
+                "write", lambda *_: self._on_rx_inner_turns_changed())
+            self._rx_inner_w_label = ttk.Label(self._rx_inner_controls_frame,
+                                                text="Inner width: —",
+                                                foreground="#404080")
+            self._rx_inner_w_label.pack(anchor="w", padx=6, pady=(0, 4))
+            self._update_rx_inner_controls_state()
 
         # View mode.
         vf = ttk.Frame(parent); vf.pack(fill="x", pady=(4, 2))
@@ -350,10 +365,31 @@ class ParametricCoilTab(ttk.Frame):
         if not enabled:
             self._tx_l2_w_label.configure(text="L2 width: —")
 
-    def _on_rx_topology_change(self):
+    def _on_rx_inner_turns_changed(self):
+        try:
+            n_inner = int(self._rx_inner_turns_var.get())
+            n_outer = int(float(self.turns_var.get()))
+            if n_inner > n_outer:
+                self._rx_inner_turns_var.set(str(n_outer))
+                return   # setting the var triggers this callback again
+        except ValueError:
+            pass
+        self._schedule_refresh()
+
+    def _on_rx_indep_inner_toggle(self):
+        self._update_rx_inner_controls_state()
         self._mark_sim_outdated_if_loaded()
         self._schedule_refresh()
         self._save_state()
+
+    def _update_rx_inner_controls_state(self):
+        if self._is_tx:
+            return
+        enabled = self._rx_indep_inner.get()
+        state = "normal" if enabled else "disabled"
+        self._walk_state(self._rx_inner_controls_frame, state)
+        if not enabled:
+            self._rx_inner_w_label.configure(text="Inner width: —")
 
     def _on_true_scale_toggle(self):
         if self._selected_slot_idx is None:
@@ -414,7 +450,8 @@ class ParametricCoilTab(ttk.Frame):
         if not ok:
             self._show_fail(msg); return
 
-        # TX with independent L2 turns takes a separate code path.
+        # TX with independent L2 turns / RX with independent inner turns
+        # both take separate code paths.
         if self._is_tx and self._tx_indep_l2.get():
             try:
                 n2 = int(self._tx_l2_turns_var.get())
@@ -430,9 +467,26 @@ class ParametricCoilTab(ttk.Frame):
                     text=f"L2 width: {w2:.4f} mm")
             except Exception as e:
                 self._show_fail(f"Layer 2 error: {e}"); return
+        elif (not self._is_tx) and self._rx_indep_inner.get():
+            try:
+                n_inner = int(self._rx_inner_turns_var.get())
+                n_outer = int(params.turns)
+                if n_inner < 1 or n_inner > n_outer:
+                    raise ValueError(f"must be 1 – {n_outer}")
+            except ValueError as e:
+                self._show_fail(f"Inner turns: {e}"); return
+            try:
+                layers, w_inner = pc.active_layer_data_rx_independent(
+                    params, stackup, n_inner)
+                self._rx_inner_w_label.configure(
+                    text=f"Inner width: {w_inner:.4f} mm")
+            except Exception as e:
+                self._show_fail(f"Inner layer error: {e}"); return
         else:
             if self._is_tx and hasattr(self, "_tx_l2_w_label"):
                 self._tx_l2_w_label.configure(text="L2 width: —")
+            if (not self._is_tx) and hasattr(self, "_rx_inner_w_label"):
+                self._rx_inner_w_label.configure(text="Inner width: —")
             try:
                 layers = pc.active_layer_data(params, stackup)
             except Exception as e:
@@ -476,6 +530,17 @@ class ParametricCoilTab(ttk.Frame):
             self.info_var.set(
                 f"{n_act} active | series | "
                 f"L1={self._last_params.turns:g}T L2={n2:g}T | "
+                f"eff. turns={eff_t:g} | {n_nodes} nodes")
+        elif (not self._is_tx) and self._rx_indep_inner.get() and n_act == 4:
+            try:
+                n_inner = float(self._rx_inner_turns_var.get())
+            except ValueError:
+                n_inner = 0.0
+            n_outer = self._last_params.turns
+            eff_t = 2.0 * n_outer + 2.0 * n_inner
+            self.info_var.set(
+                f"{n_act} active | series | "
+                f"outer={n_outer:g}T inner={n_inner:g}T | "
                 f"eff. turns={eff_t:g} | {n_nodes} nodes")
         else:
             t_per = self._last_params.turns
@@ -635,25 +700,23 @@ class ParametricCoilTab(ttk.Frame):
         topo = self._topology()
         port_inside = self._port_inside()
         tx_indep = self._is_tx and self._tx_indep_l2.get()
+        rx_indep = (not self._is_tx) and self._rx_indep_inner.get()
 
         if resolution_override is not None:
             _, stackup, _ = self._snapshot_inputs()
+            sp = pc.SpiralParams(
+                od_mm=self._last_params.od_mm,
+                trace_width_mm=self._last_params.trace_width_mm,
+                spacing_mm=self._last_params.spacing_mm,
+                turns=self._last_params.turns,
+                resolution_mm=resolution_override)
             if tx_indep:
                 n2 = int(self._tx_l2_turns_var.get())
-                sp = pc.SpiralParams(
-                    od_mm=self._last_params.od_mm,
-                    trace_width_mm=self._last_params.trace_width_mm,
-                    spacing_mm=self._last_params.spacing_mm,
-                    turns=self._last_params.turns,
-                    resolution_mm=resolution_override)
                 layers, _ = pc.active_layer_data_tx_independent(sp, stackup, n2)
+            elif rx_indep:
+                n_inner = int(self._rx_inner_turns_var.get())
+                layers, _ = pc.active_layer_data_rx_independent(sp, stackup, n_inner)
             else:
-                sp = pc.SpiralParams(
-                    od_mm=self._last_params.od_mm,
-                    trace_width_mm=self._last_params.trace_width_mm,
-                    spacing_mm=self._last_params.spacing_mm,
-                    turns=self._last_params.turns,
-                    resolution_mm=resolution_override)
                 layers = pc.active_layer_data(sp, stackup)
         else:
             layers = [dict(ld, nodes=list(ld["nodes"]))
@@ -748,7 +811,9 @@ class ParametricCoilTab(ttk.Frame):
                 self._update_l2_controls_state()
             else:
                 self.inner_gap_var.set("0.6")
-                self._rx_topology_var.set("series")
+                self._rx_indep_inner.set(False)
+                self._rx_inner_turns_var.set("11")
+                self._update_rx_inner_controls_state()
             self._true_scale.set(False)
             self._layer_data = None
             self._layer_data_emitted = None
@@ -892,7 +957,8 @@ class ParametricCoilTab(ttk.Frame):
             state["tx_l2_turns"] = self._tx_l2_turns_var.get()
         else:
             state["inner_gap"] = self.inner_gap_var.get()
-            state["rx_topology"] = self._rx_topology_var.get()
+            state["rx_indep_inner"] = self._rx_indep_inner.get()
+            state["rx_inner_turns"] = self._rx_inner_turns_var.get()
         return state
 
     def _restore_from_savestate(self):
@@ -916,8 +982,8 @@ class ParametricCoilTab(ttk.Frame):
                 self._update_l2_controls_state()
             else:
                 self.inner_gap_var.set(state.get("inner_gap", "0.6"))
-                saved_topo = state.get("rx_topology", "series")
-                valid = [v for _, v in _RX_TOPOLOGIES]
-                self._rx_topology_var.set(saved_topo if saved_topo in valid else "series")
+                self._rx_indep_inner.set(bool(state.get("rx_indep_inner", False)))
+                self._rx_inner_turns_var.set(state.get("rx_inner_turns", "11"))
+                self._update_rx_inner_controls_state()
         except Exception:
             pass

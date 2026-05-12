@@ -85,8 +85,12 @@ _SPACING_MM  = 0.16
 _OZ_MM       = 0.035                    # 1 oz copper thickness in mm
 _RHO_30C     = 1.724e-8 * (1 + 0.00393 * 10)
 
-# Stable topology vocabulary — must match TOPOLOGY_VOCAB in train_surrogate.py
-TOPOLOGY_VOCAB = ["parallel", "series", "parallel_pairs_ser"]
+# On NN_V8, TX and RX topologies are both fixed to series and are NOT NN
+# input features. RX has 4 active layers in series, with outer turns
+# (slots 1 & 4) and inner turns (slots 2 & 3) as independent sampled
+# integers. Inner trace width is auto-computed for endpoint match.
+_TX_TOPOLOGY = "series"
+_RX_TOPOLOGY = "series"
 
 _V_DIODE = 0.35
 _V_DROP  = 2.0 * _V_DIODE
@@ -97,7 +101,7 @@ _V_LDO_OUT        = 3.0   # 3 V LDO output rail
 _V_CAP_TARGET_DEF = 4.5   # default controller setpoint (UI-overridable)
 _V_ZENER_DC       = 6.8   # passive TVS clamp — safety only
 _RX_CAP_V_RATING_DEF = 100.0  # V — default C_rx rated voltage
-_V_MIN_INDUCED_DC = 4.0   # hard floor: cap must be able to reach this at V_min, D=1
+_V_MIN_INDUCED_DC = 3.6   # hard floor: cap must be able to reach this at V_min, D=1
 
 _TRAIN_SCRIPT = os.path.join(_NN_SCRIPTS, "train_surrogate.py")
 
@@ -378,7 +382,7 @@ def _rx_h_total_for_topology(topology: str, h_per_layer_m: list) -> float:
     return float(sum(h_active))
 
 
-def _nn_sweep(params, log_cb, cancel_flag):
+def _nn_sweep(params, log_cb, log_cb_ow, cancel_flag):
     """
     GPU-resident sweep:
       • Geometry sampling stays on CPU (numpy — fast at this size).
@@ -418,10 +422,8 @@ def _nn_sweep(params, log_cb, cancel_flag):
     rx_turns_min = int(params["rx_turns_min"])
     rx_turns_max = int(params.get("rx_turns_max", 99))
 
-    tx_topologies = params["tx_topologies"]
-    rx_topologies = params["rx_topologies"]
-    n_tx_topos    = len(tx_topologies)
-    n_rx_topos    = len(rx_topologies)
+    rx_inner_turns_min = int(params.get("rx_inner_turns_min", 1))
+    rx_inner_turns_max = int(params.get("rx_inner_turns_max", rx_turns_max))
 
     gc_enabled = params["gc_enabled"]
     gc_dia_mm  = round(_snap(params["gc_dia_mm"], _GRID_OD_MM_STEP), 4)
@@ -459,9 +461,8 @@ def _nn_sweep(params, log_cb, cancel_flag):
     tx_h_layers_m = [oz * _OZ_MM * 1e-3 for oz in tx_oz_layers]
     rx_h_layers_m = [oz * _OZ_MM * 1e-3 for oz in rx_oz_layers]
     tx_h_total_m  = sum(h for h in tx_h_layers_m if h > 0) or 1e-9
-    rx_h_eff_per_topo = {
-        t: _rx_h_total_for_topology(t, rx_h_layers_m) for t in rx_topologies
-    }
+    # RX is fixed to 4-layer series — equivalent to series-stack DCR.
+    rx_h_eff_m    = _rx_h_total_for_topology(_RX_TOPOLOGY, rx_h_layers_m)
 
     N              = int(params["n_combos"])
     dither_amp_hz  = params.get("dither_amp_hz", 0.0)
@@ -484,14 +485,15 @@ def _nn_sweep(params, log_cb, cancel_flag):
     f_drive_max_hz = float(freq_max_hz + dither_amp_hz)
     omega          = 2.0 * math.pi * float(freq_ref_hz)
 
-    log_cb(f"  NN features ({len(feat_cols)}): {feat_cols}")
-    log_cb(f"  TX topologies: {tx_topologies}  |  RX topologies: {rx_topologies}")
-    log_cb(f"  Fixed: pcb_gap={pcb_gap_mm:.2f}mm  "
-           f"TX oz={tx_oz_layers}  RX oz={rx_oz_layers}")
+    if params.get("log_features", True):
+        log_cb(f"  NN features ({len(feat_cols)}): {feat_cols}")
+        log_cb(f"  Fixed: pcb_gap={pcb_gap_mm:.2f}mm  "
+               f"TX oz={tx_oz_layers}  RX oz={rx_oz_layers}")
+        log_cb(f"  Device: {device}")
+    log_cb(f"  Topology: TX={_TX_TOPOLOGY} (fixed)  |  RX={_RX_TOPOLOGY} 4-layer (fixed)")
     log_cb(f"  Cap pairs per geometry: {n_caps_tx} TX × {n_caps_rx} RX = {n_pairs}")
     log_cb(f"  Drive sweep: {f_drive_min_hz/1e3:.1f}–{f_drive_max_hz/1e3:.1f} kHz "
            f"(ZVS margin {zvs_margin*100:.0f}%)")
-    log_cb(f"  Device: {device}")
 
     # ── GPU scaler tensors (replace sklearn CPU transform) ────────────────
     x_mean_g  = torch.as_tensor(x_scaler.mean_,  dtype=torch.float32, device=device)
@@ -499,48 +501,16 @@ def _nn_sweep(params, log_cb, cancel_flag):
     y_mean_g  = torch.as_tensor(y_scaler.mean_,  dtype=torch.float32, device=device)
     y_scale_g = torch.as_tensor(y_scaler.scale_, dtype=torch.float32, device=device)
 
-    # V7 schema: trainer logs `tx_outer_gap_mm` from the TX L1↔L2 gap
-    # (`tx.l1l2_gap_mm` in domain), and TX has no inner-layer gap.
-    def _rng_mid(rng, fallback):
-        if isinstance(rng, (list, tuple)) and len(rng) >= 2:
-            return 0.5 * (float(rng[0]) + float(rng[1]))
-        return float(fallback)
-
-    tx_outer_gap = _rng_mid(tx_dom.get("l1l2_gap_mm",
-                                       tx_dom.get("outer_gap_mm")), 0.2104)
-    tx_inner_gap = _rng_mid(tx_dom.get("inner_gap_mm"), 0.0)
-    rx_outer_gap = _rng_mid(rx_dom.get("outer_gap_mm"), 0.2104)
-    rx_inner_gap = _rng_mid(rx_dom.get("inner_gap_mm"), 0.6)
-
-    # ── Feature schema: constants vs per-batch variables ──────────────────
+    # ── Feature schema: only freq_hz is per-run constant; everything else
+    # the trainer treated as fixed has been dropped from the input columns.
     const_vals = {
-        "tx_spacing_mm":         _SPACING_MM,
-        "tx_outer_gap_mm":       tx_outer_gap,
-        "tx_inner_gap_mm":       tx_inner_gap,
-        "rx_spacing_mm":         _SPACING_MM,
-        "rx_outer_gap_mm":       rx_outer_gap,
-        "rx_inner_gap_mm":       rx_inner_gap,
-        "freq_hz":               float(freq_ref_hz),
-        "pcb_gap_mm":            pcb_gap_mm,
-        "rx_ground_disc_dia_mm": gc_val,
+        "freq_hz": float(freq_ref_hz),
     }
-    for i in range(4):
-        const_vals[f"tx_layer{i+1}_oz"] = float(tx_oz_layers[i])
-        const_vals[f"rx_layer{i+1}_oz"] = float(rx_oz_layers[i])
 
     var_cols = {
-        "tx_turns", "tx_width", "tx_od_mm",
-        "rx_turns", "rx_width", "rx_od_mm",
-        "tx_port_inside", "rx_port_inside",
+        "tx_turns", "tx_l2_turns", "tx_width", "tx_od_mm",
+        "rx_turns", "rx_inner_turns", "rx_width", "rx_od_mm",
     }
-    # tx_l2_turns is part of the V7 surrogate schema; older models won't
-    # have it and will fall through the missing-column check (which is
-    # what we want — the trainer must be retrained on the new feature set).
-    if "tx_l2_turns" in feat_cols:
-        var_cols.add("tx_l2_turns")
-    for name in TOPOLOGY_VOCAB:
-        var_cols.add(f"tx_topo_{name}")
-        var_cols.add(f"rx_topo_{name}")
 
     covered = set(const_vals) | var_cols
     missing = [c for c in feat_cols if c not in covered]
@@ -553,19 +523,14 @@ def _nn_sweep(params, log_cb, cancel_flag):
     col_idx = {c: feat_cols.index(c) for c in feat_cols}
     n_feat  = len(feat_cols)
 
-    idx_tx_turns    = col_idx["tx_turns"]
-    idx_tx_width    = col_idx["tx_width"]
-    idx_tx_od       = col_idx["tx_od_mm"]
-    idx_tx_l2_turns = col_idx.get("tx_l2_turns")     # None if model lacks this feature
-    idx_rx_turns    = col_idx["rx_turns"]
-    idx_rx_width    = col_idx["rx_width"]
-    idx_rx_od       = col_idx["rx_od_mm"]
-    idx_tx_port     = col_idx["tx_port_inside"]
-    idx_rx_port     = col_idx["rx_port_inside"]
-    idx_tx_topo     = np.array([col_idx[f"tx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
-    idx_rx_topo     = np.array([col_idx[f"rx_topo_{n}"] for n in TOPOLOGY_VOCAB], dtype=np.int64)
-    tx_vocab_pos    = np.array([TOPOLOGY_VOCAB.index(t) for t in tx_topologies], dtype=np.int64)
-    rx_vocab_pos    = np.array([TOPOLOGY_VOCAB.index(t) for t in rx_topologies], dtype=np.int64)
+    idx_tx_turns       = col_idx["tx_turns"]
+    idx_tx_width       = col_idx["tx_width"]
+    idx_tx_od          = col_idx["tx_od_mm"]
+    idx_tx_l2_turns    = col_idx["tx_l2_turns"]
+    idx_rx_turns       = col_idx["rx_turns"]
+    idx_rx_inner_turns = col_idx["rx_inner_turns"]
+    idx_rx_width       = col_idx["rx_width"]
+    idx_rx_od          = col_idx["rx_od_mm"]
 
     geom_per_batch = max(1, BATCH_SIZE // n_pairs)
     X_buf = np.zeros((geom_per_batch, n_feat), dtype=np.float32)
@@ -592,10 +557,9 @@ def _nn_sweep(params, log_cb, cancel_flag):
         "tx_width":       _kbuf(),
         "tx_od_mm":       _kbuf(),
         "rx_turns":       _kbuf(),
+        "rx_inner_turns": _kbuf(),
         "rx_width":       _kbuf(),
         "rx_od_mm":       _kbuf(),
-        "tx_topo":        _kbuf(torch.int32),
-        "rx_topo":        _kbuf(torch.int32),
         "tx_port_inside": _kbuf(),
         "rx_port_inside": _kbuf(),
         "gc_dia_mm":      _kbuf(),
@@ -633,13 +597,14 @@ def _nn_sweep(params, log_cb, cancel_flag):
     n_rej = 0
     b = 0
     rng = np.random.default_rng(params.get("rng_seed", 42))
+    log_cb(f"    batch 0: 0/{N:,} combos, 0 rejected")  # seed line to overwrite
 
     while n_ok < N:
         if cancel_flag.is_set():
             return None
         b += 1
-        if b % 20 == 1:
-            log_cb(f"    batch {b}: {n_ok:,}/{N:,} combos, {n_rej:,} rejected")
+        if b % 5 == 0:
+            log_cb_ow(f"    batch {b}: {n_ok:,}/{N:,} combos, {n_rej:,} rejected")
 
         bs = geom_per_batch
 
@@ -678,8 +643,18 @@ def _nn_sweep(params, log_cb, cancel_flag):
         rx_t_min   = np.minimum(np.full(bs, rx_turns_min, dtype=np.int32), rx_t_max)
         rx_turns_s = rng.integers(rx_t_min, rx_t_max + 1).astype(np.float32)
 
-        tx_topo_idx_s = rng.integers(0, n_tx_topos, size=bs)
-        rx_topo_idx_s = rng.integers(0, n_rx_topos, size=bs)
+        # rx_inner_turns ∈ [max(1, inner_min), min(rx_turns, inner_max)] —
+        # mirrors the LHS generator and feasibility check (endpoint-match
+        # width requires inner_turns <= outer_turns).
+        _rx_outer_int = rx_turns_s.astype(np.int32)
+        rx_inner_lo_arr = np.maximum(rx_inner_turns_min,
+                                     np.ones(bs, dtype=np.int32))
+        rx_inner_hi_arr = np.minimum(_rx_outer_int,
+                                     np.full(bs, rx_inner_turns_max, dtype=np.int32))
+        rx_inner_hi_arr = np.maximum(rx_inner_hi_arr, rx_inner_lo_arr)
+        rx_inner_turns_s = rng.integers(rx_inner_lo_arr,
+                                        rx_inner_hi_arr + 1).astype(np.float32)
+
         tx_port_idx_s = rng.integers(0, len(tx_port_choices), size=bs)
         rx_port_idx_s = rng.integers(0, len(rx_port_choices), size=bs)
 
@@ -693,8 +668,8 @@ def _nn_sweep(params, log_cb, cancel_flag):
         tx_turns_s = tx_turns_s[id_ok]; tx_od_s    = tx_od_s[id_ok]
         tx_width_s = tx_width_s[id_ok]; rx_od_s    = rx_od_s[id_ok]
         rx_turns_s = rx_turns_s[id_ok]; rx_width_s = rx_width_s[id_ok]
-        tx_l2_turns_s = tx_l2_turns_s[id_ok]
-        tx_topo_idx_s = tx_topo_idx_s[id_ok]; rx_topo_idx_s = rx_topo_idx_s[id_ok]
+        tx_l2_turns_s    = tx_l2_turns_s[id_ok]
+        rx_inner_turns_s = rx_inner_turns_s[id_ok]
         tx_port_idx_s = tx_port_idx_s[id_ok]; rx_port_idx_s = rx_port_idx_s[id_ok]
         tx_id_s    = tx_id_s[id_ok];    rx_id_s    = rx_id_s[id_ok]
         bs_v = int(id_ok.sum())
@@ -702,36 +677,29 @@ def _nn_sweep(params, log_cb, cancel_flag):
         tx_port_in_s = np.asarray(tx_port_choices, dtype=np.float32)[tx_port_idx_s]
         rx_port_in_s = np.asarray(rx_port_choices, dtype=np.float32)[rx_port_idx_s]
 
-        # ── DCR (TX lumped active-layer; RX per-topology) ────────────────
+        # ── DCR (TX lumped active-layer; RX fixed 4-layer series) ────────
+        # The RX series-stack DCR uses the per-layer width on each layer.
+        # Outer layers carry rx_width; inner layers carry the auto-computed
+        # endpoint-match width. For the surrogate DCR estimate we
+        # approximate the series sum using the *outer* width — same model
+        # the previous code applied (length × width × h_eff). The
+        # endpoint-match inner width differs by a small factor that the
+        # NN itself absorbs through R_rx_ac.
         tx_len_m  = _spiral_length_m(tx_od_s, tx_width_s, tx_turns_s)
         DCR_tx_np = _dcr_ohm(tx_len_m, tx_width_s, tx_h_total_m).astype(np.float32)
         rx_len_m  = _spiral_length_m(rx_od_s, rx_width_s, rx_turns_s)
-        DCR_rx_np = np.empty(bs_v, dtype=np.float32)
-        for ti, tname in enumerate(rx_topologies):
-            m = (rx_topo_idx_s == ti)
-            if not m.any():
-                continue
-            h_eff = rx_h_eff_per_topo[tname]
-            DCR_rx_np[m] = _dcr_ohm(rx_len_m[m], rx_width_s[m], h_eff)
+        DCR_rx_np = _dcr_ohm(rx_len_m, rx_width_s, rx_h_eff_m).astype(np.float32)
 
         # ── Write variable cols into X_buf (constants already filled) ────
         X = X_buf[:bs_v]
-        X[:, idx_tx_turns] = tx_turns_s
-        X[:, idx_tx_width] = tx_width_s
-        X[:, idx_tx_od]    = tx_od_s
-        X[:, idx_rx_turns] = rx_turns_s
-        X[:, idx_rx_width] = rx_width_s
-        X[:, idx_rx_od]    = rx_od_s
-        X[:, idx_tx_port]  = tx_port_in_s
-        X[:, idx_rx_port]  = rx_port_in_s
-        if idx_tx_l2_turns is not None:
-            X[:, idx_tx_l2_turns] = tx_l2_turns_s
-        # Topology one-hot via vectorised fancy indexing (no per-vocab loop)
-        X[:, idx_tx_topo]  = 0.0
-        X[:, idx_rx_topo]  = 0.0
-        row_arange = np.arange(bs_v)
-        X[row_arange, idx_tx_topo[tx_vocab_pos[tx_topo_idx_s]]] = 1.0
-        X[row_arange, idx_rx_topo[rx_vocab_pos[rx_topo_idx_s]]] = 1.0
+        X[:, idx_tx_turns]       = tx_turns_s
+        X[:, idx_tx_width]       = tx_width_s
+        X[:, idx_tx_od]          = tx_od_s
+        X[:, idx_rx_turns]       = rx_turns_s
+        X[:, idx_rx_inner_turns] = rx_inner_turns_s
+        X[:, idx_rx_width]       = rx_width_s
+        X[:, idx_rx_od]          = rx_od_s
+        X[:, idx_tx_l2_turns]    = tx_l2_turns_s
 
         # ── Inference: scale + forward + unscale, all on GPU ─────────────
         X_t  = torch.from_numpy(X).to(device, non_blocking=True)
@@ -788,19 +756,18 @@ def _nn_sweep(params, log_cb, cancel_flag):
         cap_idx  = new_sel %  n_pairs
 
         # Upload per-geometry arrays once (lazy — only when there are winners)
-        tx_turns_t    = torch.from_numpy(tx_turns_s).to(device, non_blocking=True)
-        tx_l2_turns_t = torch.from_numpy(tx_l2_turns_s).to(device, non_blocking=True)
-        tx_width_t    = torch.from_numpy(tx_width_s).to(device, non_blocking=True)
-        tx_od_t       = torch.from_numpy(tx_od_s).to(device, non_blocking=True)
-        rx_turns_t    = torch.from_numpy(rx_turns_s).to(device, non_blocking=True)
-        rx_width_t = torch.from_numpy(rx_width_s).to(device, non_blocking=True)
-        rx_od_t    = torch.from_numpy(rx_od_s).to(device, non_blocking=True)
-        tx_topo_t  = torch.from_numpy(tx_topo_idx_s.astype(np.int32)).to(device, non_blocking=True)
-        rx_topo_t  = torch.from_numpy(rx_topo_idx_s.astype(np.int32)).to(device, non_blocking=True)
-        tx_port_t  = torch.from_numpy(tx_port_in_s).to(device, non_blocking=True)
-        rx_port_t  = torch.from_numpy(rx_port_in_s).to(device, non_blocking=True)
-        tx_id_t    = torch.from_numpy(tx_id_s).to(device, non_blocking=True)
-        rx_id_t    = torch.from_numpy(rx_id_s).to(device, non_blocking=True)
+        tx_turns_t       = torch.from_numpy(tx_turns_s).to(device, non_blocking=True)
+        tx_l2_turns_t    = torch.from_numpy(tx_l2_turns_s).to(device, non_blocking=True)
+        tx_width_t       = torch.from_numpy(tx_width_s).to(device, non_blocking=True)
+        tx_od_t          = torch.from_numpy(tx_od_s).to(device, non_blocking=True)
+        rx_turns_t       = torch.from_numpy(rx_turns_s).to(device, non_blocking=True)
+        rx_inner_turns_t = torch.from_numpy(rx_inner_turns_s).to(device, non_blocking=True)
+        rx_width_t       = torch.from_numpy(rx_width_s).to(device, non_blocking=True)
+        rx_od_t          = torch.from_numpy(rx_od_s).to(device, non_blocking=True)
+        tx_port_t        = torch.from_numpy(tx_port_in_s).to(device, non_blocking=True)
+        rx_port_t        = torch.from_numpy(rx_port_in_s).to(device, non_blocking=True)
+        tx_id_t          = torch.from_numpy(tx_id_s).to(device, non_blocking=True)
+        rx_id_t          = torch.from_numpy(rx_id_s).to(device, non_blocking=True)
 
         f0_tx_flat_t = f0_tx_2d.reshape(-1)
         f0_rx_flat_t = f0_rx_2d.reshape(-1)
@@ -818,10 +785,9 @@ def _nn_sweep(params, log_cb, cancel_flag):
             "tx_width":       _merge(keep["tx_width"],       tx_width_t[geom_idx]),
             "tx_od_mm":       _merge(keep["tx_od_mm"],       tx_od_t[geom_idx]),
             "rx_turns":       _merge(keep["rx_turns"],       rx_turns_t[geom_idx]),
+            "rx_inner_turns": _merge(keep["rx_inner_turns"], rx_inner_turns_t[geom_idx]),
             "rx_width":       _merge(keep["rx_width"],       rx_width_t[geom_idx]),
             "rx_od_mm":       _merge(keep["rx_od_mm"],       rx_od_t[geom_idx]),
-            "tx_topo":        _merge(keep["tx_topo"],        tx_topo_t[geom_idx]),
-            "rx_topo":        _merge(keep["rx_topo"],        rx_topo_t[geom_idx]),
             "tx_port_inside": _merge(keep["tx_port_inside"], tx_port_t[geom_idx]),
             "rx_port_inside": _merge(keep["rx_port_inside"], rx_port_t[geom_idx]),
             "tx_id_mm":       _merge(keep["tx_id_mm"],       tx_id_t[geom_idx]),
@@ -861,10 +827,9 @@ def _nn_sweep(params, log_cb, cancel_flag):
         "tx_width":       _to_np(keep["tx_width"]),
         "tx_od_mm":       _to_np(keep["tx_od_mm"]),
         "rx_turns":       _to_np(keep["rx_turns"]),
+        "rx_inner_turns": _to_np(keep["rx_inner_turns"]),
         "rx_width":       _to_np(keep["rx_width"]),
         "rx_od_mm":       _to_np(keep["rx_od_mm"]),
-        "tx_topo":        _to_np(keep["tx_topo"]).astype(np.uint8),
-        "rx_topo":        _to_np(keep["rx_topo"]).astype(np.uint8),
         "tx_port_inside": _to_np(keep["tx_port_inside"]),
         "rx_port_inside": _to_np(keep["rx_port_inside"]),
         "gc_dia_mm":      _to_np(keep["gc_dia_mm"]),
@@ -889,8 +854,6 @@ def _nn_sweep(params, log_cb, cancel_flag):
         "f_op_lo_hz":     _to_np(keep["f_op_lo_hz"]),
         "c_tx_nf":        _to_np(keep["c_tx_nf"]),
         "c_rx_nf":        _to_np(keep["c_rx_nf"]),
-        "_tx_topologies": np.array(tx_topologies),
-        "_rx_topologies": np.array(rx_topologies),
         "_freq_ref_hz":   np.float64(freq_ref_hz),
         "_freq_min_hz":   np.float64(freq_min_hz),
         "_freq_max_hz":   np.float64(freq_max_hz),
@@ -909,12 +872,12 @@ def _nn_sweep(params, log_cb, cancel_flag):
 # Pick top-K unique configurations from sweep result
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _top_k(result, tx_topologies, rx_topologies, k=12):
+def _top_k(result, k=12):
     """
     Pick top-K unique configurations from sweep results.
 
-    Dedup key includes both topologies and port_inside booleans, since these
-    materially affect FastHenry results and the surrogate sees them as inputs.
+    Dedup key includes port_inside booleans; topology is fixed
+    (TX=series, RX=4-layer series) on NN_V8 so it's not part of the key.
     Sorted by `score` (efficiency × soft penalties) so the D_min preference
     is respected without hard-gating.
     """
@@ -931,17 +894,14 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
         tx_od = round(float(result["tx_od_mm"][i]), 1)
         tx_w  = round(float(result["tx_width"][i]), 2)
         rx_t  = int(result["rx_turns"][i])
+        rx_in = int(result["rx_inner_turns"][i])
         rx_od = round(float(result["rx_od_mm"][i]), 1)
         rx_w  = round(float(result["rx_width"][i]), 2)
-        tx_t_idx = int(result["tx_topo"][i])
-        rx_t_idx = int(result["rx_topo"][i])
-        tx_topo  = tx_topologies[tx_t_idx] if tx_t_idx < len(tx_topologies) else "parallel"
-        rx_topo  = rx_topologies[rx_t_idx] if rx_t_idx < len(rx_topologies) else "parallel"
         tx_port  = bool(result["tx_port_inside"][i])
         rx_port  = bool(result["rx_port_inside"][i])
         gc       = round(float(result["gc_dia_mm"][i]), 1)
-        key = (tx_t, tx_od, tx_w, rx_t, rx_od, rx_w,
-               tx_topo, rx_topo, tx_port, rx_port, gc)
+        key = (tx_t, tx_od, tx_w, rx_t, rx_in, rx_od, rx_w,
+               tx_port, rx_port, gc)
         if key in seen:
             continue
         seen.add(key)
@@ -950,12 +910,13 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
             "tx_l2_turns":    int(result["tx_l2_turns"][i]) if "tx_l2_turns" in result else 0,
             "tx_width":       float(result["tx_width"][i]),
             "tx_od_mm":       float(result["tx_od_mm"][i]),
-            "tx_topology":    tx_topo,
+            "tx_topology":    _TX_TOPOLOGY,
             "tx_port_inside": tx_port,
             "rx_turns":       rx_t,
+            "rx_inner_turns": rx_in,
             "rx_width":       float(result["rx_width"][i]),
             "rx_od_mm":       float(result["rx_od_mm"][i]),
-            "rx_topology":    rx_topo,
+            "rx_topology":    _RX_TOPOLOGY,
             "rx_port_inside": rx_port,
             "gc_dia_mm":      float(result["gc_dia_mm"][i]),
             "eta_sys":        float(eta[i]),
@@ -988,14 +949,13 @@ def _top_k(result, tx_topologies, rx_topologies, k=12):
 
 def _build_sim_params(winners, params, timeout_sec):
     """
-    Build FastHenry `SimParams` from winning combos (V7 schema).
+    Build FastHenry `SimParams` from winning combos (NN_V8 schema).
 
-    V7 hard-fixes a number of fields inside `parallel_sim`:
-      • tx_topology="series", tx_port_inside=False
-      • rx_port_inside=True; rx_topology is an int index (0=series, 1=ppser)
-      • tx/rx layer stackup is baked into `parallel_sim._TX_LAYERS` / `_RX_LAYERS`
-      • TX uses `tx_l1l2_gap_mm` (no inner gap)
-    The kwargs we pass must match the V7 `SimParams` dataclass exactly.
+    NN_V8 hard-fixes:
+      • TX: series, port_outside, L1+L2 active
+      • RX: series across all 4 active layers, port_inside,
+        with independent outer / inner turn counts
+        (inner trace width auto-computed inside `parallel_sim`).
     """
     from parallel_sim import SimParams
 
@@ -1007,7 +967,6 @@ def _build_sim_params(winners, params, timeout_sec):
 
     tx_d   = domain.get("tx", {})
     rx_d   = domain.get("rx", {})
-    fixed  = domain.get("fixed", {})
 
     def _rng_mid(rng, fallback):
         if isinstance(rng, (list, tuple)) and len(rng) >= 2:
@@ -1020,15 +979,9 @@ def _build_sim_params(winners, params, timeout_sec):
     rx_inner    = _rng_mid(rx_d.get("inner_gap_mm"), 0.6)
 
     pcb_gap_mm  = float(params["pcb_gap_mm"])
-    rx_topos    = fixed.get("rx_topos") or ["series", "parallel_pairs_ser"]
 
     params_list = []
     for w in winners:
-        try:
-            rx_topo_idx = rx_topos.index(w["rx_topology"])
-        except (ValueError, KeyError):
-            rx_topo_idx = 0
-
         p = SimParams(
             tx_turns        = int(w["tx_turns"]),
             tx_od_mm        = round(float(w["tx_od_mm"]), 4),
@@ -1039,12 +992,12 @@ def _build_sim_params(winners, params, timeout_sec):
             tx_nwinc        = int(tx_d.get("nwinc", 3)),
 
             rx_turns        = int(w["rx_turns"]),
+            rx_inner_turns  = int(w.get("rx_inner_turns", 0)),
             rx_od_mm        = round(float(w["rx_od_mm"]), 4),
             rx_w_mm         = round(float(w["rx_width"]), 4),
             rx_spacing_mm   = _SPACING_MM,
             rx_outer_gap_mm = rx_outer,
             rx_inner_gap_mm = rx_inner,
-            rx_topo         = rx_topo_idx,
             rx_nwinc        = int(rx_d.get("nwinc", 3)),
 
             pcb_gap_mm      = pcb_gap_mm,
@@ -1085,23 +1038,28 @@ def _append_to_refined(sim_results, winners, refined_path, log_cb):
     existing_uuids = {r.get("uuid") for r in data["results"] if r.get("uuid")}
     added = 0
 
-    for i, (sr, _w) in enumerate(zip(sim_results, winners)):
+    _INPUT_FIELDS  = ["tx_turns", "tx_l2_turns", "tx_width", "tx_od_mm",
+                      "rx_turns", "rx_inner_turns", "rx_width", "rx_od_mm",
+                      "freq_hz"]
+    _OUTPUT_FIELDS = ["L_tx_uH", "L_rx_uH", "M_uH", "R_tx_ac", "R_rx_ac"]
+
+    for i, (sr, w) in enumerate(zip(sim_results, winners)):
         if sr is None or "error" in sr:
             log_cb(f"    sim {i+1}: FAIL — {(sr or {}).get('error','?')}")
             continue
 
-        row = dict(sr)  # passthrough: freq_hz, L_*, R_*, Q_*, M, k, geometry,
-                        # layers, port_inside, pcb_gap_mm, rx_ground_disc_dia_mm,
-                        # pid, elapsed_sec — all already rounded by the sim.
-        row["uuid"]             = str(uuid.uuid4())
+        row = {k: sr[k] for k in _INPUT_FIELDS + _OUTPUT_FIELDS if k in sr}
+        row["uuid"] = str(uuid.uuid4())
 
         if row["uuid"] not in existing_uuids:
             data["results"].append(row)
             existing_uuids.add(row["uuid"])
             added += 1
+        eta_pct = w.get("eta_sys", 0.0) * 100
         log_cb(f"    sim {i+1}: OK  L_tx={sr.get('L_tx_uH',0):.2f}µH  "
                f"L_rx={sr.get('L_rx_uH',0):.2f}µH  "
-               f"M={sr.get('M_uH',0):.3f}µH  k={sr.get('k',0):.4f}")
+               f"M={sr.get('M_uH',0):.3f}µH  k={sr.get('k',0):.4f}  "
+               f"η={eta_pct:.1f}%")
 
     data["meta"]["n_results"] = len(data["results"])
     tmp = refined_path + ".tmp"
@@ -1117,7 +1075,7 @@ def _append_to_refined(sim_results, winners, refined_path, log_cb):
 # Retrain the model on refined_results.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _retrain(model_dir, refined_path, train_params, log_cb, cancel_flag):
+def _retrain(model_dir, refined_path, train_params, log_cb, log_cb_ow, cancel_flag):
     env = os.environ.copy()
     env["SURROGATE_DATA"]       = refined_path
     env["SURROGATE_OUTPUT_DIR"] = model_dir
@@ -1127,6 +1085,7 @@ def _retrain(model_dir, refined_path, train_params, log_cb, cancel_flag):
     env["SURROGATE_VAL_SPLIT"]  = str(train_params["val_split"])
 
     log_cb("  Retraining model…")
+    log_cb("    ")  # seed a blank line for epoch overwrites
     try:
         proc = subprocess.Popen(
             [sys.executable, "-u", _TRAIN_SCRIPT],
@@ -1136,7 +1095,12 @@ def _retrain(model_dir, refined_path, train_params, log_cb, cancel_flag):
             if cancel_flag.is_set():
                 proc.terminate()
                 return False
-            log_cb("    " + line.rstrip())
+            stripped = line.rstrip()
+            # Epoch progress lines are overwritten in-place; others appended normally
+            if stripped.startswith("Epoch "):
+                log_cb_ow("    " + stripped)
+            else:
+                log_cb("    " + stripped)
         proc.wait()
         if proc.returncode != 0:
             log_cb(f"  Training exited with code {proc.returncode}")
@@ -1152,7 +1116,7 @@ def _retrain(model_dir, refined_path, train_params, log_cb, cancel_flag):
 # Main optimisation loop (runs in background thread)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
+def _run_optimisation(params, progress_cb, log_cb, log_cb_ow, done_cb, cancel_flag):
     try:
         model_dir     = params["model_dir"]
         max_iters     = params["max_iters"]
@@ -1175,8 +1139,6 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                 with open(refined_path, "w") as f:
                     json.dump({"meta": {}, "results": []}, f)
 
-        tx_topologies = params["tx_topologies"]
-        rx_topologies = params["rx_topologies"]
         prev_winners  = []
         win_streak    = 0
 
@@ -1196,14 +1158,15 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
             log_cb(f"Phase 1: NN sweep ({params['n_combos']:,} combinations)…")
             sweep_seed_params = dict(params)
             sweep_seed_params["rng_seed"] = 42 + iteration
-            sweep_result = _nn_sweep(sweep_seed_params, log_cb, cancel_flag)
+            sweep_seed_params["log_features"] = (iteration == 1)
+            sweep_result = _nn_sweep(sweep_seed_params, log_cb, log_cb_ow, cancel_flag)
             if sweep_result is None:
                 log_cb("Cancelled during sweep.")
                 done_cb(None)
                 return
 
             # --- Pick top-K ---
-            winners = _top_k(sweep_result, tx_topologies, rx_topologies, k=top_k)
+            winners = _top_k(sweep_result, k=top_k)
             if not winners:
                 log_cb("  No feasible combinations found — stopping.")
                 break
@@ -1253,10 +1216,11 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
 
             from parallel_sim import run_batch as _run_batch
             sim_counter = [0]
+            log_cb(f"    FastHenry: 0/{len(winners)}")  # seed the line to overwrite
 
             def _prog(done, total, _i=iteration, _mi=max_iters):
                 sim_counter[0] = done
-                log_cb(f"    FastHenry: {done}/{total}")
+                log_cb_ow(f"    FastHenry: {done}/{total}")
                 frac = ((_i - 1) + (done / max(total, 1)) * 0.5) / _mi
                 progress_cb(frac * 0.9)
 
@@ -1265,7 +1229,7 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
                                      progress_cb=_prog)
 
             ok_count = sum(1 for r in sim_results if r and "error" not in r)
-            log_cb(f"  FastHenry: {ok_count}/{len(sim_results)} OK")
+            log_cb_ow(f"    FastHenry: {ok_count}/{len(sim_results)} OK")
 
             # --- Append to refined ---
             log_cb("\nPhase 3: Appending to refined_results.json…")
@@ -1273,7 +1237,7 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
 
             # --- Retrain ---
             log_cb("\nPhase 4: Retraining model…")
-            ok = _retrain(model_dir, refined_path, train_params, log_cb, cancel_flag)
+            ok = _retrain(model_dir, refined_path, train_params, log_cb, log_cb_ow, cancel_flag)
             if not ok or cancel_flag.is_set():
                 log_cb("Retrain failed or cancelled.")
                 done_cb(None)
@@ -1285,9 +1249,10 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
         log_cb(f"{'='*60}")
         final_seed_params = dict(params)
         final_seed_params["rng_seed"] = 42 + max_iters + 1
-        final_result = _nn_sweep(final_seed_params, log_cb, cancel_flag)
+        final_seed_params["log_features"] = False
+        final_result = _nn_sweep(final_seed_params, log_cb, log_cb_ow, cancel_flag)
         if final_result is not None and not cancel_flag.is_set():
-            final_winners = _top_k(final_result, tx_topologies, rx_topologies, k=top_k)
+            final_winners = _top_k(final_result, k=top_k)
             if final_winners:
                 prev_winners = final_winners
                 top1 = final_winners[0]
@@ -1331,12 +1296,13 @@ def _run_optimisation(params, progress_cb, log_cb, done_cb, cancel_flag):
 
 def _same_config(a, b):
     return (int(a["tx_turns"]) == int(b["tx_turns"])
+            and int(a.get("tx_l2_turns", 0)) == int(b.get("tx_l2_turns", 0))
             and int(a["rx_turns"]) == int(b["rx_turns"])
+            and int(a.get("rx_inner_turns", 0)) == int(b.get("rx_inner_turns", 0))
             and round(a["tx_od_mm"], 1) == round(b["tx_od_mm"], 1)
             and round(a["rx_od_mm"], 1) == round(b["rx_od_mm"], 1)
             and round(a["tx_width"], 2) == round(b["tx_width"], 2)
-            and round(a["rx_width"], 2) == round(b["rx_width"], 2)
-            and a["rx_topology"] == b["rx_topology"])
+            and round(a["rx_width"], 2) == round(b["rx_width"], 2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1584,13 +1550,14 @@ class NNOptimisationTab(ttk.Frame):
 
     def load_domain_from_model(self, model_dir: str):
         """
-        Read a V7-style `domain.json`:
-          • tx/rx OD given as a range `od_mm: [lo, hi]` (no `od_max_mm`).
-          • Topologies are fixed: `fixed.tx_topology` (single string) and
-            `fixed.rx_topos` (list — what the trainer one-hots over).
-          • Stackup is fixed per side under `fixed.tx_layers`/`fixed.rx_layers`.
-          • Ground disc: `rx.ground_disc_dia_mm` (0 disables; no min/max range).
-          • New `tx.l2_turns` range — separate sampling dimension.
+        Read a NN_V8-style `domain.json`:
+          • tx/rx OD given as a range `od_mm: [lo, hi]`.
+          • Both topologies are fixed: `fixed.tx_topology` and
+            `fixed.rx_topology` — TX series (L1+L2), RX series across all
+            4 active layers with independent outer/inner turn counts.
+          • Stackup fixed per side under `fixed.tx_layers`/`fixed.rx_layers`.
+          • Ground disc: `rx.ground_disc_dia_mm` (0 disables).
+          • `tx.l2_turns` and `rx.inner_turns` are separate sampling dims.
         """
         domain = _load_domain(model_dir)
         self._domain = domain
@@ -1656,10 +1623,11 @@ class NNOptimisationTab(ttk.Frame):
 
         freq     = glb.get("freq_hz", [0, 0])
         tx_topo  = fixed.get("tx_topology", "series")
-        rx_topos = fixed.get("rx_topos", []) or rx.get("allowed_topologies", [])
+        rx_topo  = fixed.get("rx_topology", "series")
         tx_turns = tx.get("turns", ["-", "-"])
         rx_turns = rx.get("turns", ["-", "-"])
         l2_turns = tx.get("l2_turns", ["-", "-"])
+        rx_inner = rx.get("inner_turns", ["-", "-"])
 
         gc_str   = (f"{self._fixed_gc_dia_mm:.1f} mm"
                     if self._fixed_gc_dia_mm > 0 else "off")
@@ -1671,7 +1639,8 @@ class NNOptimisationTab(ttk.Frame):
             f"turns {tx_turns[0]}–{tx_turns[1]} | L2 {l2_turns[0]}–{l2_turns[1]} | "
             f"topo: {tx_topo} (fixed)\n"
             f"RX: OD {rx.get('od_mm', '?')} mm | ID ≥ {rx_id_lo:.1f} mm | "
-            f"turns {rx_turns[0]}–{rx_turns[1]} | topos: {', '.join(rx_topos)}\n"
+            f"outer {rx_turns[0]}–{rx_turns[1]} | inner {rx_inner[0]}–{rx_inner[1]} | "
+            f"topo: {rx_topo} 4-layer (fixed)\n"
             f"Freq: {freq[0]/1e3:.0f}–{freq[1]/1e3:.0f} kHz  |  "
             f"PCB gap {self._fixed_pcb_gap_mm:.2f} mm  |  GC: {gc_str}\n"
             f"Stackup oz  TX: {tx_oz_s}   RX: {rx_oz_s}   (all fixed by trainer)"
@@ -1799,7 +1768,7 @@ class NNOptimisationTab(ttk.Frame):
         threading.Thread(
             target=_run_optimisation,
             args=(params, self._progress_cb, self._log_cb,
-                  self._done_cb, self._cancel_flag),
+                  self._log_cb_overwrite, self._done_cb, self._cancel_flag),
             daemon=True,
         ).start()
 
@@ -1812,6 +1781,9 @@ class NNOptimisationTab(ttk.Frame):
 
     def _log_cb(self, msg):
         self.after(0, lambda m=msg: self._log_append(m))
+
+    def _log_cb_overwrite(self, msg):
+        self.after(0, lambda m=msg: self._log_overwrite(m))
 
     def _done_cb(self, result):
         self.after(0, lambda: self._on_done(result))
@@ -1863,7 +1835,6 @@ class NNOptimisationTab(ttk.Frame):
         tx    = self._domain.get("tx", {})
         rx    = self._domain.get("rx", {})
         glb   = self._domain.get("global", {})
-        fixed = self._domain.get("fixed", {})
 
         def _hi(rng, fallback):
             if isinstance(rng, (list, tuple)) and len(rng) >= 2:
@@ -1879,13 +1850,8 @@ class NNOptimisationTab(ttk.Frame):
         dom_tx_turns  = tx.get("turns", [3, 99])
         dom_rx_turns  = rx.get("turns", [3, 99])
         dom_tx_l2     = tx.get("l2_turns", [1, int(dom_tx_turns[1])])
+        dom_rx_inner  = rx.get("inner_turns", [1, int(dom_rx_turns[1])])
         dom_freq      = glb.get("freq_hz", [340000.0, 380000.0])
-        # V7: TX topology is fixed (single); RX has a closed vocab.
-        tx_topo_fixed = fixed.get("tx_topology", "series")
-        tx_topos      = [tx_topo_fixed]
-        rx_topos      = (fixed.get("rx_topos")
-                         or rx.get("allowed_topologies")
-                         or ["parallel", "series", "parallel_pairs_ser"])
 
         tx_od_max = min(flt(self._tx_od_max, "TX OD max", lo=10.0), dom_tx_od_max)
         tx_id_min = max(flt(self._tx_id_min, "TX ID min", lo=0.0), dom_tx_id_min)
@@ -1981,8 +1947,8 @@ class NNOptimisationTab(ttk.Frame):
             rx_width_min=dom_rx_w[0], rx_width_max=dom_rx_w[1],
             rx_turns_min=int(dom_rx_turns[0]),
             rx_turns_max=int(dom_rx_turns[1]),
-            tx_topologies=tx_topos,
-            rx_topologies=rx_topos,
+            rx_inner_turns_min=int(dom_rx_inner[0]),
+            rx_inner_turns_max=int(dom_rx_inner[1]),
             freq_min_hz=freq_min_hz, freq_max_hz=freq_max_hz,
             gc_enabled=gc_enabled, gc_dia_mm=gc_dia_mm,
             p_target_w=p_target_w, v_min=v_min, v_max=v_max,
@@ -2070,7 +2036,8 @@ class NNOptimisationTab(ttk.Frame):
                                     for ld in tx_layers],
                    "nodes_by_layer": [list(ld["nodes"]) for ld in tx_layers]}
 
-        rx_topo = r["rx_topology"]
+        rx_topo = _RX_TOPOLOGY
+        rx_inner_t = int(r.get("rx_inner_turns", 0)) or int(r["rx_turns"])
         rx_sp   = pc.SpiralParams(
             od_mm=r["rx_od_mm"], trace_width_mm=r["rx_width"],
             spacing_mm=_SPACING_MM, turns=r["rx_turns"], resolution_mm=0.6)
@@ -2083,14 +2050,15 @@ class NNOptimisationTab(ttk.Frame):
         ok, msg = pc.validate_spiral(rx_sp)
         if not ok:
             raise ValueError(f"RX spiral invalid: {msg}")
-        rx_layers = pc.active_layer_data(rx_sp, rx_stackup)
+        rx_layers, _ = pc.active_layer_data_rx_independent(rx_sp, rx_stackup, rx_inner_t)
         rx_path   = os.path.join(temp_dir, "nn_auto_rx.inp")
         pc.write_topology_inp(rx_topo, rx_layers, rx_path,
                               w_mm=r["rx_width"], fmin=fmin, fmax=fmax)
         rx_flags  = pc.series_reverse_flags_for_topology(rx_topo, len(rx_layers))
         rx_native = pc.reverse_nodes_for_series_flow(rx_layers, rx_flags)
         rx_meta = {"role": "RX", "topology": rx_topo,
-                   "layer_params": [(r["rx_width"], ld["h_mm"], len(ld["nodes"]))
+                   "layer_params": [(ld.get("w_mm", r["rx_width"]),
+                                     ld["h_mm"], len(ld["nodes"]))
                                     for ld in rx_native],
                    "nodes_by_layer": [list(ld["nodes"]) for ld in rx_native]}
 
@@ -2108,9 +2076,21 @@ class NNOptimisationTab(ttk.Frame):
         self._log_text.configure(state="disabled")
 
     def _log_append(self, msg):
+        at_bottom = self._log_text.yview()[1] >= 0.999
         self._log_text.configure(state="normal")
         self._log_text.insert("end", msg + "\n")
-        self._log_text.see("end")
+        if at_bottom:
+            self._log_text.see("end")
+        self._log_text.configure(state="disabled")
+
+    def _log_overwrite(self, msg):
+        """Replace the last line in the log (for progress updates)."""
+        at_bottom = self._log_text.yview()[1] >= 0.999
+        self._log_text.configure(state="normal")
+        self._log_text.delete("end-1l linestart", "end-1c")
+        self._log_text.insert("end", msg)
+        if at_bottom:
+            self._log_text.see("end")
         self._log_text.configure(state="disabled")
 
     def _set_status(self, msg, color="gray"):
