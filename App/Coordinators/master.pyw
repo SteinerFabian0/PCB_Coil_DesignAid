@@ -37,7 +37,7 @@ from sim_nn_tab import SimNNTab
 from dxf_coil_tab import DxfCoilTab
 from nn_setup import AutomationTab
 from nn_optimisation import NNOptimisationTab
-from nn_analysis_tab import NNAnalysisTab
+from results_tab import ResultsTab
 
 PROJECT_ROOT = os.path.dirname(_APP_ROOT)
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
@@ -105,35 +105,35 @@ class CoilApp(tk.Tk):
         self.auto_tab    = AutomationTab(nb, app=self)
         self.nn_optim_tab = NNOptimisationTab(nb, app=self,
                                              on_next_tab=lambda: self._advance_tab(6))
-        self.nn_analysis_tab = NNAnalysisTab(nb, app=self)
+        self.results_tab = ResultsTab(nb, app=self)
 
-        nb.add(self.dxf_tx_tab,      text="  DXF TX  ")
-        nb.add(self.dxf_rx_tab,      text="  DXF RX  ")
-        nb.add(self.param_tx_tab,    text="  Parametric TX  ")
-        nb.add(self.param_rx_tab,    text="  Parametric RX  ")
-        nb.add(self.sim_tab,         text="  Simulation  ")
-        nb.add(self.sim_nn_tab,      text="  Simulation NN  ")
-        nb.add(self.auto_tab,        text="  NN Setup  ")
-        nb.add(self.nn_optim_tab,    text="  NN Optimisation  ", state="disabled")
-        nb.add(self.nn_analysis_tab, text="  NN Analysis  ")
+        nb.add(self.dxf_tx_tab,   text="  DXF TX  ")
+        nb.add(self.dxf_rx_tab,   text="  DXF RX  ")
+        nb.add(self.param_tx_tab, text="  Parametric TX  ")
+        nb.add(self.param_rx_tab, text="  Parametric RX  ")
+        nb.add(self.sim_tab,      text="  Simulation  ")
+        nb.add(self.sim_nn_tab,   text="  Simulation NN  ")
+        nb.add(self.auto_tab,     text="  NN Setup  ")
+        nb.add(self.nn_optim_tab, text="  NN Optimisation  ", state="disabled")
+        nb.add(self.results_tab,  text="  Results  ")
 
         self._ordered_tabs = [self.dxf_tx_tab, self.dxf_rx_tab,
                               self.param_tx_tab, self.param_rx_tab,
                               self.sim_tab, self.auto_tab,
-                              self.nn_optim_tab, self.nn_analysis_tab]
+                              self.nn_optim_tab, self.results_tab]
 
         # Restore active tab from savestate, fall back to Parametric TX.
         saved_tab_name = self._state.get("ui", {}).get("active_tab", "")
         _tab_map = {
-            "dxf_tx":       self.dxf_tx_tab,
-            "dxf_rx":       self.dxf_rx_tab,
-            "param_tx":     self.param_tx_tab,
-            "param_rx":     self.param_rx_tab,
-            "simulation":   self.sim_tab,
-            "sim_nn":       self.sim_nn_tab,
-            "nn_setup":     self.auto_tab,
-            "nn_optim":     self.nn_optim_tab,
-            "nn_analysis":  self.nn_analysis_tab,
+            "dxf_tx":      self.dxf_tx_tab,
+            "dxf_rx":      self.dxf_rx_tab,
+            "param_tx":    self.param_tx_tab,
+            "param_rx":    self.param_rx_tab,
+            "simulation":  self.sim_tab,
+            "sim_nn":      self.sim_nn_tab,
+            "nn_setup":    self.auto_tab,
+            "nn_optim":    self.nn_optim_tab,
+            "results":     self.results_tab,
         }
         _start_tab = _tab_map.get(saved_tab_name, self.param_tx_tab)
         nb.select(_start_tab)
