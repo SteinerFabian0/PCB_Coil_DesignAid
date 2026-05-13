@@ -1179,10 +1179,18 @@ def _run_optimisation(params, progress_cb, log_cb, log_cb_ow, done_cb, cancel_fl
             _rx_off   = ((_f0_rx - _f_op_lo) / 1e3) if (_f0_rx > 0 and _f_op_lo > 0) else 0.0
             _M_uH     = top1.get("M_uH", 0.0)
             _k        = top1.get("k", 0.0)
-            log_cb(f"\nTop winner: TX {top1['tx_od_mm']:.1f}mm {top1['tx_turns']}t "
+            _tx_l1 = int(top1.get("tx_turns", 0))
+            _tx_l2 = int(top1.get("tx_l2_turns", 0))
+            _tx_tot = _tx_l1 + _tx_l2
+            _rx_out = int(top1.get("rx_turns", 0))
+            _rx_in  = int(top1.get("rx_inner_turns", 0))
+            _rx_tot = 2 * _rx_out + 2 * _rx_in
+            log_cb(f"\nTop winner: TX {top1['tx_od_mm']:.1f}mm "
+                   f"L1={_tx_l1}t L2={_tx_l2}t (Σ={_tx_tot}t)  "
                    f"w={top1['tx_width']:.2f}  |  "
-                   f"RX {top1['rx_od_mm']:.1f}mm {top1['rx_turns']}t "
-                   f"w={top1['rx_width']:.2f} {top1['rx_topology']}")
+                   f"RX {top1['rx_od_mm']:.1f}mm "
+                   f"outer={_rx_out}t×2 inner={_rx_in}t×2 (Σ={_rx_tot}t)  "
+                   f"w={top1['rx_width']:.2f}")
             log_cb(f"  η={top1['eta_sys']*100:.1f}%  "
                    f"D@Vmax={min(top1.get('D_vmax', 1.0), 1.0)*100:.0f}%  "
                    f"D@Vmin={min(top1.get('D_vmin', 1.0), 1.0)*100:.0f}%  "
@@ -1264,10 +1272,18 @@ def _run_optimisation(params, progress_cb, log_cb, log_cb_ow, done_cb, cancel_fl
                 _rx_off  = ((_f0_rx - _f_op) / 1e3) if (_f0_rx > 0 and _f_op > 0) else 0.0
                 _M_uH    = top1.get("M_uH", 0.0)
                 _k       = top1.get("k", 0.0)
-                log_cb(f"\nFinal top winner: TX {top1['tx_od_mm']:.1f}mm {top1['tx_turns']}t "
+                _tx_l1  = int(top1.get("tx_turns", 0))
+                _tx_l2  = int(top1.get("tx_l2_turns", 0))
+                _tx_tot = _tx_l1 + _tx_l2
+                _rx_out = int(top1.get("rx_turns", 0))
+                _rx_in  = int(top1.get("rx_inner_turns", 0))
+                _rx_tot = 2 * _rx_out + 2 * _rx_in
+                log_cb(f"\nFinal top winner: TX {top1['tx_od_mm']:.1f}mm "
+                       f"L1={_tx_l1}t L2={_tx_l2}t (Σ={_tx_tot}t)  "
                        f"w={top1['tx_width']:.2f}  |  "
-                       f"RX {top1['rx_od_mm']:.1f}mm {top1['rx_turns']}t "
-                       f"w={top1['rx_width']:.2f} {top1['rx_topology']}")
+                       f"RX {top1['rx_od_mm']:.1f}mm "
+                       f"outer={_rx_out}t×2 inner={_rx_in}t×2 (Σ={_rx_tot}t)  "
+                       f"w={top1['rx_width']:.2f}")
                 log_cb(f"  η={top1['eta_sys']*100:.1f}%  "
                        f"D@Vmax={min(top1.get('D_vmax', 1.0), 1.0)*100:.0f}%  "
                        f"D@Vmin={min(top1.get('D_vmin', 1.0), 1.0)*100:.0f}%  "
@@ -1800,11 +1816,13 @@ class NNOptimisationTab(ttk.Frame):
         winner = result.get("winner")
         iters  = result.get("iterations", "?")
         if winner:
+            _tx_tot = int(winner.get("tx_turns", 0)) + int(winner.get("tx_l2_turns", 0))
+            _rx_tot = 2 * int(winner.get("rx_turns", 0)) + 2 * int(winner.get("rx_inner_turns", 0))
             self._set_status(
                 f"Done after {iters} iteration(s).  "
-                f"Winner: TX {winner['tx_od_mm']:.1f}mm {winner['tx_turns']}t  "
-                f"RX {winner['rx_od_mm']:.1f}mm {winner['rx_turns']}t "
-                f"{winner['rx_topology']}  η={winner['eta_sys']*100:.1f}%",
+                f"Winner: TX {winner['tx_od_mm']:.1f}mm Σ{_tx_tot}t  "
+                f"RX {winner['rx_od_mm']:.1f}mm Σ{_rx_tot}t  "
+                f"η={winner['eta_sys']*100:.1f}%",
                 color="green")
         else:
             self._set_status(f"Done after {iters} iteration(s).", color="green")

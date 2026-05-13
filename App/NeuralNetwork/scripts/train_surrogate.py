@@ -42,6 +42,10 @@ EPOCHS      = int(os.environ.get("SURROGATE_EPOCHS",     "600"))
 BATCH_SIZE  = int(os.environ.get("SURROGATE_BATCH_SIZE", "1024"))
 LR          = float(os.environ.get("SURROGATE_LR",       "1e-3"))
 VAL_SPLIT   = float(os.environ.get("SURROGATE_VAL_SPLIT", "0.20"))
+# Optional step-LR decay: at LR_DROP_EPOCH, multiply LR by LR_DROP_FACTOR.
+# Setting LR_DROP_EPOCH=0 disables it (default).
+LR_DROP_EPOCH  = int(os.environ.get("SURROGATE_LR_DROP_EPOCH",  "0"))
+LR_DROP_FACTOR = float(os.environ.get("SURROGATE_LR_DROP_FACTOR", "0.1"))
 RANDOM_SEED = 42
 PRINT_EVERY = max(1, EPOCHS // 20)
 
@@ -197,6 +201,10 @@ def train(model, X_train, y_train, X_val, y_val, device):
                 val_loss = criterion(pred.float(), yt_val).item()
 
         scheduler.step(val_loss)
+        if LR_DROP_EPOCH and epoch == LR_DROP_EPOCH:
+            for pg in optimizer.param_groups:
+                pg["lr"] *= LR_DROP_FACTOR
+            print(f"  [LR drop] epoch {epoch}: lr -> {optimizer.param_groups[0]['lr']:.2e}")
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
@@ -209,15 +217,17 @@ def train(model, X_train, y_train, X_val, y_val, device):
             print(f"Epoch {epoch:>4}/{EPOCHS}  |  Train MSE: {train_loss:.6f}  |  Val MSE: {val_loss:.6f}")
 
     print(f"\nBest val loss  : {best_val_loss:.6f}  (epoch {best_epoch})")
+    print(f"BEST_VAL_MSE={best_val_loss:.8f} BEST_EPOCH={best_epoch}")
     model.load_state_dict(best_state)
-    return train_losses, val_losses
+    return train_losses, val_losses, best_val_loss, best_epoch
 
 
 # ---------------------------------------------------------------------------
 # 5. Save artifacts
 # ---------------------------------------------------------------------------
 
-def save_artifacts(model, x_scaler, y_scaler, train_losses, val_losses):
+def save_artifacts(model, x_scaler, y_scaler, train_losses, val_losses,
+                   best_val_loss=None, best_epoch=None):
     model_path    = os.path.join(OUTPUT_DIR, "surrogate_model.pth")
     x_scaler_path = os.path.join(OUTPUT_DIR, "x_scaler.pkl")
     y_scaler_path = os.path.join(OUTPUT_DIR, "y_scaler.pkl")
@@ -227,13 +237,24 @@ def save_artifacts(model, x_scaler, y_scaler, train_losses, val_losses):
     joblib.dump(x_scaler, x_scaler_path)
     joblib.dump(y_scaler, y_scaler_path)
 
+    drop_note = (f"  |  LR drop @ epoch {LR_DROP_EPOCH} ×{LR_DROP_FACTOR}"
+                 if LR_DROP_EPOCH else "  |  no LR drop")
+    best_note = ""
+    if best_val_loss is not None and best_epoch is not None:
+        best_note = f"\nBest val MSE: {best_val_loss:.6f}  (epoch {best_epoch})"
+    title = (f"Surrogate NN — batch={BATCH_SIZE}  lr={LR:g}"
+             f"{drop_note}{best_note}")
+
     plt.figure(figsize=(9, 5))
-    plt.plot(train_losses, label="Train MSE", linewidth=1.5)
-    plt.plot(val_losses,   label="Val MSE",   linewidth=1.5)
+    plt.plot(train_losses, label=f"Train MSE  (lr={LR:g})", linewidth=1.5)
+    plt.plot(val_losses,   label=f"Val MSE  (batch={BATCH_SIZE})", linewidth=1.5)
+    if LR_DROP_EPOCH and LR_DROP_EPOCH < len(train_losses):
+        plt.axvline(LR_DROP_EPOCH, color="gray", linestyle="--", linewidth=0.8,
+                    label=f"LR ×{LR_DROP_FACTOR} @ {LR_DROP_EPOCH}")
     plt.yscale("log")
     plt.xlabel("Epoch")
     plt.ylabel("MSE Loss (log scale)")
-    plt.title("Surrogate NN — Training vs Validation Loss")
+    plt.title(title)
     plt.legend()
     plt.tight_layout()
     plt.savefig(plot_path, dpi=150)
@@ -262,14 +283,18 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {total_params:,} parameters  |  Input dim: {n_inputs}\n")
 
-    print(f"Training {EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}\n")
-    train_losses, val_losses = train(model, X_train, y_train, X_val, y_val, device)
+    drop_note = (f", lr_drop@{LR_DROP_EPOCH} x{LR_DROP_FACTOR}"
+                 if LR_DROP_EPOCH else "")
+    print(f"Training {EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}{drop_note}\n")
+    train_losses, val_losses, best_val_loss, best_epoch = train(
+        model, X_train, y_train, X_val, y_val, device)
 
     final_train = train_losses[-1]
     final_val   = val_losses[-1]
     print(f"\nFinal  — Train: {final_train:.6f}  |  Val: {final_val:.6f}")
 
-    save_artifacts(model, x_scaler, y_scaler, train_losses, val_losses)
+    save_artifacts(model, x_scaler, y_scaler, train_losses, val_losses,
+                   best_val_loss=best_val_loss, best_epoch=best_epoch)
 
 
 if __name__ == "__main__":

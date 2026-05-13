@@ -28,9 +28,10 @@ _NN_DIR      = os.path.join(_APP_ROOT, "NeuralNetwork")
 _MODULES_DIR = os.path.join(_APP_ROOT, "Modules")
 _SCRIPTS_DIR = os.path.join(_NN_DIR, "scripts")
 
-_GEN_SCRIPT   = os.path.join(_SCRIPTS_DIR, "generate_lhs_samples.py")
-_SWEEP_SCRIPT = os.path.join(_SCRIPTS_DIR, "run_sweep.py")
-_TRAIN_SCRIPT = os.path.join(_SCRIPTS_DIR, "train_surrogate.py")
+_GEN_SCRIPT      = os.path.join(_SCRIPTS_DIR, "generate_lhs_samples.py")
+_SWEEP_SCRIPT    = os.path.join(_SCRIPTS_DIR, "run_sweep.py")
+_TRAIN_SCRIPT    = os.path.join(_SCRIPTS_DIR, "train_surrogate.py")
+_HP_SWEEP_SCRIPT = os.path.join(_SCRIPTS_DIR, "hp_sweep.py")
 
 for _p in (_NN_DIR, _MODULES_DIR):
     if _p not in sys.path:
@@ -53,6 +54,7 @@ def _results_path(folder):   return os.path.join(folder, "results.json")
 def _model_path(folder):     return os.path.join(folder, "surrogate_model.pth")
 def _loss_plot_path(folder): return os.path.join(folder, "loss_curve.png")
 def _stop_flag(folder):      return os.path.join(folder, "STOP_SWEEP")
+def _hp_plots_dir(folder):   return os.path.join(folder, "hp_sweep_plots")
 
 ST_EMPTY   = "empty"
 ST_SAMPLES = "samples"
@@ -704,6 +706,15 @@ class AutomationTab(ttk.Frame):
                                           state="disabled")
         self._stop_train_btn.pack(anchor="w")
 
+        f = ttk.Frame(hp_row); f.pack(side="left", padx=(0, 8))
+        self._hp_sweep_btn = ttk.Button(
+            f, text="Run HP Sweep",
+            command=self._on_hp_sweep_start)
+        self._hp_sweep_btn.pack(anchor="w", pady=(0, 2))
+        ttk.Label(f, text="batch × lr × lr-drop",
+                  foreground="gray",
+                  font=("TkDefaultFont", 7)).pack(anchor="w")
+
         f = ttk.Frame(hp_row); f.pack(side="left")
         self._train_status    = tk.StringVar(value="—")
         self._train_epoch_var = tk.StringVar(value="")
@@ -736,25 +747,39 @@ class AutomationTab(ttk.Frame):
                   foreground="#4ec94e",
                   font=("TkDefaultFont", 11, "bold")).pack(side="left")
         ttk.Button(top_row, text="Next Tab →", command=self._go_next_tab).pack(side="right")
+        ttk.Button(top_row, text="Delete Model",
+                   command=self._on_delete_model).pack(side="right", padx=(0, 6))
 
-        plot = _loss_plot_path(folder)
-        if os.path.exists(plot):
-            try:
-                from PIL import Image, ImageTk
-                img_pil = Image.open(plot)
-                img_pil.thumbnail((700, 350))
-                img_tk  = ImageTk.PhotoImage(img_pil)
-                lbl = ttk.Label(parent, image=img_tk)
-                lbl.image = img_tk
-                lbl.pack(pady=8)
-            except ImportError:
-                ttk.Label(parent, text=f"(install Pillow to preview {plot})",
-                          foreground="gray").pack(pady=4)
-            except Exception as e:
-                ttk.Label(parent, text=f"Could not load plot: {e}",
-                          foreground="red").pack(pady=4)
+        plots_dir = _hp_plots_dir(folder)
+        sweep_plots = []
+        if os.path.isdir(plots_dir):
+            sweep_plots = sorted(
+                os.path.join(plots_dir, f)
+                for f in os.listdir(plots_dir)
+                if f.lower().endswith(".png")
+            )
 
-        art_row = ttk.Frame(parent); art_row.pack(pady=4)
+        if sweep_plots:
+            self._build_sweep_grid(parent, folder, sweep_plots)
+        else:
+            plot = _loss_plot_path(folder)
+            if os.path.exists(plot):
+                try:
+                    from PIL import Image, ImageTk
+                    img_pil = Image.open(plot)
+                    img_pil.thumbnail((700, 350))
+                    img_tk  = ImageTk.PhotoImage(img_pil)
+                    lbl = ttk.Label(parent, image=img_tk)
+                    lbl.image = img_tk
+                    lbl.pack(pady=8)
+                except ImportError:
+                    ttk.Label(parent, text=f"(install Pillow to preview {plot})",
+                              foreground="gray").pack(pady=4)
+                except Exception as e:
+                    ttk.Label(parent, text=f"Could not load plot: {e}",
+                              foreground="red").pack(pady=4)
+
+        art_row = ttk.Frame(parent); art_row.pack(pady=(4, 2))
         for name, fn in [("surrogate_model.pth", _model_path),
                           ("x_scaler.pkl",  lambda f: os.path.join(f, "x_scaler.pkl")),
                           ("y_scaler.pkl",  lambda f: os.path.join(f, "y_scaler.pkl")),
@@ -765,6 +790,86 @@ class AutomationTab(ttk.Frame):
 
         ttk.Label(parent, text=f"Folder: {folder}",
                   foreground="gray", font=("Consolas", 8)).pack(pady=(4, 0))
+
+    def _build_sweep_grid(self, parent, folder, plot_paths):
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            ttk.Label(parent,
+                      text="(install Pillow to preview sweep plots)",
+                      foreground="gray").pack(pady=8)
+            return
+
+        hdr = ttk.Frame(parent); hdr.pack(fill="x", padx=12, pady=(4, 2))
+        ttk.Label(hdr,
+                  text=f"HP sweep — {len(plot_paths)} trials  "
+                       f"(click a thumbnail to open full size)",
+                  foreground="#80c8ff").pack(side="left")
+
+        # Scrollable canvas hosting the grid.
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        canvas = tk.Canvas(outer, highlightthickness=0,
+                           background=self._get_bg())
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas)
+        canvas_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_win, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+
+        # Build thumbnail grid — 4 columns, tightly packed.
+        thumb_w, thumb_h = 480, 270
+        cols = 5
+        self._sweep_thumb_refs = []  # prevent GC
+
+        for i, path in enumerate(plot_paths):
+            try:
+                pil = Image.open(path)
+                pil.thumbnail((thumb_w, thumb_h))
+                tkimg = ImageTk.PhotoImage(pil)
+            except Exception as exc:
+                ttk.Label(inner, text=f"(load failed: {os.path.basename(path)}: {exc})",
+                          foreground="red").grid(row=i // cols, column=i % cols,
+                                                 padx=2, pady=2)
+                continue
+            self._sweep_thumb_refs.append(tkimg)
+
+            cell = ttk.Frame(inner)
+            cell.grid(row=i // cols, column=i % cols, padx=1, pady=1, sticky="n")
+
+            btn = ttk.Button(cell, image=tkimg, padding=0,
+                             command=lambda p=path: self._open_path(p))
+            btn.image = tkimg
+            btn.pack()
+            ttk.Label(cell, text=os.path.basename(path),
+                      foreground="gray",
+                      font=("Consolas", 8)).pack(pady=(0, 0))
+
+    def _get_bg(self):
+        try:
+            return ttk.Style().lookup("TFrame", "background") or "#2b2b2b"
+        except Exception:
+            return "#2b2b2b"
+
+    def _open_path(self, path):
+        try:
+            os.startfile(path)  # Windows: open with default image viewer
+        except Exception as exc:
+            self._log(f"[open] {path}: {exc}")
 
     # ================================================================ log helpers
 
@@ -853,6 +958,8 @@ class AutomationTab(ttk.Frame):
                 self._log_train(f"[train] Exited with code {rc}.")
             if hasattr(self, "_train_btn"):
                 self._train_btn.config(state="normal")
+            if hasattr(self, "_hp_sweep_btn"):
+                self._hp_sweep_btn.config(state="normal")
             if hasattr(self, "_stop_train_btn"):
                 self._stop_train_btn.config(state="disabled")
             self.after(500, self._do_state_check)
@@ -1058,6 +1165,8 @@ class AutomationTab(ttk.Frame):
             return
 
         self._train_btn.config(state="disabled")
+        if hasattr(self, "_hp_sweep_btn"):
+            self._hp_sweep_btn.config(state="disabled")
         self._stop_train_btn.config(state="normal")
         self._train_status.set("Running…")
         self._train_epoch_var.set("")
@@ -1090,6 +1199,84 @@ class AutomationTab(ttk.Frame):
         self._train_thread = threading.Thread(target=_drain, daemon=True)
         self._train_thread.start()
 
+    def _on_hp_sweep_start(self):
+        if self._train_proc is not None:
+            return
+        folder = self._folder.get()
+        if not folder:
+            self._log_train("[hp-sweep] ERROR: No folder selected.")
+            return
+        data_file = _results_path(folder)
+        if not os.path.exists(data_file):
+            self._log_train("[hp-sweep] ERROR: results.json not found.")
+            return
+        if not os.path.exists(_HP_SWEEP_SCRIPT):
+            self._log_train(f"[hp-sweep] ERROR: hp_sweep.py not found at {_HP_SWEEP_SCRIPT}")
+            return
+        try:
+            epochs = int(self._nn_epochs_var.get())
+            val    = float(self._nn_val_var.get())
+            assert 0 < val < 1
+        except (ValueError, AssertionError):
+            self._log_train("[hp-sweep] ERROR: invalid epochs/val split.")
+            return
+
+        self._train_btn.config(state="disabled")
+        self._hp_sweep_btn.config(state="disabled")
+        self._stop_train_btn.config(state="normal")
+        self._train_status.set("HP sweep…")
+        self._train_epoch_var.set("")
+        self._log_train(f"[hp-sweep] epochs={epochs} val={val}  "
+                        f"(batches=[1024,2048,4096] lrs=[0.01,0.005,0.001,0.0005] "
+                        f"drops=[0,700])")
+
+        env = os.environ.copy()
+        env["SURROGATE_DATA"]       = data_file
+        env["SURROGATE_OUTPUT_DIR"] = folder
+        env["SWEEP_EPOCHS"]         = str(epochs)
+        env["SWEEP_VAL_SPLIT"]      = str(val)
+        # Defaults for batches/lrs/lr_drops are baked into hp_sweep.py.
+
+        try:
+            self._train_proc = subprocess.Popen(
+                [sys.executable, "-u", _HP_SWEEP_SCRIPT],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=_NN_DIR, env=env)
+        except Exception as exc:
+            self._log_train(f"[hp-sweep] Failed to launch: {exc}")
+            self._train_btn.config(state="normal")
+            self._hp_sweep_btn.config(state="normal")
+            self._stop_train_btn.config(state="disabled")
+            self._train_status.set("Error")
+            return
+
+        def _drain():
+            for line in self._train_proc.stdout:
+                self._log_train(line.rstrip())
+
+        self._train_thread = threading.Thread(target=_drain, daemon=True)
+        self._train_thread.start()
+
+    def _on_delete_model(self):
+        import shutil
+        folder = self._folder.get()
+        if not folder or not os.path.isdir(folder):
+            return
+        targets = [
+            _model_path(folder),
+            os.path.join(folder, "x_scaler.pkl"),
+            os.path.join(folder, "y_scaler.pkl"),
+            _loss_plot_path(folder),
+        ]
+        for p in targets:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+        shutil.rmtree(_hp_plots_dir(folder), ignore_errors=True)
+        self._do_state_check()
+
     def _on_train_stop(self):
         if self._train_proc is None:
             return
@@ -1102,5 +1289,7 @@ class AutomationTab(ttk.Frame):
         self._log_train("[train] Stopped by user.")
         if hasattr(self, "_train_btn"):
             self._train_btn.config(state="normal")
+        if hasattr(self, "_hp_sweep_btn"):
+            self._hp_sweep_btn.config(state="normal")
         if hasattr(self, "_stop_train_btn"):
             self._stop_train_btn.config(state="disabled")
